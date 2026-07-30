@@ -5,6 +5,7 @@ param(
     [int]$ApiPort = 8787,
     [int]$RelayPort = 9443,
     [string]$PyPiMirror = "https://mirrors.ivolces.com/pypi/simple",
+    [string]$UvVersion = "0.9.30",
     [switch]$SkipTests,
     [switch]$SkipFrontendBuild,
     [switch]$SkipBrowserInstall
@@ -132,6 +133,7 @@ public_host="$PublicHost"
 api_port="$ApiPort"
 relay_port="$RelayPort"
 pypi_mirror="$PyPiMirror"
+uv_version="$UvVersion"
 browser_install="$browserInstall"
 stamp=`$(date +%Y%m%d-%H%M%S)
 work="/tmp/pulseguard-release-`${stamp}"
@@ -144,16 +146,50 @@ fi
 mkdir -p "`${remote_root}" /opt/pulseguard-backups "`${work}" "`${remote_root}/data" "`${remote_root}/reports"
 tar -xzf "`${payload}" -C "`${work}"
 
+uv_bootstrap="`${work}/.uv-bootstrap"
+python3 -m venv "`${uv_bootstrap}"
+"`${uv_bootstrap}/bin/python" -m pip install -i "`${pypi_mirror}" "uv==`${uv_version}"
 python3 -m venv "`${remote_root}/.venv"
-"`${remote_root}/.venv/bin/python" -m pip install -i "`${pypi_mirror}" -U pip
 cd "`${work}"
-"`${remote_root}/.venv/bin/python" - <<'PY' > requirements.deploy.txt
-import tomllib
-with open("pyproject.toml", "rb") as fh:
-    data = tomllib.load(fh)
-print("\n".join(data["project"]["dependencies"]))
+VIRTUAL_ENV="`${remote_root}/.venv" "`${uv_bootstrap}/bin/uv" sync \
+  --active \
+  --frozen \
+  --no-dev \
+  --no-install-project \
+  --default-index "`${pypi_mirror}"
+
+active_db="`${remote_root}/data/pulseguard.db"
+backup_db="/opt/pulseguard-backups/pulseguard-before-deploy-`${stamp}.db"
+preflight_db="`${work}/pulseguard-migration-preflight.db"
+if [ -f "`${active_db}" ]; then
+  "`${remote_root}/.venv/bin/python" - "`${active_db}" "`${backup_db}" "`${preflight_db}" <<'PY'
+import hashlib
+import shutil
+import sqlite3
+import sys
+from pathlib import Path
+
+source_path, backup_path, preflight_path = map(Path, sys.argv[1:4])
+with sqlite3.connect(source_path, timeout=30) as source, sqlite3.connect(backup_path) as backup:
+    source.backup(backup)
+shutil.copy2(backup_path, preflight_path)
+with backup_path.open("rb") as backup_file:
+    digest = hashlib.file_digest(backup_file, "sha256").hexdigest()
+print(f"database backup ready: {backup_path} sha256={digest}")
 PY
-"`${remote_root}/.venv/bin/python" -m pip install -i "`${pypi_mirror}" -r requirements.deploy.txt
+  PULSEGUARD_DB_PATH="`${preflight_db}" \
+  PULSEGUARD_DATA_DIR="`${work}/migration-data" \
+  PULSEGUARD_REPORTS_DIR="`${work}/migration-reports" \
+  PULSEGUARD_BACKUPS_DIR="`${work}/migration-backups" \
+  PULSEGUARD_RUNNER_TOKEN_KEY_FILE="`${remote_root}/data/runner-token.key" \
+  PYTHONPATH="`${work}/backend" \
+    "`${remote_root}/.venv/bin/python" - <<'PY'
+from app import storage
+
+storage.init_db()
+print("database migration preflight passed")
+PY
+fi
 if [ "`${browser_install}" = "1" ]; then
   if [ "`$(id -u)" = "0" ]; then
     "`${remote_root}/.venv/bin/python" -m playwright install --with-deps chromium

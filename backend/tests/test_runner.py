@@ -397,7 +397,7 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertEqual(len(finished_runs), 1)
         self.assertEqual(finished_runs[0]["duration_ms"], 1200)
 
-    def test_runner_environment_failure_does_not_persist_task_run(self) -> None:
+    def test_runner_environment_failure_persists_non_health_run(self) -> None:
         check = {
             "id": 18,
             "name": "Runner browser failure",
@@ -423,21 +423,34 @@ class DraftRunnerTests(unittest.TestCase):
         }
         created_run = {"id": 180, "status": "running"}
 
+        def finish_runner_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
+            return {
+                "id": run_id,
+                "check_id": 18,
+                "observation_kind": "observation",
+                "notification_status": None,
+                **data,
+            }
+
         with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
             "backend.app.runner.storage.get_settings",
             return_value=settings,
         ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
             "backend.app.runner.storage.create_run", return_value=created_run
+        ), patch("backend.app.runner.storage.finish_run", side_effect=finish_runner_run) as finish_run, patch(
+            "backend.app.runner.storage.get_run", return_value=None
         ), patch(
-            "backend.app.runner.storage.finish_run"
-        ) as finish_run, patch(
             "backend.app.runner.storage.discard_incomplete_run", return_value=True
         ) as discard_incomplete_run, patch(
+            "backend.app.runner.storage.update_run_notification"
+        ), patch(
             "backend.app.runner.storage.update_check_status"
         ) as update_check_status, patch(
             "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
         ) as maybe_notify, patch(
-            "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+            "backend.app.runner.notifier.notify_system_error",
+            new_callable=AsyncMock,
+            return_value={"sent": False, "reason": "disabled"},
         ) as notify_system_error, patch(
             "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock, side_effect=RunnerEnvironmentFailure("browser failed")
         ):
@@ -447,14 +460,14 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["failure_kind"], "runner")
         self.assertFalse(result["affects_health"])
-        self.assertEqual(result["observation_kind"], "runner")
-        finish_run.assert_not_called()
-        discard_incomplete_run.assert_called_once_with(180)
+        self.assertEqual(result["observation_kind"], "observation")
+        finish_run.assert_called_once()
+        discard_incomplete_run.assert_not_called()
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
         notify_system_error.assert_awaited_once()
 
-    def test_playwright_target_crash_is_system_alert_not_run_failure(self) -> None:
+    def test_playwright_target_crash_persists_system_run_not_target_failure(self) -> None:
         check = {
             "id": 19,
             "name": "浏览器崩溃",
@@ -480,21 +493,34 @@ class DraftRunnerTests(unittest.TestCase):
         }
         created_run = {"id": 181, "status": "running"}
 
+        def finish_runner_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
+            return {
+                "id": run_id,
+                "check_id": 19,
+                "observation_kind": "observation",
+                "notification_status": None,
+                **data,
+            }
+
         with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
             "backend.app.runner.storage.get_settings",
             return_value=settings,
         ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
             "backend.app.runner.storage.create_run", return_value=created_run
+        ), patch("backend.app.runner.storage.finish_run", side_effect=finish_runner_run) as finish_run, patch(
+            "backend.app.runner.storage.get_run", return_value=None
         ), patch(
-            "backend.app.runner.storage.finish_run"
-        ) as finish_run, patch(
             "backend.app.runner.storage.discard_incomplete_run", return_value=True
         ) as discard_incomplete_run, patch(
+            "backend.app.runner.storage.update_run_notification"
+        ), patch(
             "backend.app.runner.storage.update_check_status"
         ) as update_check_status, patch(
             "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
         ) as maybe_notify, patch(
-            "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+            "backend.app.runner.notifier.notify_system_error",
+            new_callable=AsyncMock,
+            return_value={"sent": False, "reason": "disabled"},
         ) as notify_system_error, patch(
             "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock, side_effect=RuntimeError("Page.title: Target crashed")
         ):
@@ -504,12 +530,96 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["failure_kind"], "runner")
         self.assertFalse(result["affects_health"])
-        self.assertEqual(result["observation_kind"], "runner")
-        finish_run.assert_not_called()
-        discard_incomplete_run.assert_called_once_with(181)
+        self.assertEqual(result["observation_kind"], "observation")
+        finish_run.assert_called_once()
+        discard_incomplete_run.assert_not_called()
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
         notify_system_error.assert_awaited_once()
+
+    def test_system_alert_delivery_outcome_is_persisted_on_runner_run(self) -> None:
+        check = {"id": 20, "name": "Runner system failure", "type": "api"}
+        result = {
+            "id": 182,
+            "check_id": 20,
+            "status": "failed",
+            "failure_kind": "runner",
+            "affects_health": False,
+            "error_message": "runner unavailable",
+            "finished_at": "2026-01-01T00:00:01+08:00",
+        }
+        refreshed = {
+            **result,
+            "notification_status": "sent",
+            "notification_channel": "Ops webhook",
+            "notification_sent_at": "2026-01-01T00:00:02+08:00",
+        }
+
+        with patch(
+            "backend.app.runner.notifier.notify_system_error",
+            new_callable=AsyncMock,
+            return_value={"sent": True, "status": "sent", "channel": "Ops webhook"},
+        ), patch(
+            "backend.app.runner.storage.now_iso",
+            return_value="2026-01-01T00:00:02+08:00",
+        ), patch(
+            "backend.app.runner.storage.update_run_notification"
+        ) as update_run_notification, patch(
+            "backend.app.runner.storage.get_run",
+            return_value=refreshed,
+        ):
+            persisted = asyncio.run(
+                CheckRunner()._notify_system_result(
+                    check,
+                    "scheduled",
+                    182,
+                    result,
+                    {"system_alerts_enabled": True},
+                    source="runner",
+                )
+            )
+
+        update_run_notification.assert_called_once_with(
+            182,
+            "sent",
+            channel="Ops webhook",
+            error=None,
+            sent_at="2026-01-01T00:00:02+08:00",
+        )
+        self.assertEqual(persisted["notification_status"], "sent")
+        self.assertEqual(persisted["notification_channel"], "Ops webhook")
+
+    def test_runner_fallback_does_not_overwrite_completed_target_run(self) -> None:
+        completed = {
+            "id": 183,
+            "check_id": 21,
+            "status": "failed",
+            "failure_kind": "target",
+            "affects_health": True,
+            "error_message": "target assertion failed",
+        }
+
+        with patch(
+            "backend.app.runner.storage.get_run",
+            return_value=completed,
+        ), patch(
+            "backend.app.runner.storage.finish_run"
+        ) as finish_run, patch(
+            "backend.app.runner.storage.update_run_notification"
+        ) as update_run_notification:
+            result = CheckRunner._finish_runner_result(
+                {"id": 21, "name": "Target check", "type": "api"},
+                "scheduled",
+                183,
+                {
+                    "status": "failed",
+                    "error_message": "late runner failure",
+                },
+            )
+
+        self.assertEqual(result, completed)
+        finish_run.assert_not_called()
+        update_run_notification.assert_not_called()
 
     def test_structured_ui_check_runs_without_loading_user_script(self) -> None:
         check = {
@@ -730,7 +840,9 @@ class RunnerQueueTests(unittest.TestCase):
             ) as update_check_status, patch(
                 "backend.app.runner.storage.discard_incomplete_run", return_value=True
             ) as discard_incomplete_run, patch(
-                "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+                "backend.app.runner.notifier.notify_system_error",
+                new_callable=AsyncMock,
+                return_value={"sent": False, "reason": "disabled"},
             ) as notify_system_error:
                 runner = CheckRunner()
                 runner._execute = execute  # type: ignore[method-assign]
@@ -763,9 +875,9 @@ class RunnerQueueTests(unittest.TestCase):
         self.assertEqual(after_timeout["workers"]["running"], 0)
         self.assertEqual(second["status"], "ok")
         self.assertEqual(after_second["active_checks"], 0)
-        self.assertEqual(notification_count, 0)
+        self.assertEqual(notification_count, 2)
         self.assertEqual(status_update_count, 0)
-        self.assertEqual(discard_count, 1)
+        self.assertEqual(discard_count, 0)
         self.assertEqual(system_alert_count, 1)
 
     def test_job_watchdog_does_not_count_queue_wait_time(self) -> None:
@@ -912,7 +1024,7 @@ class RunnerQueueTests(unittest.TestCase):
         self.assertFalse(result["affects_health"])
         self.assertIn("单任务总时长限制", str(result["error_message"]))
         self.assertEqual(after_timeout["active_checks"], 0)
-        self.assertEqual(discard_count, 1)
+        self.assertEqual(discard_count, 0)
         self.assertEqual(system_alert_count, 1)
 
     def test_ui_jobs_are_capped_independently_from_global_concurrency(self) -> None:

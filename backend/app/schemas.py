@@ -410,6 +410,7 @@ class ProbeRunnerCreate(BaseModel):
     network_region: str = Field(default="local", max_length=120)
     enabled: bool = True
     token: str = Field(min_length=1, max_length=4096)
+    allow_insecure_http: bool = False
 
     @field_validator("address")
     @classmethod
@@ -421,6 +422,12 @@ class ProbeRunnerCreate(BaseModel):
     def token_must_be_worker_token(cls, value: str) -> str:
         return _worker_token(value, required=True) or ""
 
+    @model_validator(mode="after")
+    def insecure_http_requires_confirmation(self) -> "ProbeRunnerCreate":
+        if self.address.startswith("http://") and not self.allow_insecure_http:
+            raise ValueError("手动 HTTP 节点会明文传输 token 和任务数据，请显式确认允许不安全 HTTP")
+        return self
+
 
 class ProbeRunnerUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
@@ -428,6 +435,7 @@ class ProbeRunnerUpdate(BaseModel):
     network_region: str | None = Field(default=None, max_length=120)
     enabled: bool | None = None
     token: str | None = Field(default=None, max_length=4096)
+    allow_insecure_http: bool | None = None
 
     @field_validator("token")
     @classmethod

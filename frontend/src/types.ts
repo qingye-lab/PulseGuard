@@ -348,6 +348,7 @@ export interface ProbeRunner {
   enabled: boolean;
   role: ProbeRunnerRole;
   connection_mode?: ProbeRunnerConnectionMode;
+  allow_insecure_http?: boolean;
   available: boolean;
   token_set?: boolean;
   token_hint?: string;
@@ -387,6 +388,7 @@ export interface ProbeRunnerPayload {
   network_region: string;
   enabled?: boolean;
   token?: string;
+  allow_insecure_http?: boolean;
 }
 
 export interface RelayStatus {

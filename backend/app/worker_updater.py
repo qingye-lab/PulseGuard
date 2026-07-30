@@ -203,9 +203,38 @@ def _target_image(payload: dict[str, Any]) -> str:
         raise ValueError("target image is not configured")
     if any(char.isspace() for char in image) or image.startswith("-"):
         raise ValueError("target image format is invalid")
-    if ALLOWED_PREFIXES and not any(image.startswith(prefix) for prefix in ALLOWED_PREFIXES):
+    if ALLOWED_PREFIXES and not _image_repository_allowed(image, ALLOWED_PREFIXES):
         raise ValueError("target image is not allowed")
     return image
+
+
+def _image_repository_allowed(image: str, allowed_entries: tuple[str, ...]) -> bool:
+    repository = _image_repository(image)
+    if not repository:
+        return False
+    for raw_entry in allowed_entries:
+        entry = str(raw_entry or "").strip()
+        namespace_allowed = entry.endswith("/") or entry.endswith("/*")
+        if entry.endswith("/*"):
+            entry = entry[:-1]
+        allowed_repository = _image_repository(entry)
+        if not allowed_repository:
+            continue
+        if namespace_allowed:
+            if repository.startswith(f"{allowed_repository.rstrip('/')}/"):
+                return True
+        elif repository == allowed_repository:
+            return True
+    return False
+
+
+def _image_repository(image: str) -> str:
+    reference = str(image or "").strip().split("@", 1)[0]
+    last_slash = reference.rfind("/")
+    last_colon = reference.rfind(":")
+    if last_colon > last_slash:
+        reference = reference[:last_colon]
+    return reference.rstrip("/")
 
 
 def _ensure_image_available(image: str) -> None:

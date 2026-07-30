@@ -227,10 +227,13 @@ docker update --restart unless-stopped pulseguard-worker pulseguard-worker-updat
 ```sh
 export PULSEGUARD_WORKER_IMAGE="registry.example.com/pulseguard-worker:local"
 export PULSEGUARD_WORKER_UPDATE_IMAGE="registry.example.com/pulseguard-worker:local"
+export PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES="registry.example.com/pulseguard-worker"
 docker compose -f docker-compose.worker.yml up -d
 docker update --restart unless-stopped pulseguard-worker
 docker logs --tail 80 pulseguard-worker
 ```
+
+`PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES` 按镜像仓库边界校验，不按原始字符串前缀匹配。普通条目只允许该仓库的不同 tag/digest；如确需允许整个命名空间，使用 `registry.example.com/team/*`。类似 `pulseguard-worker.attacker.example/evil` 的前缀伪装不会被接受。
 
 可覆盖基础镜像：
 
@@ -281,9 +284,9 @@ uv run python -m backend.app.worker --rotate-token --token-file data/worker-toke
 
 ## 网络要求
 
-- 手动模式：主节点必须访问子节点 `/api/worker/health` 和 `/api/worker/run`；
+- 手动模式：主节点必须访问子节点 `/api/worker/health` 和 `/api/worker/run`。优先使用 HTTPS；新增或修改为 HTTP/裸 IP 时必须显式确认明文传输风险，旧版已保存的 HTTP 节点会迁移为已确认；
 - Relay 模式：公网只开放主节点 Relay TCP 端口，默认 `9443`；
-- 子节点 API 使用 `Authorization: Bearer <token>`；
+- 子节点 API 使用 `Authorization: Bearer <token>`；手工 HTTP 模式不会加密 token、任务参数或环境变量，只适用于已确认的可信网络；
 - 手动节点不主动访问主节点；
 - Relay client 主动出站连接主节点；
 - 截图、Trace 和 Response Body 使用 JSON base64 回传；

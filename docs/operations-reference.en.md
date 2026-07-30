@@ -156,8 +156,11 @@ If source access is unavailable, build and publish a worker image from another e
 ```bash
 export PULSEGUARD_WORKER_IMAGE="registry.example.com/pulseguard-worker:local"
 export PULSEGUARD_WORKER_UPDATE_IMAGE="registry.example.com/pulseguard-worker:local"
+export PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES="registry.example.com/pulseguard-worker"
 docker compose -f docker-compose.worker.yml up -d
 ```
+
+`PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES` is validated on repository boundaries rather than as a raw string prefix. A normal entry allows tags and digests only for that exact repository. Use an explicit namespace entry such as `registry.example.com/team/*` only when every repository below it is trusted; prefix lookalikes are rejected.
 
 ## Controlled worker updates
 
@@ -205,9 +208,9 @@ After rotating a direct-worker token, update the credential in the main console 
 
 ## Network requirements
 
-- direct mode: the main node must reach `/api/worker/health` and `/api/worker/run`;
+- direct mode: the main node must reach `/api/worker/health` and `/api/worker/run`; prefer HTTPS, while new or changed HTTP/bare-host runners require explicit insecure-transport acknowledgement and existing saved HTTP runners migrate as acknowledged;
 - Relay mode: only the public Relay TCP port is required;
-- worker APIs use `Authorization: Bearer <token>`;
+- worker APIs use `Authorization: Bearer <token>`; direct HTTP does not encrypt the token, task payload, or environment variables and is only suitable for an acknowledged trusted network;
 - direct workers do not need the main-node address;
 - Relay clients connect outbound;
 - screenshots, optional Trace files, and response bodies are returned as base64 JSON payloads;

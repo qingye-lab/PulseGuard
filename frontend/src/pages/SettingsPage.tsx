@@ -1,4 +1,4 @@
-import { Alert, App, Button, Card, Drawer, Dropdown, Empty, Form, Input, InputNumber, Modal, Popconfirm, Segmented, Select, Skeleton, Space, Switch, Tag, Tooltip, Upload } from "antd";
+import { Alert, App, Button, Card, Checkbox, Drawer, Dropdown, Empty, Form, Input, InputNumber, Modal, Popconfirm, Segmented, Select, Skeleton, Space, Switch, Tag, Tooltip, Upload } from "antd";
 import type { MenuProps, UploadProps } from "antd";
 import {
   BellRing,
@@ -1240,7 +1240,8 @@ const emptyRunnerDraft: ProbeRunnerPayload = {
   address: "",
   network_region: "local",
   enabled: true,
-  token: ""
+  token: "",
+  allow_insecure_http: false
 };
 
 type RunnerCreateMode = "manual" | "relay";
@@ -1289,6 +1290,11 @@ function runnerImageSummary(image: string): string {
   if (!image) return "-";
   const parts = image.split("/");
   return parts[parts.length - 1] || image;
+}
+
+function runnerAddressUsesInsecureHttp(address: string): boolean {
+  const value = address.trim().toLowerCase();
+  return Boolean(value) && (value.startsWith("http://") || !value.includes("://"));
 }
 
 function wait(ms: number): Promise<void> {
@@ -1374,7 +1380,8 @@ function RunnerNodePanel() {
         name: runner.name || runner.runner_id,
         address: runner.address || "",
         network_region: runner.network_region || "local",
-        enabled: runner.enabled
+        enabled: runner.enabled,
+        allow_insecure_http: Boolean(runner.allow_insecure_http)
       }
     });
   }
@@ -1411,10 +1418,15 @@ function RunnerNodePanel() {
       address: draft.address.trim(),
       network_region: draft.network_region.trim() || "local",
       enabled: draft.enabled !== false,
-      token: draft.token?.trim() || ""
+      token: draft.token?.trim() || "",
+      allow_insecure_http: runnerAddressUsesInsecureHttp(draft.address) && Boolean(draft.allow_insecure_http)
     };
     if (!payload.name || !payload.address || !payload.token) {
       message.error("请填写节点名称、地址和认证信息");
+      return;
+    }
+    if (runnerAddressUsesInsecureHttp(payload.address) && !payload.allow_insecure_http) {
+      message.error("请确认手工 HTTP 节点的明文传输风险，或改用 HTTPS / Relay");
       return;
     }
     setSaving(true);
@@ -1449,10 +1461,24 @@ function RunnerNodePanel() {
       name: editRunner.draft.name.trim(),
       address: editRunner.draft.address.trim(),
       network_region: editRunner.draft.network_region.trim() || "local",
-      enabled: editRunner.draft.enabled !== false
+      enabled: editRunner.draft.enabled !== false,
+      allow_insecure_http:
+        editRunner.runner.role === "child" &&
+        editRunner.runner.connection_mode !== "relay" &&
+        runnerAddressUsesInsecureHttp(editRunner.draft.address) &&
+        Boolean(editRunner.draft.allow_insecure_http)
     };
     if (!payload.name || !payload.address) {
       message.error("请填写节点名称和地址");
+      return;
+    }
+    if (
+      editRunner.runner.role === "child" &&
+      editRunner.runner.connection_mode !== "relay" &&
+      runnerAddressUsesInsecureHttp(payload.address) &&
+      !payload.allow_insecure_http
+    ) {
+      message.error("请确认手工 HTTP 节点的明文传输风险，或改用 HTTPS / Relay");
       return;
     }
     setSaving(true);
@@ -1692,6 +1718,13 @@ function RunnerNodePanel() {
                           <Space size={6} wrap className="runner-node-tags">
                             <Tag>{runner.role === "local" ? "本机" : "子节点"}</Tag>
                             {runner.role !== "local" && <Tag>{runner.connection_mode === "relay" ? "Relay 自动" : "手动直连"}</Tag>}
+                            {runner.role !== "local" &&
+                              runner.connection_mode !== "relay" &&
+                              runnerAddressUsesInsecureHttp(runner.address) && (
+                                <Tag color={runner.allow_insecure_http ? "warning" : "error"}>
+                                  {runner.allow_insecure_http ? "HTTP 风险已确认" : "HTTP 未确认"}
+                                </Tag>
+                              )}
                             <Tag color={runner.enabled ? "success" : "default"}>{runner.enabled ? "已启用" : "已停用"}</Tag>
                             <Tag color={runnerStatusColor(runner)}>{runnerStatusLabel(runner)}</Tag>
                             <Tag>{runner.network_region || "local"}</Tag>
@@ -1787,13 +1820,25 @@ function RunnerNodePanel() {
           </Form.Item>
           {createMode === "manual" && (
             <>
-              <Form.Item label="节点地址" required help="可填写裸 IP/域名，系统会按 worker 默认端口补成 http://地址:8788。">
+              <Form.Item label="节点地址" required help="优先填写 HTTPS 地址；裸 IP/域名会按 worker 默认端口补成 http://地址:8788。">
                 <Input
                   value={draft.address}
                   placeholder="10.0.0.12 或 http://10.0.0.12:8788"
                   onChange={(event) => setDraft((current) => ({ ...current, address: event.target.value }))}
                 />
               </Form.Item>
+              {runnerAddressUsesInsecureHttp(draft.address) && (
+                <Form.Item>
+                  <Checkbox
+                    checked={Boolean(draft.allow_insecure_http)}
+                    onChange={(event) =>
+                      setDraft((current) => ({ ...current, allow_insecure_http: event.target.checked }))
+                    }
+                  >
+                    我确认该节点位于可信网络，允许 token、任务参数和环境变量通过明文 HTTP 传输
+                  </Checkbox>
+                </Form.Item>
+              )}
               <Form.Item label="认证信息" required help="粘贴 pgrn_ 开头的 token；也可以粘贴日志里的 token: pgrn_... 整行。">
                 <Input.Password
                   value={draft.token}
@@ -1878,6 +1923,27 @@ function RunnerNodePanel() {
               }
             />
           </Form.Item>
+          {editRunner?.runner.role === "child" &&
+            editRunner.runner.connection_mode !== "relay" &&
+            runnerAddressUsesInsecureHttp(editRunner.draft.address) && (
+              <Form.Item>
+                <Checkbox
+                  checked={Boolean(editRunner.draft.allow_insecure_http)}
+                  onChange={(event) =>
+                    setEditRunner((current) =>
+                      current
+                        ? {
+                            ...current,
+                            draft: { ...current.draft, allow_insecure_http: event.target.checked }
+                          }
+                        : current
+                    )
+                  }
+                >
+                  我确认该节点位于可信网络，允许 token、任务参数和环境变量通过明文 HTTP 传输
+                </Checkbox>
+              </Form.Item>
+            )}
           <Form.Item label="网络区域">
             <Input
               value={editRunner?.draft.network_region || ""}
@@ -1955,7 +2021,7 @@ function RunnerNodePanel() {
             <pre>{`docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d`}</pre>
             <span>主节点启用 relay 后，在新增子节点里选择“生成部署命令”，复制命令到 worker 宿主机执行。worker 不需要开放 8788 入站端口，部署命令默认启动 updater。</span>
           </div>
-          <span>手动添加模式下，先在子节点服务器启动 worker，再回到这里填写子节点地址和日志输出的 token。</span>
+          <span>手动添加模式优先使用 HTTPS。仅在可信内网无法提供 HTTPS 时，才显式确认使用明文 HTTP；否则使用 Relay 自动接入。</span>
           <div className="worker-help-block">
             <strong>推荐部署：公司 Git 源码构建（Windows PowerShell）</strong>
             <pre>{`git clone git@git.corpautohome.com:liyanqing/PulseGuard.git

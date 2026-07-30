@@ -72,14 +72,20 @@ class OverviewStorageTests(unittest.TestCase):
                 {
                     **run_payload("failed", "runner failed"),
                     **storage.runner_metadata({"runner_id": "edge-1", "name": "Edge 1"}, failure_kind="runner"),
+                    "affects_health": False,
                 },
             )
             assert runner_finished is not None
-            storage.update_check_status(int(runner_check["id"]), runner_finished)
 
             overview = storage.get_overview()
+            retained_runner_run = storage.get_run(int(runner_run["id"]))
+            listed_runner_runs = storage.list_runs({"runner_id": "edge-1"}, limit=10)
 
         trend_24h = {item["check_type"]: item for item in overview["trends"][0]["series"]}
+        self.assertIsNotNone(retained_runner_run)
+        self.assertEqual(retained_runner_run["failure_kind"], "runner")
+        self.assertFalse(retained_runner_run["affects_health"])
+        self.assertIn(runner_run["id"], [run["id"] for run in listed_runner_runs])
         self.assertEqual(overview["failing_count"], 1)
         self.assertEqual([run["id"] for run in overview["recent_failures"]], [target_run["id"]])
         self.assertEqual(trend_24h["api"]["runs"], 1)
@@ -1149,6 +1155,7 @@ class RunnerStorageTests(unittest.TestCase):
                     "name": "Edge Runner",
                     "address": "http://10.0.0.8:8787",
                     "token": "runner-secret-1",
+                    "allow_insecure_http": True,
                 }
             )
             public = storage.get_probe_runner("edge-1")
@@ -1232,6 +1239,64 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(raw_token_value["token_hash"], storage.runner_token_hash("pgrn_legacy-token-1234567890"))
         self.assertEqual(raw_token_value["token_hint"], "567890")
         self.assertIsNotNone(verified)
+
+    def test_init_db_preserves_legacy_manual_http_runner_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            storage.create_probe_runner(
+                {
+                    "runner_id": "legacy-http",
+                    "name": "Legacy HTTP",
+                    "address": "http://10.0.0.10:8788",
+                    "token": "pgrn_legacy-http-token-1234567890",
+                    "allow_insecure_http": True,
+                }
+            )
+            storage.create_probe_runner(
+                {
+                    "runner_id": "legacy-https",
+                    "name": "Legacy HTTPS",
+                    "address": "https://worker.example.com:8788",
+                    "token": "pgrn_legacy-https-token-1234567890",
+                }
+            )
+            with storage._connect() as conn:
+                conn.execute("ALTER TABLE probe_runners DROP COLUMN allow_insecure_http")
+
+            storage.init_db()
+            migrated_http = storage.get_probe_runner("legacy-http")
+            migrated_https = storage.get_probe_runner("legacy-https")
+
+        self.assertTrue(migrated_http["allow_insecure_http"])
+        self.assertFalse(migrated_https["allow_insecure_http"])
+        self.assertTrue(storage.can_schedule_runner({**migrated_http, "available": True}))
+
+    def test_manual_http_runner_requires_explicit_transport_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            with self.assertRaisesRegex(ValueError, "明文传输"):
+                storage.create_probe_runner(
+                    {
+                        "runner_id": "unsafe-http",
+                        "name": "Unsafe HTTP",
+                        "address": "http://10.0.0.11:8788",
+                        "token": "pgrn_unsafe-http-token-1234567890",
+                    }
+                )
+            secure = storage.create_probe_runner(
+                {
+                    "runner_id": "secure-https",
+                    "name": "Secure HTTPS",
+                    "address": "https://worker.example.com:8788",
+                    "token": "pgrn_secure-https-token-1234567890",
+                }
+            )
+
+        self.assertFalse(secure["allow_insecure_http"])
 
     def test_relay_provisioning_requires_session_and_worker_health_before_scheduling(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
@@ -1623,6 +1688,7 @@ class RunnerStorageTests(unittest.TestCase):
                     "name": "Edge Runner",
                     "address": "http://10.0.0.9:8787",
                     "token": "runner-secret-2",
+                    "allow_insecure_http": True,
                 }
             )
             unavailable = storage.mark_probe_runner_unavailable("edge-2")

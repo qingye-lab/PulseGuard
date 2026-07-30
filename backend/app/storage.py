@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -298,6 +299,7 @@ def init_db() -> None:
                 token_hash TEXT NOT NULL DEFAULT '',
                 token_hint TEXT NOT NULL DEFAULT '',
                 connection_mode TEXT NOT NULL DEFAULT 'manual',
+                allow_insecure_http INTEGER NOT NULL DEFAULT 0,
                 relay_token_hash TEXT NOT NULL DEFAULT '',
                 relay_token_hint TEXT NOT NULL DEFAULT '',
                 relay_token_version INTEGER NOT NULL DEFAULT 0,
@@ -1210,6 +1212,17 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
     runner_id = _normalize_runner_id(data.get("runner_id") or f"runner-{uuid.uuid4().hex[:8]}")
     timestamp = now_iso()
     metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    role = _normalize_runner_role(data.get("role") or "child")
+    address = str(data.get("address") or "").strip()
+    allow_insecure_http = bool(data.get("allow_insecure_http", False))
+    ensure_probe_runner_transport_allowed(
+        {
+            "role": role,
+            "connection_mode": "manual",
+            "address": address,
+            "allow_insecure_http": allow_insecure_http,
+        }
+    )
     with _LOCK, _connect() as conn:
         if conn.execute("SELECT 1 FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone():
             raise ValueError("Runner ID already exists")
@@ -1218,13 +1231,13 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
             INSERT INTO probe_runners (
                 runner_id, name, address, network_region, browser_version, installed_browser_types_json, available_browser_types_json, status,
                 metadata_json, enabled, role, token_value, token_hash, token_hint, created_at,
-                connection_mode, last_seen_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                connection_mode, allow_insecure_http, last_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 runner_id,
                 str(data.get("name") or runner_id).strip(),
-                str(data.get("address") or "").strip(),
+                address,
                 str(data.get("network_region") or "local").strip(),
                 str(data.get("browser_version") or "").strip(),
                 json.dumps(_normalize_runner_browser_types(data.get("installed_browser_types")), ensure_ascii=False),
@@ -1232,12 +1245,13 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
                 "offline",
                 json.dumps(metadata, ensure_ascii=False),
                 1 if data.get("enabled", True) else 0,
-                _normalize_runner_role(data.get("role") or "child"),
+                role,
                 _store_runner_token(token),
                 runner_token_hash(token) if token else "",
                 _token_hint(token),
                 timestamp,
                 "manual",
+                1 if allow_insecure_http else 0,
                 timestamp,
                 timestamp,
             ),
@@ -1374,8 +1388,26 @@ def update_probe_runner(runner_id: str, data: dict[str, Any]) -> dict[str, Any] 
         address = str(data["address"] if data.get("address") is not None else current["address"] or "").strip()
         network_region = str(data["network_region"] if data.get("network_region") is not None else current["network_region"] or "local").strip() or "local"
         enabled = bool(data["enabled"] if data.get("enabled") is not None else current["enabled"])
-        assignments = ["name = ?", "address = ?", "network_region = ?", "enabled = ?", "updated_at = ?"]
-        params: list[Any] = [name, address, network_region, 1 if enabled else 0, timestamp]
+        allow_insecure_http = bool(
+            data["allow_insecure_http"] if data.get("allow_insecure_http") is not None else current["allow_insecure_http"]
+        )
+        ensure_probe_runner_transport_allowed(
+            {
+                "role": current["role"],
+                "connection_mode": current["connection_mode"],
+                "address": address,
+                "allow_insecure_http": allow_insecure_http,
+            }
+        )
+        assignments = [
+            "name = ?",
+            "address = ?",
+            "network_region = ?",
+            "enabled = ?",
+            "allow_insecure_http = ?",
+            "updated_at = ?",
+        ]
+        params: list[Any] = [name, address, network_region, 1 if enabled else 0, 1 if allow_insecure_http else 0, timestamp]
         token = str(data.get("token") or "").strip()
         if token:
             assignments.extend(["token_value = ?", "token_hash = ?", "token_hint = ?"])
@@ -1845,6 +1877,8 @@ def can_schedule_runner(runner_or_id: dict[str, Any] | str) -> bool:
     runner = get_probe_runner(runner_or_id) if isinstance(runner_or_id, str) else runner_or_id
     if not runner or not runner.get("enabled"):
         return False
+    if probe_runner_transport_error(runner):
+        return False
     if str(runner.get("role") or "") == "local":
         return runner.get("available", False)
     if str(runner.get("connection_mode") or "manual") != "relay":
@@ -1855,6 +1889,26 @@ def can_schedule_runner(runner_or_id: dict[str, Any] | str) -> bool:
         runner.get("worker_health_last_success_at"),
         RUNNER_HEARTBEAT_TIMEOUT_SECONDS,
     )
+
+
+def probe_runner_transport_error(runner: dict[str, Any]) -> str:
+    if str(runner.get("role") or "") != "child":
+        return ""
+    if str(runner.get("connection_mode") or "manual") != "manual":
+        return ""
+    address = str(runner.get("address") or "").strip()
+    if not address:
+        return ""
+    parsed = urlsplit(address if "://" in address else f"http://{address}")
+    if parsed.scheme == "http" and not bool(runner.get("allow_insecure_http")):
+        return "手动 HTTP 节点未确认明文传输风险，请改用 HTTPS、Relay，或显式允许不安全 HTTP"
+    return ""
+
+
+def ensure_probe_runner_transport_allowed(runner: dict[str, Any]) -> None:
+    error = probe_runner_transport_error(runner)
+    if error:
+        raise ValueError(error)
 
 
 def mark_probe_runner_updating(runner_id: str) -> dict[str, Any] | None:
@@ -3494,6 +3548,7 @@ def _ensure_check_status_columns(conn: sqlite3.Connection) -> None:
 
 def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(probe_runners)").fetchall()}
+    migrate_legacy_insecure_http = "allow_insecure_http" not in existing
     columns = {
         "enabled": "INTEGER NOT NULL DEFAULT 1",
         "role": "TEXT NOT NULL DEFAULT 'child'",
@@ -3503,6 +3558,7 @@ def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
         "installed_browser_types_json": "TEXT NOT NULL DEFAULT '[]'",
         "available_browser_types_json": "TEXT NOT NULL DEFAULT '[]'",
         "connection_mode": "TEXT NOT NULL DEFAULT 'manual'",
+        "allow_insecure_http": "INTEGER NOT NULL DEFAULT 0",
         "relay_token_hash": "TEXT NOT NULL DEFAULT ''",
         "relay_token_hint": "TEXT NOT NULL DEFAULT ''",
         "relay_token_version": "INTEGER NOT NULL DEFAULT 0",
@@ -3523,6 +3579,17 @@ def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
     for name, column_type in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE probe_runners ADD COLUMN {name} {column_type}")
+    if migrate_legacy_insecure_http:
+        conn.execute(
+            """
+            UPDATE probe_runners
+            SET allow_insecure_http = 1
+            WHERE role = 'child'
+              AND connection_mode = 'manual'
+              AND TRIM(address) <> ''
+              AND (LOWER(address) LIKE 'http://%' OR INSTR(address, '://') = 0)
+            """
+        )
     timestamp = now_iso()
     conn.execute(
         "UPDATE probe_runners SET created_at = COALESCE(NULLIF(created_at, ''), updated_at, last_seen_at, ?) WHERE created_at = ''",
@@ -3873,6 +3940,7 @@ def _normalize_probe_runner(row: sqlite3.Row) -> dict[str, Any]:
     data["available_browser_types"] = _normalize_runner_browser_types(data.get("available_browser_types_json"))
     data["browser_type_status"] = browser_type_status(data["installed_browser_types"], get_settings())
     data["connection_mode"] = _normalize_runner_connection_mode(data.get("connection_mode"))
+    data["allow_insecure_http"] = bool(data.get("allow_insecure_http"))
     data["relay_token_version"] = int(data.get("relay_token_version") or 0)
     data["relay_previous_token_version"] = int(data.get("relay_previous_token_version") or 0)
     data["allocated_internal_port"] = data.get("allocated_internal_port")

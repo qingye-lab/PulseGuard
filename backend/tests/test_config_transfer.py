@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from backend.app import storage
+from backend.app import config_transfer, storage
 from backend.app.main import app
 
 
@@ -124,6 +124,7 @@ class ConfigTransferApiTests(unittest.TestCase):
                 "address": "http://10.0.0.8:8787",
                 "network_region": "edge",
                 "token": "runner-secret-export",
+                "allow_insecure_http": True,
             }
         )
 
@@ -156,6 +157,7 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.assertIn("runners", exported)
         exported_runner = next(runner for runner in exported["runners"] if runner["runner_id"] == "edge-secret")
         self.assertEqual(exported_runner["role"], "child")
+        self.assertTrue(exported_runner["allow_insecure_http"])
         self.assertNotIn("token", exported_runner)
         self.assertNotIn("token_value", exported_runner)
 
@@ -313,10 +315,35 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.assertEqual(runner["address"], "http://10.0.0.12:8787")
         self.assertFalse(runner["enabled"])
         self.assertFalse(runner["token_set"])
+        self.assertTrue(runner["allow_insecure_http"])
         self.assertNotIn("token", runner)
         self.assertIsNotNone(imported_check)
         self.assertEqual(imported_check["runner_selection_mode"], "selected_parallel")
         self.assertEqual(imported_check["runner_ids"], ["edge-import"])
+
+    def test_current_config_requires_explicit_manual_http_confirmation(self) -> None:
+        for confirmation in (None, False):
+            with self.subTest(confirmation=confirmation):
+                runner = {
+                    "runner_id": "edge-current-http",
+                    "name": "Current HTTP Runner",
+                    "address": "http://10.0.0.13:8787",
+                    "network_region": "edge",
+                    "enabled": True,
+                }
+                if confirmation is not None:
+                    runner["allow_insecure_http"] = confirmation
+                bundle = transfer_config(settings={}, runners=[runner], checks=[])
+                bundle["version"] = config_transfer.EXPORT_SCHEMA_VERSION
+
+                preview = self.client.post(
+                    "/api/config/import-preview",
+                    json={"bundle": bundle, "replace_existing": False},
+                )
+
+                self.assertEqual(preview.status_code, 200)
+                self.assertFalse(preview.json()["valid"])
+                self.assertTrue(any("allow_insecure_http=true" in issue for issue in preview.json()["issues"]))
 
     def test_import_apply_without_replace_preserves_existing_duplicate_name_policy(self) -> None:
         existing = storage.create_check(api_check_payload("Duplicate API", entry_url="https://old.example.com/health"))

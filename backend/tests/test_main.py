@@ -540,6 +540,7 @@ class RunnerRouteTests(unittest.TestCase):
                     "address": "10.0.0.8",
                     "network_region": "office-lan",
                     "token": f"token: {token}",
+                    "allow_insecure_http": True,
                 },
             )
 
@@ -551,7 +552,42 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(create_probe_runner.call_args.args[0]["role"], "child")
         self.assertEqual(create_probe_runner.call_args.args[0]["address"], "http://10.0.0.8:8788")
         self.assertEqual(create_probe_runner.call_args.args[0]["token"], token)
+        self.assertTrue(create_probe_runner.call_args.args[0]["allow_insecure_http"])
         record_audit_event.assert_called_once()
+
+    def test_create_runner_rejects_http_without_explicit_confirmation(self) -> None:
+        response = TestClient(app).post(
+            "/api/runners",
+            json={
+                "name": "Office Runner",
+                "address": "10.0.0.8",
+                "network_region": "office-lan",
+                "token": "pgrn_abcdefghijklmnopqrstuvwxyzABCDE1234567890_-",
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("明文传输", response.text)
+
+    def test_worker_request_rejects_unconfirmed_manual_http_before_sending_token(self) -> None:
+        runner = {
+            "runner_id": "unsafe-http",
+            "role": "child",
+            "connection_mode": "manual",
+            "address": "http://10.0.0.8:8788",
+            "allow_insecure_http": False,
+        }
+
+        with patch("backend.app.main.storage.get_probe_runner_token") as get_token, patch(
+            "backend.app.main.httpx.AsyncClient"
+        ) as httpx_client:
+            with self.assertRaises(HTTPException) as context:
+                asyncio.run(main_module._worker_request(runner, "GET", "/api/worker/health"))
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertIn("明文传输", str(context.exception.detail))
+        get_token.assert_not_called()
+        httpx_client.assert_not_called()
 
     def test_create_runner_rejects_non_worker_token(self) -> None:
         response = TestClient(app).post(
@@ -561,6 +597,7 @@ class RunnerRouteTests(unittest.TestCase):
                 "address": "10.0.0.8",
                 "network_region": "office-lan",
                 "token": "token: 复制整段日志但没有有效令牌",
+                "allow_insecure_http": True,
             },
         )
 
@@ -754,11 +791,17 @@ class RunnerRouteTests(unittest.TestCase):
         ):
             response = TestClient(app).put(
                 "/api/runners/office-1",
-                json={"name": "Office Runner", "address": "10.0.0.8", "network_region": "office-lan"},
+                json={
+                    "name": "Office Runner",
+                    "address": "10.0.0.8",
+                    "network_region": "office-lan",
+                    "allow_insecure_http": True,
+                },
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(update_probe_runner.call_args.args[1]["address"], "http://10.0.0.8:8788")
+        self.assertTrue(update_probe_runner.call_args.args[1]["allow_insecure_http"])
 
     def test_update_local_runner_preserves_local_address(self) -> None:
         current = {"runner_id": "local", "name": "local", "role": "local"}

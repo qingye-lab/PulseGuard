@@ -25,7 +25,7 @@ docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d
   -RelayPort 9443
 ```
 
-脚本会在本地运行后端测试和前端构建，打包源码，上传到远端，保留远端 `data/`、`reports/`、`.venv`，使用火山 PyPI 镜像安装后端依赖，安装 Chromium，并创建/重启：
+脚本会在本地运行后端测试和前端构建，打包源码，上传到远端，保留远端 `data/`、`reports/`、`.venv`，使用固定版本 `uv` 和仓库 `uv.lock` 同步后端依赖。若远端已有数据库，脚本会先通过 SQLite backup API 创建带 SHA-256 的一致性备份，并在副本上执行数据库迁移预检；只有预检通过后才停止服务、安装 Chromium 并创建/重启：
 
 - `pulseguard.service`
 - `pulseguard-relay.service`

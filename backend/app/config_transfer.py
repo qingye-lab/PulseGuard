@@ -14,7 +14,7 @@ from .schemas import CheckCreate
 from .variables import is_sensitive_variable_name, mask_data
 
 
-EXPORT_SCHEMA_VERSION = 2
+EXPORT_SCHEMA_VERSION = 3
 CHECK_EXPORT_FIELDS = (
     "name",
     "type",
@@ -169,6 +169,7 @@ def _export_runner(runner: dict[str, Any], *, redact: bool) -> dict[str, Any]:
         "network_region": runner.get("network_region"),
         "enabled": bool(runner.get("enabled", True)),
         "role": runner.get("role") or "child",
+        "allow_insecure_http": bool(runner.get("allow_insecure_http")),
     }
     if not redact:
         exported["token_set"] = bool(runner.get("token_set"))
@@ -264,14 +265,26 @@ def _parse_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
         "schema": schema or "pulseguard.config",
         "version": version or EXPORT_SCHEMA_VERSION,
         "settings": settings,
-        "runners": _parse_runners(bundle.get("runners") or [], issues, warnings),
+        "runners": _parse_runners(
+            bundle.get("runners") or [],
+            issues,
+            warnings,
+            allow_legacy_insecure_http=version is None
+            or (isinstance(version, int) and not isinstance(version, bool) and version < EXPORT_SCHEMA_VERSION),
+        ),
         "checks": checks,
         "issues": issues,
         "warnings": warnings,
     }
 
 
-def _parse_runners(raw_runners: Any, issues: list[str], warnings: list[str]) -> list[dict[str, Any]]:
+def _parse_runners(
+    raw_runners: Any,
+    issues: list[str],
+    warnings: list[str],
+    *,
+    allow_legacy_insecure_http: bool,
+) -> list[dict[str, Any]]:
     if not raw_runners:
         return []
     if not isinstance(raw_runners, list):
@@ -294,16 +307,33 @@ def _parse_runners(raw_runners: Any, issues: list[str], warnings: list[str]) -> 
         is_child = runner_id != storage.LOCAL_RUNNER_ID
         token = str(raw.get("token") or raw.get("token_value") or "").strip()
         enabled = bool(raw.get("enabled", True))
+        address = str(raw.get("address") or "").strip()
+        raw_allow_insecure_http = raw.get("allow_insecure_http")
+        if raw_allow_insecure_http is not None and not isinstance(raw_allow_insecure_http, bool):
+            issues.append(f"Runner {runner_id} 的 allow_insecure_http 必须是布尔值")
+            continue
+        allow_insecure_http = bool(raw_allow_insecure_http)
+        uses_manual_http = is_child and address and (
+            address.lower().startswith("http://") or "://" not in address
+        )
+        if uses_manual_http:
+            if raw_allow_insecure_http is None and allow_legacy_insecure_http:
+                allow_insecure_http = True
+                warnings.append(f"Runner {runner_id} 使用旧版手工 HTTP 配置，已保留为显式允许不安全 HTTP")
+            elif not allow_insecure_http:
+                issues.append(f"Runner {runner_id} 使用手工 HTTP，必须显式设置 allow_insecure_http=true")
+                continue
         if is_child and not token and enabled:
             warnings.append(f"Runner {runner_id} 未包含认证信息，导入后将停用；请更新认证后再启用")
             enabled = False
         runner = {
             "runner_id": runner_id,
             "name": str(raw.get("name") or runner_id).strip(),
-            "address": str(raw.get("address") or "").strip(),
+            "address": address,
             "network_region": str(raw.get("network_region") or "local").strip(),
             "enabled": enabled,
             "role": "local" if runner_id == storage.LOCAL_RUNNER_ID else "child",
+            "allow_insecure_http": allow_insecure_http,
         }
         if token:
             runner["token"] = token

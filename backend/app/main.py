@@ -1349,6 +1349,10 @@ async def _worker_request(
     timeout: float = 10,
 ) -> dict[str, Any]:
     runner_id = str(runner.get("runner_id") or "")
+    try:
+        storage.ensure_probe_runner_transport_allowed(runner)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     token = storage.get_probe_runner_token(runner_id)
     address = str(runner.get("address") or "").strip().rstrip("/")
     if not address or not token:
