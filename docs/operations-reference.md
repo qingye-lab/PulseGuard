@@ -43,6 +43,8 @@ UI 任务支持 `chromium`、`firefox`、`webkit`。系统设置中可以分别�
 
 每个预热浏览器类型保留一个 Playwright browser 进程，并维护独立的空 Context 池。UI 任务独占租用一个 Context/Page，结束后关闭 Context 并由资源池补齐。Web 与 H5 通过 Context 参数区分，可以在同一 browser 进程下并发执行不同 viewport。
 
+页面扫描会把最外层 `cursor:pointer` 命中区域识别为交互候选，并限制低稳定性重复组件族的数量。重复的卡片、名称、城市/里程、价格等结构化区域会优先生成“重复区域 + 字段”的定位方式；候选下拉框只展示可选 selector，系统在内部保留并校验真实匹配数。重复区域生成数量规则时默认使用“至少 1 个”，避免动态列表条数变化造成误报。默认只分析页面自然加载后的 DOM，不会主动滚动并触发懒加载或无限列表；确实需要扫描滚动后内容时，应在任务的前置脚本中显式执行滚动。元素数量断言会在任务超时预算内等待数量条件稳定成立，而不是只在页面初次加载后立即计数一次。
+
 任务执行时先解析执行节点，再解析节点支持的浏览器类型。多节点与多浏览器组合会按“节点 × 浏览器类型”生成运行记录。缺失或未启用的组合记录为 Runner 异常，不会伪装为目标故障。
 
 ## 多运行节点
@@ -227,10 +229,13 @@ docker update --restart unless-stopped pulseguard-worker pulseguard-worker-updat
 ```sh
 export PULSEGUARD_WORKER_IMAGE="registry.example.com/pulseguard-worker:local"
 export PULSEGUARD_WORKER_UPDATE_IMAGE="registry.example.com/pulseguard-worker:local"
+export PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES="registry.example.com/pulseguard-worker"
 docker compose -f docker-compose.worker.yml up -d
 docker update --restart unless-stopped pulseguard-worker
 docker logs --tail 80 pulseguard-worker
 ```
+
+`PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES` 按镜像仓库边界校验，不按原始字符串前缀匹配。普通条目只允许该仓库的不同 tag/digest；如确需允许整个命名空间，使用 `registry.example.com/team/*`。类似 `pulseguard-worker.attacker.example/evil` 的前缀伪装不会被接受。
 
 可覆盖基础镜像：
 
@@ -281,9 +286,9 @@ uv run python -m backend.app.worker --rotate-token --token-file data/worker-toke
 
 ## 网络要求
 
-- 手动模式：主节点必须访问子节点 `/api/worker/health` 和 `/api/worker/run`；
+- 手动模式：主节点必须访问子节点 `/api/worker/health` 和 `/api/worker/run`。优先使用 HTTPS；新增或修改为 HTTP/裸 IP 时必须显式确认明文传输风险，旧版已保存的 HTTP 节点会迁移为已确认；
 - Relay 模式：公网只开放主节点 Relay TCP 端口，默认 `9443`；
-- 子节点 API 使用 `Authorization: Bearer <token>`；
+- 子节点 API 使用 `Authorization: Bearer <token>`；手工 HTTP 模式不会加密 token、任务参数或环境变量，只适用于已确认的可信网络；
 - 手动节点不主动访问主节点；
 - Relay client 主动出站连接主节点；
 - 截图、Trace 和 Response Body 使用 JSON base64 回传；
@@ -343,16 +348,45 @@ async def setup(ctx):
 
 存在结构化断言时不强制编写脚本。复杂登录、多窗口或业务分支仍可使用脚本模式。
 
+## 项目隔离与一次性迁移
+
+- 项目接口之外，任务、运行、趋势、状态页、指标、项目告警和项目配置包请求必须携带 `X-PulseGuard-Project-Id`；缺失返回 400，不存在返回 404。
+- 归档项目历史可读，但创建、编辑、执行、重跑、导入和版本恢复返回 409；调度器只装载活跃项目任务。
+- 只读令牌必须绑定至少一个项目，`/api/read-only/snapshot` 同时校验令牌范围与项目头。
+- `pulseguard.config` v4 只包含全局设置、Runner 和成员；`pulseguard.project` v1 只包含当前项目任务与项目告警。
+
+旧数据库不会由应用启动过程隐式修改。升级前先执行只读预检：
+
+```powershell
+uv run python scripts/migrate-projects.py
+```
+
+发布窗口内完成应用一致性备份后，再显式执行：
+
+```powershell
+uv run python scripts/migrate-projects.py --apply
+```
+
+脚本会在 `data/backups/` 创建迁移前 SQLite 在线备份、校验完整性并输出迁移前后各项目表计数和 SHA-256。迁移失败会回滚整个事务；回滚版本时必须同时恢复旧应用和该迁移前数据库备份。新旧版本不得连接同一数据库混跑。
+
 ## 数据与安全边界
 
 - 默认 SQLite，数据库位于 `data/`；
 - 在线备份位于 `data/backups/`；
+- 恢复备份会暂停新接单和调度，最多等待 30 秒排空已接纳的任务；超时返回 409 且不恢复。恢复、安全备份与初始化共用独占维护边界，失败时从安全备份补偿；客户端取消不会提前解除保护；
+- 纯查询使用只读 SQLite 快照，写入串行；历史保留清理按终态运行 ID 分批提交，运行中记录不删除，中断后重试不会重复归档；
+- 恢复仅在主节点执行；若恢复补偿或运行时配置重载失败，返回 503 并保持任务暂停，需要按错误提示人工恢复/检查配置后重启，不会自动恢复接单；API/UI 扫描预览不是持久化运行任务，不属于该接单范围；
+- “运维审计 → 数据库状态”只读展示数据库文件、WAL 与可回收空闲页；压缩仍需先备份并在停止写入的维护窗口执行；
 - 趋势数据写入 `trend_rollups` 聚合表；
 - 旧运行历史趋势默认不回填；
 - 截图、Trace、Response Body 和归档摘要位于 `reports/`；
 - 常见凭据、Header、Cookie 和只读令牌会在公开输出中脱敏；
 - 用户自定义 Python 脚本是可信本地工具能力，不是安全沙箱；
 - 录制器不是当前主线，多步骤探活优先使用模板、前置脚本和结构化规则。
+
+控制台不做手机视口兼容；H5 探测能力不受影响。前端编辑器运行时和 Worker 使用本地按需资源，无需公共 CDN。加载、并发与验收范围见 [性能优化说明](performance-optimization.md)。
+
+部署时核对 `uv run python -c "import sqlite3; print(sqlite3.sqlite_version)"`，优先采用 [SQLite 官方 WAL-reset 修复版本](https://sqlite.org/wal.html#walresetbug)（3.51.3+，或官方列出的 3.50.7 / 3.44.6 回移版本）。不要在应用运行时启动外部写入/checkpoint 工具；也不要让多个应用进程共用同一数据库。
 
 如确需补齐旧趋势数据，可临时设置：
 
@@ -367,9 +401,14 @@ PULSEGUARD_TREND_BACKFILL_ON_STARTUP=true
 | 接口 | 用途 |
 | --- | --- |
 | `GET /api/health` | 应用健康检查 |
+| `GET /api/projects` / `POST /api/projects` | 项目列表与创建 |
+| `GET /api/database-health` | 只读数据库容量与空闲页健康指标 |
 | `GET /api/metrics.json` | JSON 指标 |
 | `GET /api/metrics` | Prometheus 指标 |
 | `GET /api/read-only/snapshot` | 受令牌保护的只读快照 |
+| `GET /api/project-alert-settings` / `PUT /api/project-alert-settings` | 当前项目运行告警 |
+| `GET /api/config/export` | 导出 `pulseguard.config` v4 系统包 |
+| `GET /api/project-config/export` | 导出 `pulseguard.project` v1 当前项目包 |
 | `GET /api/runners` / `POST /api/runners` | 节点列表与手动创建 |
 | `GET /api/relay/status` | Relay 地址、状态与 fingerprint |
 | `POST /api/runners/provision` | 创建 Relay 节点与一次性部署命令 |

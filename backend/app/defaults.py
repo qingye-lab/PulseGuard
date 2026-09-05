@@ -13,18 +13,13 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "api_pool_size": 5,
     "browser_pool_size": 5,
     "max_task_runtime_seconds": 60,
-    "alerts_enabled": False,
     "system_alerts_enabled": True,
     "alert_detail_base_url": ALERT_DETAIL_BASE_URL,
-    "notification_channels": [],
-    "execution_notification_channel_ids": [],
+    "system_notification_channels": [],
     "system_notification_channel_ids": [],
     "members": [],
-    "alert_tag_policies": [],
     "environment_variables": [],
-    "alert_cooldown_minutes": 30,
     "alert_delivery_attempts": 3,
-    "recovery_notification": True,
     "api_failure_confirmation_count": 2,
     "ui_failure_confirmation_count": 3,
     "recovery_confirmation_count": 2,
@@ -57,6 +52,16 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "maintenance_message": "",
     "maintenance_starts_at": "",
     "maintenance_ends_at": "",
+}
+
+
+DEFAULT_PROJECT_ALERT_SETTINGS: dict[str, object] = {
+    "alerts_enabled": False,
+    "notification_channels": [],
+    "execution_notification_channel_ids": [],
+    "alert_tag_policies": [],
+    "alert_cooldown_minutes": 30,
+    "recovery_notification": True,
 }
 
 

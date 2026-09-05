@@ -44,6 +44,14 @@ SYSTEM_ERROR_PATTERNS = (
 )
 
 
+class MaintenanceBusyError(RuntimeError):
+    pass
+
+
+class RuntimeSettingsReloadError(RuntimeError):
+    """The database switched successfully, but execution must remain paused."""
+
+
 @dataclass
 class RunJob:
     check: dict[str, Any]
@@ -106,8 +114,10 @@ class CheckRunner:
         self._queue_limit = self._max_queue_size()
         self._queued_jobs = 0
         self._running_jobs = 0
+        self._worker_jobs = 0
         self._jobs: set[asyncio.Task[None]] = set()
         self._closing = False
+        self._maintenance_active = False
         self._suppress_shutdown_records = False
         self._global_limiter = AsyncCapacityLimiter(self._max_concurrency())
         self._ui_limiter = AsyncCapacityLimiter(self._max_ui_concurrency())
@@ -150,10 +160,15 @@ class CheckRunner:
         )
         self._refresh_local_runner_browser_capabilities(settings)
 
-    async def run_check(self, check_id: int, trigger: str = "scheduled") -> dict[str, Any]:
-        check = storage.get_check(check_id)
+    async def run_check(
+        self, check_id: int, trigger: str = "scheduled", project_id: int | None = None
+    ) -> dict[str, Any]:
+        check = storage.get_check(check_id, project_id=project_id)
         if not check:
             raise ValueError("任务不存在")
+        project = storage.get_project(int(check["project_id"]))
+        if not project or project.get("status") != "active":
+            raise ValueError("归档项目不能执行任务")
         if storage.is_deployment_window_active() and trigger != "post-deploy":
             return self._deployment_paused_result(check, trigger)
         runners = self._resolve_check_runners(check)
@@ -181,69 +196,40 @@ class CheckRunner:
     async def run_draft(self, check: dict[str, Any], trigger: str = "draft") -> dict[str, Any]:
         draft = dict(check)
         draft["id"] = 0
-        started = datetime.now().astimezone()
+        if not draft.get("project_id"):
+            raise ValueError("草稿调试缺少项目归属")
         settings = storage.get_settings()
         local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(settings)
         browser_type = self._first_runnable_browser_type(draft, local, settings) if self._uses_browser(draft) else ""
         if browser_type:
             draft = self._with_browser_type(draft, browser_type)
-            settings = settings_for_browser_type(settings, browser_type)
-        runner_payload = storage.runner_metadata(local, browser_type=browser_type)
-        try:
-            if self._uses_browser(draft):
-                async with self._ui_limiter.slot():
-                    async with self._global_limiter.slot():
-                        result_data = await self._execute_core(draft, trigger, 0, settings)
-            else:
-                async with self._global_limiter.slot():
-                    result_data = await self._execute_core(draft, trigger, 0, settings)
-        except Exception as exc:
-            message = mask_text(str(exc) or exc.__class__.__name__, settings)
-            finished = datetime.now().astimezone()
-            result_data = {
-                "status": "failed",
-                "finished_at": finished.isoformat(timespec="seconds"),
-                "duration_ms": self._task_duration_from_exception(exc),
-                "error_message": message,
-                "error_stack": mask_text(traceback.format_exc(), settings),
-                "logs": message,
-                "screenshot_path": None,
-                "trace_path": None,
-                "response_path": None,
-                "request_snapshot": None,
-                "response_snapshot": None,
-                **self._runner_metadata(settings, failure_kind="runner"),
-            }
-        result_data.update(
-            {
-                "runner_id": runner_payload.get("runner_id"),
-                "runner_name": runner_payload.get("runner_name"),
-                "runner_address": runner_payload.get("runner_address"),
-                "runner_region": runner_payload.get("runner_region"),
-                "runner_browser_version": result_data.get("runner_browser_version") or runner_payload.get("runner_browser_version"),
-            }
+        return await self._submit(
+            draft,
+            trigger,
+            record_status=False,
+            notify=False,
+            runner_metadata=storage.runner_metadata(local, browser_type=browser_type),
+            manage_active=False,
         )
-        metadata = run_metadata(trigger)
-        return {
-            "id": 0,
-            "check_id": 0,
-            "check_name": str(draft.get("name") or "草稿调试"),
-            "check_type": str(draft.get("type") or "api"),
-            "started_at": started.isoformat(timespec="seconds"),
-            "notification_status": "not_required",
-            "notification_channel": None,
-            "notification_error": None,
-            "notification_sent_at": None,
-            "trigger": trigger,
-            "observation_kind": metadata["observation_kind"],
-            "affects_health": False,
-            "run_group_id": None,
-            "created_at": started.isoformat(timespec="seconds"),
-            "consecutive_failures": 0,
-            **result_data,
-        }
 
     async def execute_worker_run(
+        self,
+        check: dict[str, Any],
+        trigger: str,
+        run_id: int,
+        settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        async with self._lock:
+            if self._maintenance_active:
+                return self._deployment_paused_result(check, trigger, run_id=run_id)
+            self._worker_jobs += 1
+        try:
+            return await self._execute_worker_run(check, trigger, run_id, settings)
+        finally:
+            async with self._lock:
+                self._worker_jobs -= 1
+
+    async def _execute_worker_run(
         self,
         check: dict[str, Any],
         trigger: str,
@@ -265,51 +251,21 @@ class CheckRunner:
     async def inspect_ui(self, payload: dict[str, Any]) -> dict[str, Any]:
         from .ui_assertions import inspect_ui_page
 
-        settings = storage.get_settings()
-        ctx = RunContext(
-            {
-                "id": 0,
-                "name": "页面扫描",
-                "type": "ui",
-                "entry_url": payload.get("entry_url") or "",
-                "timeout_ms": payload.get("timeout_ms") or settings.get("default_ui_timeout_ms", 15000),
-                "viewport_mode": payload.get("viewport_mode") or "web",
-                "setup_script": payload.get("setup_script") or "",
-                "method": "",
-                "headers_json": "{}",
-                "body": "",
-                "viewport_width": payload.get("viewport_width"),
-                "viewport_height": payload.get("viewport_height"),
-            },
-            0,
-            settings,
-            self.artifacts,
-            resources=self.resources,
-        )
-        setup_func = None
-        try:
-            setup_script = str(payload.get("setup_script") or "")
-            if setup_script.strip():
-                setup_func = self._load_check_function(
-                    setup_script,
-                    ctx,
-                    function_name="setup",
-                    expected_signature="async def setup(ctx, page)",
-                    script_label="前置脚本",
-                )
-            async with self._ui_limiter.slot():
-                return await inspect_ui_page(payload, settings, ctx=ctx, setup_func=setup_func)
-        finally:
-            await ctx.close(False)
+        return await self._inspect_ui(payload, inspect_ui_page, "页面扫描")
 
     async def inspect_ui_rules(self, payload: dict[str, Any]) -> dict[str, Any]:
         from .ui_assertions import inspect_ui_rule_selectors
 
-        settings = storage.get_settings()
+        return await self._inspect_ui(payload, inspect_ui_rule_selectors, "规则检测")
+
+    async def _inspect_ui(self, payload: dict[str, Any], inspect_func: Any, name: str) -> dict[str, Any]:
+        from .ui_diagnostics import UiInspectionFailure, inspection_diagnostics
+
+        settings = storage.settings_for_project(storage.get_settings(), payload.get("project_id"))
         ctx = RunContext(
             {
                 "id": 0,
-                "name": "规则检测",
+                "name": name,
                 "type": "ui",
                 "entry_url": payload.get("entry_url") or "",
                 "timeout_ms": payload.get("timeout_ms") or settings.get("default_ui_timeout_ms", 15000),
@@ -327,7 +283,10 @@ class CheckRunner:
             resources=self.resources,
         )
         setup_func = None
+        failure: UiInspectionFailure | None = None
+        result: dict[str, Any] | None = None
         try:
+            ctx.ui_stage = "compile"
             setup_script = str(payload.get("setup_script") or "")
             if setup_script.strip():
                 setup_func = self._load_check_function(
@@ -337,10 +296,34 @@ class CheckRunner:
                     expected_signature="async def setup(ctx, page)",
                     script_label="前置脚本",
                 )
-            async with self._ui_limiter.slot():
-                return await inspect_ui_rule_selectors(payload, settings, ctx=ctx, setup_func=setup_func)
+            ctx.ui_stage = "queue"
+            async def inspect_with_slot() -> dict[str, Any]:
+                async with self._ui_limiter.slot():
+                    return await inspect_func(payload, settings, ctx=ctx, setup_func=setup_func)
+
+            result = await asyncio.wait_for(
+                inspect_with_slot(),
+                timeout=int(settings.get("max_task_runtime_seconds", 60)),
+            )
+            result["diagnostics"] = inspection_diagnostics(ctx)
+        except Exception as exc:
+            diagnostics = inspection_diagnostics(ctx, error=exc)
+            failure = UiInspectionFailure(diagnostics["message"], diagnostics)
         finally:
-            await ctx.close(False)
+            try:
+                await ctx.close(False)
+            except Exception as exc:
+                # Preserve cancellation and the primary failure; cleanup is secondary.
+                if failure is not None:
+                    failure.diagnostics["cleanup_error"] = mask_text(str(exc) or type(exc).__name__, ctx.settings)[:8000]
+                elif result is not None:
+                    ctx.ui_stage = "cleanup"
+                    diagnostics = inspection_diagnostics(ctx, error=exc)
+                    failure = UiInspectionFailure(diagnostics["message"], diagnostics)
+        if failure is not None:
+            raise failure from None
+        assert result is not None
+        return result
 
     def runtime_status(self) -> dict[str, Any]:
         global_slots = self._global_limiter.snapshot()
@@ -364,6 +347,7 @@ class CheckRunner:
             "pools": self.resources.snapshot(),
             "active_checks": len(self._active_checks),
             "closing": self._closing,
+            "maintenance_active": self._maintenance_active,
         }
 
     async def wait_for_idle(self, timeout_seconds: float = 30) -> dict[str, Any]:
@@ -373,15 +357,42 @@ class CheckRunner:
                 queued = self._queued_jobs
                 running = self._running_jobs
                 active_checks = len(self._active_checks)
-            idle = queued == 0 and running == 0 and active_checks == 0
+                self._jobs = {job for job in self._jobs if not job.done()}
+                in_flight_jobs = len(self._jobs)
+                worker_jobs = self._worker_jobs
+            # A cancelled distributed request can release group counters while
+            # its shielded local children are still finishing persisted runs.
+            idle = queued == 0 and running == 0 and active_checks == 0 and in_flight_jobs == 0 and worker_jobs == 0
             if idle or perf_counter() >= deadline:
                 return {
                     "idle": idle,
                     "queued": queued,
                     "running": running,
                     "active_checks": active_checks,
+                    "in_flight_jobs": in_flight_jobs,
+                    "worker_jobs": worker_jobs,
                 }
             await asyncio.sleep(0.2)
+
+    @asynccontextmanager
+    async def maintenance_window(self) -> AsyncIterator[None]:
+        """Stop new admissions while previously accepted work drains."""
+        async with self._lock:
+            if self._maintenance_active:
+                raise MaintenanceBusyError("数据库维护正在进行，请稍后重试")
+            self._maintenance_active = True
+        release_admissions = True
+        try:
+            yield
+        except (storage.DatabaseRestoreRecoveryError, RuntimeSettingsReloadError):
+            # Recovery or runtime reinitialization failed. Keep execution closed
+            # until an operator follows the recovery error and restarts safely.
+            release_admissions = False
+            raise
+        finally:
+            if release_admissions:
+                async with self._lock:
+                    self._maintenance_active = False
 
     async def _submit(
         self,
@@ -397,12 +408,15 @@ class CheckRunner:
         check_id = int(check.get("id") or 0)
         async with self._lock:
             self._jobs = {job for job in self._jobs if not job.done()}
+            # Internal children belong to an already counted distributed group.
+            if self._maintenance_active and manage_capacity:
+                return self._deployment_paused_result(check, trigger)
             if self._closing:
-                return self._create_skipped_run(check, "执行器正在关闭，本次已跳过", trigger, record_status=record_status)
+                return self._create_skipped_run(check, "执行器正在关闭，本次已跳过", trigger)
             if manage_active and check_id > 0 and check_id in self._active_checks:
-                return self._create_skipped_run(check, "同一任务上一次执行尚未结束或仍在排队，本次已跳过", trigger, record_status=record_status)
+                return self._create_skipped_run(check, "同一任务上一次执行尚未结束或仍在排队，本次已跳过", trigger)
             if manage_capacity and self._queued_jobs >= self._queue_limit:
-                return self._create_skipped_run(check, "执行队列已满，本次已跳过", trigger, record_status=record_status)
+                return self._create_skipped_run(check, "执行队列已满，本次已跳过", trigger)
 
             settings = storage.get_settings()
             metadata = run_metadata(trigger)
@@ -454,7 +468,7 @@ class CheckRunner:
                     finish_exc,
                     status="timeout",
                 )
-            await self._notify_system_result(
+            result = await self._notify_system_result(
                 job.check,
                 job.trigger,
                 job.run_id,
@@ -466,7 +480,7 @@ class CheckRunner:
             result = self._finish_cancelled_job(job)
         except Exception as exc:
             result = self._finish_internal_error(job, exc)
-            await self._notify_system_result(
+            result = await self._notify_system_result(
                 job.check,
                 job.trigger,
                 job.run_id,
@@ -536,7 +550,7 @@ class CheckRunner:
         notify: bool = True,
         runner_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        settings = storage.get_settings()
+        settings = storage.settings_for_project(storage.get_settings(), check.get("project_id"))
         result_data = await self._execute_core(check, trigger, run_id, settings)
         if runner_metadata:
             result_data.update(
@@ -550,10 +564,9 @@ class CheckRunner:
                 }
             )
         if self._is_runner_system_result(result_data):
-            storage.discard_incomplete_run(run_id)
-            result = self._ephemeral_runner_result(check, trigger, run_id, result_data)
+            result = self._finish_runner_result(check, trigger, run_id, result_data)
             if notify:
-                await self._notify_system_result(check, trigger, run_id, result, settings, source="runner")
+                result = await self._notify_system_result(check, trigger, run_id, result, settings, source="runner")
             return result
         finished_run = storage.finish_run(run_id, result_data)
 
@@ -649,7 +662,11 @@ class CheckRunner:
                             retrying = False
                         else:
                             ctx.log(f"运行清理失败：{exc}")
-                    log_lines.extend(ctx.logs)
+                    log_lines.extend(mask_text(line, ctx.settings) for line in ctx.logs)
+                    if error_message is not None:
+                        error_message = mask_text(error_message, ctx.settings)
+                    if error_stack is not None:
+                        error_stack = mask_text(error_stack, ctx.settings)
 
             if retrying:
                 continue
@@ -659,8 +676,13 @@ class CheckRunner:
         safe_error_message = mask_text(error_message, settings) if error_message is not None else None
         safe_error_stack = mask_text(error_stack, settings) if error_stack is not None else None
         safe_logs = mask_text("\n".join(log_lines), settings)
-        safe_request_snapshot = mask_data(ctx.request_snapshot, settings) if ctx and ctx.request_snapshot else None
-        safe_response_snapshot = mask_data(ctx.response_snapshot, settings) if ctx and ctx.response_snapshot else None
+        if ctx is not None and check.get("type") == "ui":
+            from .ui_diagnostics import inspection_diagnostics
+
+            diagnostics = inspection_diagnostics(ctx, error=RunFailure(error_message) if error_message else None)
+            ctx.request_snapshot = {**(ctx.request_snapshot or {}), "diagnostics": diagnostics}
+        safe_request_snapshot = mask_data(ctx.request_snapshot, ctx.settings) if ctx and ctx.request_snapshot else None
+        safe_response_snapshot = mask_data(ctx.response_snapshot, ctx.settings) if ctx and ctx.response_snapshot else None
         runner_metadata = self._runner_metadata(settings, ctx=ctx, failure_kind=failure_kind)
         runner_metadata["browser_type"] = (
             str(check.get("_browser_type") or runner_metadata.get("browser_type") or settings.get("browser_type") or "")
@@ -702,7 +724,9 @@ class CheckRunner:
                     expected_signature="async def setup(ctx, page)",
                     script_label="前置脚本",
                 )
-            return await self._measure_task_duration(run_structured_ui_check(ctx, setup_func=setup_func))
+            return await self._measure_task_duration(asyncio.wait_for(
+                run_structured_ui_check(ctx, setup_func=setup_func), timeout=max_runtime_seconds,
+            ))
         else:
             check_func = self._load_check_function(check.get("script") or "", ctx)
             return await self._measure_task_duration(asyncio.wait_for(check_func(ctx), timeout=timeout_seconds))
@@ -735,23 +759,17 @@ class CheckRunner:
             retries = 0
         return 1 + max(0, min(3, int(retries or 0)))
 
-    def _create_skipped_run(self, check: dict[str, Any], message: str, trigger: str, record_status: bool = True) -> dict[str, Any]:
-        settings = self._settings_for_check(check, storage.get_settings())
-        metadata = run_metadata(trigger)
-        if not record_status:
-            metadata = {**metadata, "affects_health": False}
+    def _create_skipped_run(self, check: dict[str, Any], message: str, trigger: str) -> dict[str, Any]:
+        settings = self._settings_for_check(check, storage.settings_for_project(storage.get_settings(), check.get("project_id")))
+        metadata = {**run_metadata(trigger), "affects_health": False}
         runner_payload = self._runner_metadata(settings, failure_kind="runner")
         run = storage.create_run(
             self._with_runner_metadata(check, settings, runner_payload, trigger=trigger, run_metadata_payload=metadata),
             "skipped",
             message,
         )
-        if not record_status or not metadata["affects_health"]:
-            storage.update_run_notification(int(run["id"]), "not_required", channel=None, error=None, sent_at=None)
-            return storage.get_run(int(run["id"])) or run
-        if run.get("affects_health"):
-            storage.update_check_status(int(check["id"]), run)
-        return run
+        storage.update_run_notification(int(run["id"]), "not_required", channel=None, error=None, sent_at=None)
+        return storage.get_run(int(run["id"])) or run
 
     def _finish_cancelled_job(self, job: RunJob) -> dict[str, Any]:
         if self._suppress_shutdown_records:
@@ -808,8 +826,7 @@ class CheckRunner:
             **({**(job.runner_metadata or self._runner_metadata(settings)), "failure_kind": "runner"}),
             "affects_health": False,
         }
-        storage.discard_incomplete_run(job.run_id)
-        return self._ephemeral_runner_result(job.check, job.trigger, job.run_id, payload)
+        return self._finish_runner_result(job.check, job.trigger, job.run_id, payload)
 
     def _finish_without_context(
         self,
@@ -835,9 +852,9 @@ class CheckRunner:
             "request_snapshot": None,
             "response_snapshot": None,
             **({**(job.runner_metadata or self._runner_metadata(settings)), "failure_kind": "runner"}),
+            "affects_health": False,
         }
-        storage.discard_incomplete_run(job.run_id)
-        return self._ephemeral_runner_result(job.check, job.trigger, job.run_id, payload)
+        return self._finish_runner_result(job.check, job.trigger, job.run_id, payload)
 
     @staticmethod
     def _is_runner_system_result(data: dict[str, Any]) -> bool:
@@ -865,9 +882,10 @@ class CheckRunner:
         settings: dict[str, Any],
         *,
         source: str,
-    ) -> None:
+    ) -> dict[str, Any]:
+        outcome: dict[str, Any]
         try:
-            await notifier.notify_system_error(
+            notified = await notifier.notify_system_error(
                 {
                     "source": source,
                     "severity": "error",
@@ -883,8 +901,68 @@ class CheckRunner:
                 },
                 settings=settings,
             )
+            outcome = notified if isinstance(notified, dict) else {}
+        except Exception as exc:
+            outcome = {
+                "sent": False,
+                "status": "failed",
+                "error": mask_text(str(exc).strip() or exc.__class__.__name__, settings),
+            }
+        if str(result.get("failure_kind") or "") == "runner" and not bool(result.get("affects_health")):
+            status, channel, error, sent_at = self._system_notification_record(outcome)
+            try:
+                storage.update_run_notification(run_id, status, channel=channel, error=error, sent_at=sent_at)
+            except Exception:
+                pass
+            try:
+                return storage.get_run(run_id) or result
+            except Exception:
+                return result
+        return result
+
+    @staticmethod
+    def _system_notification_record(outcome: dict[str, Any]) -> tuple[str, str | None, str | None, str | None]:
+        reason = str(outcome.get("reason") or "")
+        if reason in {"disabled", "no_channels"}:
+            return "disabled", None, None, None
+        if reason == "settings_unavailable":
+            return "failed", None, "system notification settings unavailable", None
+        status = str(outcome.get("status") or "")
+        if status not in {"sent", "failed"}:
+            status = "sent" if outcome.get("sent") else "failed"
+        channel = str(outcome.get("channel") or "").strip() or None
+        error = str(outcome.get("error") or "").strip() or None
+        sent_at = storage.now_iso() if outcome.get("sent") else None
+        return status, channel, error, sent_at
+
+    @staticmethod
+    def _finish_runner_result(
+        check: dict[str, Any],
+        trigger: str,
+        run_id: int,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = {**data, "failure_kind": "runner", "affects_health": False}
+        try:
+            existing = storage.get_run(run_id)
         except Exception:
-            return
+            existing = None
+        if existing and str(existing.get("status") or "") not in {"pending", "running"}:
+            return existing
+        try:
+            finished = storage.finish_run(run_id, payload)
+        except Exception:
+            return CheckRunner._ephemeral_runner_result(check, trigger, run_id, payload)
+        if finished is None:
+            return CheckRunner._ephemeral_runner_result(check, trigger, run_id, payload)
+        try:
+            storage.update_run_notification(run_id, "not_required", channel=None, error=None, sent_at=None)
+        except Exception:
+            pass
+        try:
+            return storage.get_run(run_id) or finished
+        except Exception:
+            return finished
 
     @staticmethod
     def _ephemeral_runner_result(
@@ -1078,6 +1156,8 @@ class CheckRunner:
 
         async with self._lock:
             self._jobs = {job for job in self._jobs if not job.done()}
+            if self._maintenance_active:
+                return self._deployment_paused_result(check, trigger)
             if self._closing:
                 return self._create_skipped_run(check, "执行器正在关闭，本次已跳过", trigger)
             if check_id > 0 and check_id in self._active_checks:
@@ -1128,15 +1208,28 @@ class CheckRunner:
                 "pending",
             )
             unavailable = self._finish_runner_unavailable(int(run["id"]), check_payload, trigger, runner, target.skip_reason)
-            await self._notify_system_result(check_payload, trigger, int(run["id"]), unavailable, self._settings_for_system_alert(), source="runner")
-            return unavailable
+            return await self._notify_system_result(
+                check_payload,
+                trigger,
+                int(run["id"]),
+                unavailable,
+                self._settings_for_system_alert(),
+                source="runner",
+            )
         if not storage.can_schedule_runner(runner):
             run = storage.create_run(
                 self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
             )
             unavailable = self._finish_runner_unavailable(int(run["id"]), check, trigger, runner, "执行节点不可用")
-            await self._notify_system_result(check_payload, trigger, int(run["id"]), unavailable, self._settings_for_system_alert(), source="runner")
+            unavailable = await self._notify_system_result(
+                check_payload,
+                trigger,
+                int(run["id"]),
+                unavailable,
+                self._settings_for_system_alert(),
+                source="runner",
+            )
             await self._notify_runner_unavailable_if_needed(runner, check)
             return unavailable
         if runner_id == storage.LOCAL_RUNNER_ID:
@@ -1160,29 +1253,46 @@ class CheckRunner:
         except Exception as exc:
             storage.mark_probe_runner_unavailable(runner_id)
             unavailable = self._finish_runner_unavailable(run_id, check, trigger, runner, f"执行节点调用失败：{exc}")
-            await self._notify_system_result(check_payload, trigger, run_id, unavailable, self._settings_for_system_alert(), source="runner")
+            unavailable = await self._notify_system_result(
+                check_payload,
+                trigger,
+                run_id,
+                unavailable,
+                self._settings_for_system_alert(),
+                source="runner",
+            )
             latest_runner = storage.get_probe_runner(runner_id) or runner
             await self._notify_runner_unavailable_if_needed(latest_runner, check)
             return unavailable
         data = self._remote_result_to_finish_payload(result, run_id, runner)
         if self._is_runner_system_result(data):
             latest_runner = storage.mark_probe_runner_unavailable(runner_id, status="unhealthy") or storage.get_probe_runner(runner_id) or runner
-            storage.discard_incomplete_run(run_id)
-            system_result = self._ephemeral_runner_result(check_payload, trigger, run_id, data)
-            await self._notify_system_result(check_payload, trigger, run_id, system_result, self._settings_for_system_alert(), source="runner")
+            system_result = self._finish_runner_result(check_payload, trigger, run_id, data)
+            system_result = await self._notify_system_result(
+                check_payload,
+                trigger,
+                run_id,
+                system_result,
+                self._settings_for_system_alert(),
+                source="runner",
+            )
             await self._notify_runner_unavailable_if_needed(latest_runner, check)
             return system_result
         finished = storage.finish_run(run_id, data)
         return storage.get_run(run_id) or finished or run
 
     async def _call_remote_runner(self, runner: dict[str, Any], check: dict[str, Any], trigger: str, run_id: int) -> dict[str, Any]:
+        try:
+            storage.ensure_probe_runner_transport_allowed(runner)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         address = str(runner.get("address") or "").strip().rstrip("/")
         token = str(runner.get("_token") or "")
         if not address:
             raise RuntimeError("Runner address is empty")
         if not token:
             token = self._runner_token_from_row(runner)
-        settings = storage.get_settings()
+        settings = storage.settings_for_project(storage.get_settings(), check.get("project_id"))
         payload = {
             "check": self._worker_check_payload(check),
             "trigger": trigger,
@@ -1293,12 +1403,11 @@ class CheckRunner:
             **storage.runner_metadata(runner, failure_kind="runner", browser_type=str(check.get("_browser_type") or "")),
             "affects_health": False,
         }
-        storage.discard_incomplete_run(run_id)
-        return self._ephemeral_runner_result(check, trigger, run_id, payload)
+        return self._finish_runner_result(check, trigger, run_id, payload)
 
     async def _finish_distributed_group(self, check: dict[str, Any], runs: list[dict[str, Any]], trigger: str) -> dict[str, Any]:
         if not runs:
-            return self._create_skipped_run(check, "没有可执行节点，本次已跳过", trigger, record_status=False)
+            return self._create_skipped_run(check, "没有可执行节点，本次已跳过", trigger)
         status_run = self._aggregate_group_run(runs)
         if status_run.get("affects_health") and status_run.get("failure_kind") != "runner":
             transition = storage.update_check_status(int(check["id"]), status_run)

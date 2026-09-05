@@ -62,7 +62,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         update_run_notification.assert_called_once_with(43, "not_required", channel=None, error=None, sent_at=None)
 
     def test_maybe_notify_sends_to_all_enabled_configured_channels(self) -> None:
-        run = {"id": 44, "status": "failed", "started_at": "2026-06-05T10:00:00+08:00"}
+        run = {"id": 44, "project_id": 7, "status": "failed", "started_at": "2026-06-05T10:00:00+08:00"}
         transition = {"current_status": "failing", "previous_status": "suspected_failing", "consecutive_failures": 2}
         settings = {
             "alerts_enabled": True,
@@ -96,18 +96,27 @@ class DingtalkNotifierTests(unittest.TestCase):
         }
 
         with patch.object(notifier.storage, "get_settings", return_value=settings), patch.object(
+            notifier.storage, "get_project", return_value={"id": 7, "status": "active"}
+        ), patch.object(
+            notifier.storage, "get_project_alert_settings", return_value=settings
+        ), patch.object(
             notifier, "send_webhook_alert", new_callable=AsyncMock
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:00:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ) as update_run_notification, patch.object(notifier.storage, "update_last_notified") as update_last_notified:
-            self.run_async(notifier.maybe_notify({"id": 11, "type": "api", "name": "接口"}, run, transition))
+            self.run_async(
+                notifier.maybe_notify({"id": 11, "project_id": 7, "type": "api", "name": "接口"}, run, transition)
+            )
 
         self.assertEqual(send_webhook_alert.await_count, 2)
         sent_channel_ids = [call.args[0]["id"] for call in send_webhook_alert.await_args_list]
         self.assertEqual(sent_channel_ids, ["feishu", "ding"])
         sent_messages = [call.args[2] for call in send_webhook_alert.await_args_list]
         self.assertTrue(
-            all("http://10.168.78.49:8787/runs/44?from=%2Fruns%3Fcheck_id%3D11" in message for message in sent_messages)
+            all(
+                "http://10.168.78.49:8787/runs/44?from=%2Fruns%3Fcheck_id%3D11&project_id=7" in message
+                for message in sent_messages
+            )
         )
         update_run_notification.assert_called_once_with(
             44,
@@ -119,24 +128,34 @@ class DingtalkNotifierTests(unittest.TestCase):
         update_last_notified.assert_called_once_with(11, "2026-06-05T10:00:01+08:00")
 
     def test_maybe_notify_uses_execution_channel_selection(self) -> None:
-        run = {"id": 55, "status": "failed", "started_at": "2026-06-05T10:00:00+08:00"}
+        run = {"id": 55, "project_id": 7, "status": "failed", "started_at": "2026-06-05T10:00:00+08:00"}
         transition = {"current_status": "failing", "previous_status": "healthy", "consecutive_failures": 1}
-        settings = {
+        global_settings = {
+            "members": [],
+            "system_notification_channels": [
+                {"id": "infra", "name": "系统群", "type": "wecom", "enabled": True, "webhook_url": "https://example.test/infra"},
+            ],
+        }
+        project_settings = {
             "alerts_enabled": True,
             "execution_notification_channel_ids": ["biz"],
             "notification_channels": [
                 {"id": "biz", "name": "业务群", "type": "feishu", "enabled": True, "webhook_url": "https://example.test/biz"},
-                {"id": "infra", "name": "系统群", "type": "wecom", "enabled": True, "webhook_url": "https://example.test/infra"},
             ],
         }
 
-        with patch.object(notifier.storage, "get_settings", return_value=settings), patch.object(
+        with patch.object(notifier.storage, "get_settings", return_value=global_settings), patch.object(
+            notifier.storage, "get_project", return_value={"id": 7, "status": "active"}
+        ), patch.object(
+            notifier.storage, "get_project_alert_settings", return_value=project_settings
+        ) as get_project_alert_settings, patch.object(
             notifier, "send_webhook_alert", new_callable=AsyncMock
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:00:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ), patch.object(notifier.storage, "update_last_notified"):
-            self.run_async(notifier.maybe_notify({"id": 11, "type": "api", "name": "接口"}, run, transition))
+            self.run_async(notifier.maybe_notify({"id": 11, "project_id": 7, "type": "api", "name": "接口"}, run, transition))
 
+        get_project_alert_settings.assert_called_once_with(7)
         send_webhook_alert.assert_awaited_once()
         self.assertEqual(send_webhook_alert.await_args.args[0]["id"], "biz")
 
@@ -145,7 +164,7 @@ class DingtalkNotifierTests(unittest.TestCase):
             "system_alerts_enabled": True,
             "alert_delivery_attempts": 1,
             "system_notification_channel_ids": ["infra"],
-            "notification_channels": [
+            "system_notification_channels": [
                 {"id": "biz", "name": "业务群", "type": "feishu", "enabled": True, "webhook_url": "https://example.test/biz"},
                 {"id": "infra", "name": "系统群", "type": "wecom", "enabled": True, "webhook_url": "https://example.test/infra"},
             ],

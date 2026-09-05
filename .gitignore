@@ -8,6 +8,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .playwright-mcp/
+.playwright-cli/
+/output/playwright/
+.claude/settings.local.json
 *.tsbuildinfo
 node_modules/
 dist/

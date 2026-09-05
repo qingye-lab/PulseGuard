@@ -149,14 +149,16 @@ class MonitoringStorageTests(unittest.TestCase):
 def _seed_trend_run(check_id: int, check_type: str, started_at: datetime, duration_ms: int = 300) -> None:
     timestamp = started_at.isoformat(timespec="seconds")
     with storage._connect() as conn:
+        project_id = int(conn.execute("SELECT project_id FROM checks WHERE id = ?", (check_id,)).fetchone()[0])
         cursor = conn.execute(
             """
             INSERT INTO runs (
-                check_id, check_name, check_type, status, started_at, finished_at,
+                project_id, check_id, check_name, check_type, status, started_at, finished_at,
                 duration_ms, failure_kind, observation_kind, affects_health, created_at
-            ) VALUES (?, ?, ?, 'ok', ?, ?, ?, 'none', 'observation', 1, ?)
+            ) VALUES (?, ?, ?, ?, 'ok', ?, ?, ?, 'none', 'observation', 1, ?)
             """,
             (
+                project_id,
                 check_id,
                 "Trend UI" if check_type == "ui" else "Trend API",
                 check_type,

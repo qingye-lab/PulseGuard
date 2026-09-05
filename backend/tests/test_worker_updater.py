@@ -41,6 +41,51 @@ class WorkerUpdaterTokenTests(unittest.TestCase):
 
 
 class WorkerUpdaterImageTests(unittest.TestCase):
+    def test_target_image_accepts_exact_repository_with_tag_or_digest(self) -> None:
+        with patch.object(worker_updater, "ALLOWED_PREFIXES", ("pulseguard-worker",)):
+            tagged = worker_updater._target_image({"target_image": "pulseguard-worker:stable"})
+            pinned = worker_updater._target_image(
+                {"target_image": "pulseguard-worker@sha256:" + ("a" * 64)}
+            )
+
+        self.assertEqual(tagged, "pulseguard-worker:stable")
+        self.assertTrue(pinned.startswith("pulseguard-worker@sha256:"))
+
+    def test_target_image_rejects_repository_prefix_lookalike(self) -> None:
+        with patch.object(worker_updater, "ALLOWED_PREFIXES", ("pulseguard-worker",)):
+            with self.assertRaisesRegex(ValueError, "not allowed"):
+                worker_updater._target_image(
+                    {"target_image": "pulseguard-worker.attacker.example/evil:latest"}
+                )
+
+    def test_target_image_matches_registry_port_repository_exactly(self) -> None:
+        with patch.object(
+            worker_updater,
+            "ALLOWED_PREFIXES",
+            ("registry.example.com:5000/ops/pulseguard-worker",),
+        ):
+            accepted = worker_updater._target_image(
+                {"target_image": "registry.example.com:5000/ops/pulseguard-worker:v2"}
+            )
+            with self.assertRaisesRegex(ValueError, "not allowed"):
+                worker_updater._target_image(
+                    {"target_image": "registry.example.com:5000/ops/pulseguard-worker-extra:v2"}
+                )
+
+        self.assertEqual(accepted, "registry.example.com:5000/ops/pulseguard-worker:v2")
+
+    def test_target_image_supports_explicit_namespace_allowlist(self) -> None:
+        with patch.object(worker_updater, "ALLOWED_PREFIXES", ("ghcr.io/example/*",)):
+            accepted = worker_updater._target_image(
+                {"target_image": "ghcr.io/example/pulseguard-worker:latest"}
+            )
+            with self.assertRaisesRegex(ValueError, "not allowed"):
+                worker_updater._target_image(
+                    {"target_image": "ghcr.io/example-attacker/pulseguard-worker:latest"}
+                )
+
+        self.assertEqual(accepted, "ghcr.io/example/pulseguard-worker:latest")
+
     def test_ensure_image_available_uses_pulled_image(self) -> None:
         with patch.object(worker_updater, "_run", return_value="pulled") as run:
             worker_updater._ensure_image_available("pulseguard-worker:local")

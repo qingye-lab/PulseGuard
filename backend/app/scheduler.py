@@ -55,7 +55,7 @@ class PulseScheduler:
         for job in list(self.scheduler.get_jobs()):
             if job.id.startswith("check-"):
                 self.scheduler.remove_job(job.id)
-        for check in storage.list_checks(enabled_only=True):
+        for check in storage.list_checks(enabled_only=True, active_projects_only=True):
             self.sync_check(int(check["id"]), check=check)
 
     def sync_check(self, check_id: int, check: dict[str, Any] | None = None) -> None:
@@ -64,7 +64,8 @@ class PulseScheduler:
             self.scheduler.remove_job(job_id)
 
         check = check or storage.get_check(check_id)
-        if not check or not check.get("enabled"):
+        project = storage.get_project(int(check.get("project_id") or 0)) if check else None
+        if not check or not check.get("enabled") or not project or project.get("status") != "active":
             return
 
         self.scheduler.add_job(

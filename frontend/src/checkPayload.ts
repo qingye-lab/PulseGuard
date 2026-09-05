@@ -142,7 +142,24 @@ export function normalizeCheckPayload(value: CheckPayload): CheckPayload {
 }
 
 export function sameCheckPayload(left: CheckPayload, right: CheckPayload): boolean {
-  return JSON.stringify(normalizeCheckPayload(left)) === JSON.stringify(normalizeCheckPayload(right));
+  function comparable(value: CheckPayload): string {
+    const normalized: Record<string, unknown> = { ...normalizeCheckPayload(value) };
+    for (const field of ["assertions_json", "headers_json", "alert_policy_json"]) {
+      try { normalized[field] = { json: JSON.parse(String(normalized[field])) }; }
+      catch { /* Invalid drafts remain distinguishable by their original text. */ }
+    }
+    return JSON.stringify(sortObjectKeys(normalized));
+  }
+  return comparable(left) === comparable(right);
+}
+
+function sortObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortObjectKeys);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => [key, sortObjectKeys(item)]));
+  }
+  return value;
 }
 
 export function detectBodyMode(value?: string | null): BodyEditorMode {

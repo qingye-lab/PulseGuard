@@ -1,5 +1,8 @@
 import type { UiAssertion, UiAssertionType } from "./types";
 
+const ELEMENT_SELECTOR_TYPES: UiAssertionType[] = ["element_visible", "element_hidden", "element_not_empty", "element_count"];
+const TEXT_TYPES: UiAssertionType[] = ["text_present", "text_absent", "title_contains", "url_contains"];
+
 export const UI_ASSERTION_LABELS: Record<UiAssertionType, string> = {
   element_visible: "元素可见",
   element_hidden: "元素隐藏",
@@ -45,7 +48,7 @@ export function createUiAssertion(type: UiAssertionType): UiAssertion {
   if (type === "element_count") {
     return { ...base, selector: "", operator: "eq", expected_count: 1 };
   }
-  if (["text_present", "text_absent", "title_contains", "url_contains"].includes(type)) {
+  if (TEXT_TYPES.includes(type)) {
     return { ...base, expected_text: "" };
   }
   return base;
@@ -61,12 +64,16 @@ function normalizeUiAssertion(item: unknown): UiAssertion | null {
     type,
     enabled: source.enabled !== false
   };
-  if (["element_visible", "element_hidden", "element_not_empty", "element_count"].includes(type)) {
+  if (ELEMENT_SELECTOR_TYPES.includes(type)) {
     assertion.selector = source.selector || "";
     applySelectorMetadata(assertion, source);
   }
-  if (["text_present", "text_absent", "title_contains", "url_contains"].includes(type)) {
+  if (TEXT_TYPES.includes(type)) {
     assertion.expected_text = source.expected_text || "";
+    if ((type === "text_present" || type === "text_absent") && source.selector) {
+      assertion.selector = source.selector;
+      applySelectorMetadata(assertion, source);
+    }
   }
   if (type === "element_count") {
     assertion.operator = source.operator || "eq";
@@ -82,6 +89,13 @@ function applySelectorMetadata(assertion: UiAssertion, source: Partial<UiAsserti
   if (selectorType) assertion.selector_type = selectorType;
   if (selectorStability) assertion.selector_stability = selectorStability;
   if (Number.isFinite(selectorScore)) assertion.selector_score = selectorScore;
+  if (typeof source.scope_selector === "string" && source.scope_selector.trim()) assertion.scope_selector = source.scope_selector.trim();
+  if (typeof source.relative_selector === "string" && source.relative_selector.trim()) assertion.relative_selector = source.relative_selector.trim();
+  if (source.match_mode === "first" || source.match_mode === "all" || source.match_mode === "every_scope") assertion.match_mode = source.match_mode;
+  if (source.count_mode === "attached" || source.count_mode === "visible") assertion.count_mode = source.count_mode;
+  if (Array.isArray(source.frame_path) && source.frame_path.every((item) => Number.isInteger(item) && item >= 0)) {
+    assertion.frame_path = source.frame_path.map(Number);
+  }
 }
 
 function normalizeSelectorStability(value: unknown): UiAssertion["selector_stability"] | undefined {

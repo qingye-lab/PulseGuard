@@ -15,6 +15,8 @@ import type {
   ConfigImportPreview,
   ConfigImportResult,
   DatabaseBackup,
+  DatabaseHealth,
+  EnvironmentVariable,
   MonitoringTrends,
   NotificationStatus,
   Overview,
@@ -34,18 +36,46 @@ import type {
   RunStatus,
   RuntimeStatus,
   SettingsValues,
+  Project,
+  ProjectAlertSettings,
   StatusPageSnapshot,
   TrendPeriod,
   UiInspectPayload,
   UiInspectResult,
+  UiInspectionDiagnostics,
   UiRuleInspectPayload,
   UiRuleInspectResult
 } from "./types";
 
+export const PROJECT_STORAGE_KEY = "pulseguard.current-project-id";
+
+let activeProjectId: number | undefined;
+
+export function setActiveProjectId(projectId: number | null | undefined): void {
+  activeProjectId = Number.isInteger(projectId) && Number(projectId) > 0 ? Number(projectId) : undefined;
+}
+
+function projectHeader(): Record<string, string> {
+  return activeProjectId ? { "X-PulseGuard-Project-Id": String(activeProjectId) } : {};
+}
+
+const PROJECT_ALERT_KEYS = new Set([
+  "alerts_enabled",
+  "notification_channels",
+  "execution_notification_channel_ids",
+  "alert_tag_policies",
+  "alert_cooldown_minutes",
+  "recovery_notification"
+]);
+
+function projectAlertValues(values: Partial<SettingsValues>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(values).filter(([key]) => PROJECT_ALERT_KEYS.has(key)));
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-    ...init
+    ...init,
+    headers: { "Content-Type": "application/json", ...projectHeader(), ...(init?.headers || {}) }
   });
   if (!response.ok) {
     throw await responseError(response);
@@ -55,8 +85,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 async function downloadFile(path: string, init?: RequestInit): Promise<ConfigExportFile> {
   const response = await fetch(path, {
-    headers: { Accept: "application/json", ...(init?.headers || {}) },
-    ...init
+    ...init,
+    headers: { Accept: "application/json", ...projectHeader(), ...(init?.headers || {}) }
   });
   if (!response.ok) {
     throw await responseError(response);
@@ -67,15 +97,26 @@ async function downloadFile(path: string, init?: RequestInit): Promise<ConfigExp
   };
 }
 
+export class ApiError extends Error {
+  constructor(message: string, public readonly diagnostics?: UiInspectionDiagnostics) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function responseError(response: Response): Promise<Error> {
   let message = `请求失败：${response.status}`;
+  let diagnostics: UiInspectionDiagnostics | undefined;
   try {
     const data = await response.json();
     message = formatErrorDetail(data.detail, message);
+    if (data.diagnostics && typeof data.diagnostics.stage === "string" && data.diagnostics.status === "failed") {
+      diagnostics = data.diagnostics;
+    }
   } catch {
     // keep default message
   }
-  return new Error(message);
+  return new ApiError(message, diagnostics);
 }
 
 function downloadFilename(contentDisposition: string | null): string {
@@ -185,6 +226,14 @@ function validationText(error: { msg?: unknown; type?: unknown }): string {
 }
 
 export const api = {
+  projects: () => request<Project[]>("/api/projects"),
+  createProject: (name: string) =>
+    request<Project>("/api/projects", { method: "POST", body: JSON.stringify({ name }) }),
+  renameProject: (id: number, name: string) =>
+    request<Project>(`/api/projects/${id}`, { method: "PUT", body: JSON.stringify({ name }) }),
+  archiveProject: (id: number) => request<Project>(`/api/projects/${id}/archive`, { method: "POST" }),
+  restoreProject: (id: number) => request<Project>(`/api/projects/${id}/restore`, { method: "POST" }),
+  deleteProject: (id: number) => request<{ ok: boolean }>(`/api/projects/${id}`, { method: "DELETE" }),
   overview: () => request<Overview>("/api/overview"),
   runtime: () => request<RuntimeStatus>("/api/runtime"),
   statusPage: () => request<StatusPageSnapshot>("/api/status-page"),
@@ -309,22 +358,80 @@ export const api = {
   runComparison: (id: number) => request<RunComparison>(`/api/runs/${id}/compare-success`),
   runFailureSummary: (id: number) => request<RunFailureSummary>(`/api/runs/${id}/failure-summary`),
   rerun: (id: number) => request<Run>(`/api/runs/${id}/rerun`, { method: "POST" }),
-  settings: () => request<SettingsValues>("/api/settings"),
-  updateSettings: (values: Partial<SettingsValues>) =>
-    request<SettingsValues>("/api/settings", { method: "PUT", body: JSON.stringify({ values }) }),
-  createReadOnlyToken: (name: string) =>
-    request<CreatedReadOnlyToken>("/api/read-only-tokens", { method: "POST", body: JSON.stringify({ read_only_token_name: name }) }),
+  settings: async () => {
+    const [globalSettings, projectAlerts] = await Promise.all([
+      request<SettingsValues>("/api/settings"),
+      request<ProjectAlertSettings>("/api/project-alert-settings")
+    ]);
+    return { ...globalSettings, ...projectAlerts } as SettingsValues;
+  },
+  projectAlertSettings: () => request<ProjectAlertSettings>("/api/project-alert-settings"),
+  projectVariables: () => request<EnvironmentVariable[]>("/api/project-variables"),
+  updateProjectVariables: (values: EnvironmentVariable[]) => request<EnvironmentVariable[]>("/api/project-variables", {
+    method: "PUT", body: JSON.stringify(values)
+  }),
+  updateSettings: async (values: Partial<SettingsValues>) => {
+    const projectValues: Record<string, unknown> = {};
+    const globalValues: Record<string, unknown> = {};
+    Object.entries(values).forEach(([key, value]) => {
+      (PROJECT_ALERT_KEYS.has(key) ? projectValues : globalValues)[key] = value;
+    });
+    await Promise.all([
+      Object.keys(globalValues).length
+        ? request<SettingsValues>("/api/settings", { method: "PUT", body: JSON.stringify({ values: globalValues }) })
+        : Promise.resolve(),
+      Object.keys(projectValues).length
+        ? request<ProjectAlertSettings>("/api/project-alert-settings", {
+            method: "PUT",
+            body: JSON.stringify({ values: projectValues })
+          })
+        : Promise.resolve()
+    ]);
+    return api.settings();
+  },
+  createReadOnlyToken: (name: string, projectIds?: number[]) => {
+    const scope = projectIds?.length ? projectIds : activeProjectId ? [activeProjectId] : [];
+    return request<CreatedReadOnlyToken>("/api/read-only-tokens", {
+      method: "POST",
+      body: JSON.stringify({ read_only_token_name: name, project_ids: scope })
+    });
+  },
   deleteReadOnlyToken: (id: string) =>
     request<SettingsValues>(`/api/read-only-tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
   alertPreview: (values: Partial<SettingsValues>) =>
-    request<AlertPreview>("/api/settings/alert-preview", { method: "POST", body: JSON.stringify({ values }) }),
+    request<AlertPreview>("/api/settings/alert-preview", {
+      method: "POST",
+      body: JSON.stringify({ values: projectAlertValues(values) })
+    }),
   testAlert: (values: Partial<SettingsValues>) =>
-    request<{ ok: boolean; message: string }>("/api/settings/test-alert", { method: "POST", body: JSON.stringify({ values }) }),
+    request<{ ok: boolean; message: string }>("/api/settings/test-alert", {
+      method: "POST",
+      body: JSON.stringify({ values: projectAlertValues(values) })
+    }),
+  systemAlertPreview: (values: Partial<SettingsValues>) =>
+    request<AlertPreview>("/api/settings/system-alert-preview", { method: "POST", body: JSON.stringify({ values }) }),
+  testSystemAlert: (values: Partial<SettingsValues>) =>
+    request<{ ok: boolean; message: string }>("/api/settings/test-system-alert", {
+      method: "POST",
+      body: JSON.stringify({ values })
+    }),
   exportConfig: () => downloadFile("/api/config/export"),
   previewConfigImport: (bundle: ConfigBundle) =>
     request<ConfigImportPreview>("/api/config/import-preview", { method: "POST", body: JSON.stringify({ bundle }) }),
   importConfig: (bundle: ConfigBundle) =>
     request<ConfigImportResult>("/api/config/import", { method: "POST", body: JSON.stringify({ bundle }) }),
+  exportProjectConfig: () => downloadFile("/api/project-config/export"),
+  previewProjectConfigImport: (bundle: ConfigBundle) =>
+    request<ConfigImportPreview>("/api/project-config/import-preview", {
+      method: "POST",
+      body: JSON.stringify({ bundle })
+    }),
+  importProjectConfig: (bundle: ConfigBundle) =>
+    request<ConfigImportResult>("/api/project-config/import", {
+      method: "POST",
+      body: JSON.stringify({ bundle })
+    }),
+  databaseHealth: () => request<DatabaseHealth>("/api/database-health"),
   databaseBackups: () => request<DatabaseBackup[]>("/api/database-backups"),
   createDatabaseBackup: () => request<DatabaseBackup>("/api/database-backups", { method: "POST" }),
   restoreDatabaseBackup: (filename: string) =>

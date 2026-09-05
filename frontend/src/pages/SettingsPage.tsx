@@ -1,4 +1,4 @@
-import { Alert, App, Button, Card, Drawer, Dropdown, Empty, Form, Input, InputNumber, Modal, Popconfirm, Segmented, Select, Skeleton, Space, Switch, Tag, Tooltip, Upload } from "antd";
+import { Alert, App, Button, Card, Checkbox, Descriptions, Drawer, Dropdown, Empty, Form, Input, InputNumber, Modal, Popconfirm, Segmented, Select, Skeleton, Space, Switch, Table, Tag, Tooltip, Upload } from "antd";
 import type { MenuProps, UploadProps } from "antd";
 import {
   BellRing,
@@ -7,6 +7,7 @@ import {
   Database,
   Download,
   FileJson2,
+  FolderKanban,
   Info,
   KeyRound,
   Monitor,
@@ -23,7 +24,7 @@ import {
   Zap
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { StructuredViewer } from "../components/StructuredViewer";
@@ -48,11 +49,13 @@ import type {
   WebhookType
 } from "../types";
 import { dirtyTagColor, enabledTagColor, formatDate } from "../utils";
+import { useProject } from "../ProjectContext";
 
-type SettingsTab = "alerts" | "execution" | "variables" | "system";
+type SettingsTab = "alerts" | "system-alerts" | "execution" | "variables" | "system";
 
 const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
-  alerts: "告警配置",
+  alerts: "项目告警",
+  "system-alerts": "系统告警",
   execution: "执行配置",
   variables: "变量管理",
   system: "系统配置"
@@ -119,11 +122,15 @@ const CONFIG_SUMMARY_ITEMS: Array<{ key: keyof ConfigImportSummary; label: strin
   { key: "variables", label: "变量" }
 ];
 
-export function SettingsPage() {
+type ProjectAlertSection = "channels" | "policies" | "package";
+type SystemSettingsSection = "storage" | "access" | "maintenance" | "package";
+
+export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}) {
   const { message } = App.useApp();
+  const { currentProject, projects } = useProject();
   const navigate = useNavigate();
   const { tab } = useParams<{ tab?: string }>();
-  const activeTab = normalizeSettingsTab(tab);
+  const activeTab = tabOverride || normalizeSettingsTab(tab);
   const [settings, setSettings] = useState<SettingsValues | null>(null);
   const [savedSettings, setSavedSettings] = useState<SettingsValues | null>(null);
   const [loading, setLoading] = useState(true);
@@ -144,15 +151,20 @@ export function SettingsPage() {
   const [savingReadOnlyToken, setSavingReadOnlyToken] = useState(false);
   const [readOnlyTokenCreateOpen, setReadOnlyTokenCreateOpen] = useState(false);
   const [readOnlyTokenNameDraft, setReadOnlyTokenNameDraft] = useState("");
+  const [readOnlyTokenProjectIds, setReadOnlyTokenProjectIds] = useState<number[]>([currentProject.id]);
   const [createdReadOnlyToken, setCreatedReadOnlyToken] = useState<{ name: string; token: string } | null>(null);
   const [databaseBackups, setDatabaseBackups] = useState<DatabaseBackup[]>([]);
   const [backupBusy, setBackupBusy] = useState(false);
+  const [projectAlertSection, setProjectAlertSection] = useState<ProjectAlertSection>("channels");
+  const [systemSettingsSection, setSystemSettingsSection] = useState<SystemSettingsSection>("storage");
+  const [variableScope, setVariableScope] = useState<"project" | "global">("project");
 
   useEffect(() => {
+    if (tabOverride) return;
     if (tab !== activeTab) {
       navigate(`/settings/${activeTab}`, { replace: true });
     }
-  }, [activeTab, navigate, tab]);
+  }, [activeTab, navigate, tab, tabOverride]);
 
   useEffect(() => {
     api
@@ -216,12 +228,8 @@ export function SettingsPage() {
     setAlertPreview(null);
     setSettings((current) => {
       if (!current) return current;
-      return {
-        ...current,
-        notification_channels: current.notification_channels.map((channel) =>
-          channel.id === channelId ? { ...channel, ...patch } : channel
-        )
-      };
+      const key = activeTab === "system-alerts" ? "system_notification_channels" : "notification_channels";
+      return { ...current, [key]: current[key].map((channel) => channel.id === channelId ? { ...channel, ...patch } : channel) };
     });
   }
 
@@ -230,10 +238,8 @@ export function SettingsPage() {
     setAlertPreview(null);
     setSettings((current) => {
       if (!current) return current;
-      return {
-        ...current,
-        notification_channels: [...current.notification_channels, channel]
-      };
+      const key = activeTab === "system-alerts" ? "system_notification_channels" : "notification_channels";
+      return { ...current, [key]: [...current[key], channel] };
     });
     setChannelEditing(channel.id, true);
   }
@@ -242,11 +248,17 @@ export function SettingsPage() {
     setAlertPreview(null);
     setSettings((current) => {
       if (!current) return current;
+      if (activeTab === "system-alerts") {
+        return {
+          ...current,
+          system_notification_channels: current.system_notification_channels.filter((channel) => channel.id !== channelId),
+          system_notification_channel_ids: (current.system_notification_channel_ids || []).filter((id) => id !== channelId)
+        };
+      }
       return {
         ...current,
         notification_channels: current.notification_channels.filter((channel) => channel.id !== channelId),
         execution_notification_channel_ids: (current.execution_notification_channel_ids || []).filter((id) => id !== channelId),
-        system_notification_channel_ids: (current.system_notification_channel_ids || []).filter((id) => id !== channelId),
         alert_tag_policies: current.alert_tag_policies.map((policy) => ({
           ...policy,
           notification_channel_ids: (policy.notification_channel_ids || []).filter((id) => id !== channelId)
@@ -338,15 +350,20 @@ export function SettingsPage() {
     if (scope === "alerts") {
       return {
         alerts_enabled: settings.alerts_enabled,
-        system_alerts_enabled: settings.system_alerts_enabled,
-        alert_detail_base_url: settings.alert_detail_base_url.trim(),
         alert_cooldown_minutes: settings.alert_cooldown_minutes,
-        alert_delivery_attempts: settings.alert_delivery_attempts,
         recovery_notification: settings.recovery_notification,
         execution_notification_channel_ids: uniqueIds(settings.execution_notification_channel_ids || []),
-        system_notification_channel_ids: uniqueIds(settings.system_notification_channel_ids || []),
         alert_tag_policies: settings.alert_tag_policies.map(toPayloadAlertTagPolicy),
         notification_channels: settings.notification_channels.map(toPayloadChannel)
+      };
+    }
+    if (scope === "system-alerts") {
+      return {
+        system_alerts_enabled: settings.system_alerts_enabled,
+        alert_detail_base_url: settings.alert_detail_base_url.trim(),
+        alert_delivery_attempts: settings.alert_delivery_attempts,
+        system_notification_channel_ids: uniqueIds(settings.system_notification_channel_ids || []),
+        system_notification_channels: settings.system_notification_channels.map(toPayloadChannel)
       };
     }
     if (scope === "execution") {
@@ -422,6 +439,7 @@ export function SettingsPage() {
 
   function openReadOnlyTokenCreate() {
     setReadOnlyTokenNameDraft("");
+    setReadOnlyTokenProjectIds([currentProject.id]);
     setReadOnlyTokenCreateOpen(true);
   }
 
@@ -429,7 +447,7 @@ export function SettingsPage() {
     const tokenName = readOnlyTokenNameDraft.trim() || "未命名令牌";
     setSavingReadOnlyToken(true);
     try {
-      const created = await api.createReadOnlyToken(tokenName);
+      const created = await api.createReadOnlyToken(tokenName, readOnlyTokenProjectIds);
       const values = await api.settings();
       setSettings(cloneSettings(values));
       setSavedSettings(cloneSettings(values));
@@ -469,8 +487,18 @@ export function SettingsPage() {
   }
 
   function buildChannelTestPayload(channel: NotificationChannel): Partial<SettingsValues> {
-    return {
+    const common = {
       alert_delivery_attempts: settings?.alert_delivery_attempts ?? 1,
+    };
+    if (activeTab === "system-alerts") {
+      return {
+        ...common,
+        system_notification_channels: [toPayloadChannel(channel)],
+        system_notification_channel_ids: [channel.id]
+      };
+    }
+    return {
+      ...common,
       notification_channels: [toPayloadChannel(channel)]
     };
   }
@@ -479,7 +507,9 @@ export function SettingsPage() {
     if (!settings) return;
     setTestingChannelId(channel.id);
     try {
-      const result = await api.testAlert(buildChannelTestPayload(channel));
+      const result = activeTab === "system-alerts"
+        ? await api.testSystemAlert(buildChannelTestPayload(channel))
+        : await api.testAlert(buildChannelTestPayload(channel));
       message.success(`${channelDisplayName(channel)}：${result.message}`);
     } catch (err) {
       message.error((err as Error).message);
@@ -492,7 +522,11 @@ export function SettingsPage() {
     if (!settings) return;
     setPreviewing(true);
     try {
-      setAlertPreview(await api.alertPreview(buildPayload("alerts")));
+      setAlertPreview(
+        activeTab === "system-alerts"
+          ? await api.systemAlertPreview(buildPayload("system-alerts"))
+          : await api.alertPreview(buildPayload("alerts"))
+      );
     } catch (err) {
       setAlertPreview(null);
       message.error((err as Error).message);
@@ -504,9 +538,9 @@ export function SettingsPage() {
   async function exportConfig() {
     setExportingConfig(true);
     try {
-      const file = await api.exportConfig();
+      const file = activeTab === "alerts" ? await api.exportProjectConfig() : await api.exportConfig();
       triggerConfigDownload(file);
-      message.success("已导出脱敏配置");
+      message.success(activeTab === "alerts" ? "已导出当前项目包" : "已导出脱敏系统配置包");
     } catch (err) {
       message.error((err as Error).message);
     } finally {
@@ -539,7 +573,9 @@ export function SettingsPage() {
     if (!importBundle) return;
     setImportPreviewing(true);
     try {
-      const preview = await api.previewConfigImport(importBundle);
+      const preview = activeTab === "alerts"
+        ? await api.previewProjectConfigImport(importBundle)
+        : await api.previewConfigImport(importBundle);
       setImportPreview(preview);
       if (configImportPreviewAllowsApply(preview)) {
         message.success("预检通过");
@@ -558,7 +594,9 @@ export function SettingsPage() {
     if (!importBundle || !importPreview || !configImportPreviewAllowsApply(importPreview) || hasUnsavedChanges) return;
     setImportingConfig(true);
     try {
-      const result = await api.importConfig(importBundle);
+      const result = activeTab === "alerts"
+        ? await api.importProjectConfig(importBundle)
+        : await api.importConfig(importBundle);
       setImportConfirmOpen(false);
       setImportDrawerOpen(false);
       resetImportDraft();
@@ -567,7 +605,7 @@ export function SettingsPage() {
         setSettings(cloneSettings(values));
         setSavedSettings(cloneSettings(values));
         setAlertPreview(null);
-        message.success(result.message || "配置已导入");
+        message.success(result.message || (activeTab === "alerts" ? "项目包已导入" : "系统配置已导入"));
       } catch (refreshErr) {
         message.warning(`配置已导入，但刷新设置失败：${(refreshErr as Error).message}`);
       }
@@ -600,17 +638,21 @@ export function SettingsPage() {
     );
   }
 
-  const blockingError = firstBlockingError(settings.notification_channels);
+  const activeChannels = activeTab === "system-alerts" ? settings.system_notification_channels : settings.notification_channels;
+  const blockingError = firstBlockingError(activeChannels);
   const alertTagPolicyError = firstAlertTagPolicyError(settings.alert_tag_policies);
   const variableBlockingError = firstVariableBlockingError(settings.environment_variables);
   const hasUnsavedChanges = Boolean(savedSettings && settingsChanged(settings, savedSettings));
-  const settingsTabCanSave = true;
+  const settingsTabCanSave = currentProject.status === "active" || activeTab !== "alerts";
+  const projectReadOnly = activeTab === "alerts" && currentProject.status === "archived";
   const activeTabChanged = Boolean(savedSettings && settingsTabCanSave && settingsTabChanged(settings, savedSettings, activeTab));
   const alertSettingsChanged = Boolean(savedSettings && settingsTabChanged(settings, savedSettings, "alerts"));
-  const activeTabBlockingError = activeTab === "alerts" ? blockingError || alertTagPolicyError : activeTab === "variables" ? variableBlockingError : "";
-  const saveDisabledReason = activeTabBlockingError || (!activeTabChanged ? "当前页没有需要保存的更改" : "");
-  const previewDisabledReason = settings.notification_channels.length === 0 ? "先添加通知渠道后再预检" : blockingError;
-  const sendableChannels = settings.notification_channels.filter(isReadyForSend);
+  const activeTabBlockingError = activeTab === "alerts" ? blockingError || alertTagPolicyError : activeTab === "system-alerts" ? blockingError : activeTab === "variables" ? variableBlockingError : "";
+  const saveDisabledReason = activeTab === "alerts" && currentProject.status === "archived"
+    ? "归档项目的项目告警为只读"
+    : activeTabBlockingError || (!activeTabChanged ? "当前页没有需要保存的更改" : "");
+  const previewDisabledReason = activeChannels.length === 0 ? "先添加通知渠道后再预检" : blockingError;
+  const sendableChannels = activeChannels.filter(isReadyForSend);
   const sendableChannelCount = sendableChannels.length;
   const sendableChannelIds = new Set(sendableChannels.map((channel) => channel.id));
   const channelOptions = settings.notification_channels.map((channel) => ({
@@ -618,12 +660,21 @@ export function SettingsPage() {
     value: channel.id,
     disabled: !isReadyForSend(channel)
   }));
+  const systemChannelOptions = settings.system_notification_channels.map((channel) => ({
+    label: channelDisplayName(channel),
+    value: channel.id,
+    disabled: !isReadyForSend(channel)
+  }));
   const executionSelectedChannelCount = settings.execution_notification_channel_ids.filter((channelId) => sendableChannelIds.has(channelId)).length;
-  const systemSelectedChannelCount = settings.system_notification_channel_ids.filter((channelId) => sendableChannelIds.has(channelId)).length;
+  const readySystemChannelIds = new Set(settings.system_notification_channels.filter(isReadyForSend).map((channel) => channel.id));
+  const systemSelectedChannelCount = settings.system_notification_channel_ids.filter((channelId) => readySystemChannelIds.has(channelId)).length;
   const executionChannelCount =
     settings.execution_notification_channel_ids.length > 0 ? executionSelectedChannelCount : sendableChannelCount;
+  const enabledAlertTagPolicyCount = settings.alert_tag_policies.filter((policy) => policy.enabled).length;
   const systemChannelCount = systemSelectedChannelCount;
-  const importApplyDisabledReason = configImportApplyDisabledReason(importBundle, importPreview, hasUnsavedChanges);
+  const importApplyDisabledReason = activeTab === "alerts" && currentProject.status === "archived"
+    ? "归档项目不能导入项目包"
+    : configImportApplyDisabledReason(importBundle, importPreview, hasUnsavedChanges);
   const readOnlyTokens = settings.read_only_tokens || [];
   const importUploadProps: UploadProps = {
     accept: "application/json,.json",
@@ -637,221 +688,321 @@ export function SettingsPage() {
 
   return (
     <div className="page-content settings-page">
-      <section className="settings-command-bar">
-        <div>
+      {!(activeTab === "variables" && variableScope === "project") && <Card size="small" className="settings-command-card">
+        <div className="settings-command-bar">
           <div className="settings-title-row">
-            <h2>{SETTINGS_TAB_LABELS[activeTab]}</h2>
+            {activeTab === "alerts" && <Tag icon={<FolderKanban size={14} />} color="blue">{currentProject.name}</Tag>}
             <Tooltip title={hasUnsavedChanges ? "当前页存在未保存内容" : "当前内容与已保存配置一致"}>
               <Tag color={dirtyTagColor(hasUnsavedChanges)}>{hasUnsavedChanges ? "未保存更改" : "已保存"}</Tag>
             </Tooltip>
           </div>
+          <Space wrap>
+            <Button icon={<RotateCcw size={16} />} onClick={resetDraft} disabled={!hasUnsavedChanges}>
+              撤销更改
+            </Button>
+            {settingsTabCanSave && <SaveSettingsButton loading={saving} disabledReason={saveDisabledReason} onClick={() => save()} />}
+          </Space>
         </div>
-        <Space wrap>
-          <Button icon={<RotateCcw size={16} />} onClick={resetDraft} disabled={!hasUnsavedChanges}>
-            撤销更改
-          </Button>
-          {settingsTabCanSave && <SaveSettingsButton loading={saving} disabledReason={saveDisabledReason} onClick={() => save()} />}
-        </Space>
-      </section>
+      </Card>}
 
       <section className={`settings-layout settings-layout-${activeTab}`}>
+        {activeTab === "variables" && <Segmented
+          aria-label="变量作用域"
+          value={variableScope}
+          options={[{ label: "项目变量", value: "project" }, { label: "全局变量", value: "global" }]}
+          onChange={(value) => setVariableScope(value as "project" | "global")}
+        />}
+        {activeTab === "variables" && variableScope === "project" && <ProjectVariablesPanel
+          key={currentProject.id} projectName={currentProject.name} readOnly={currentProject.status !== "active"}
+        />}
         {activeTab === "alerts" && (
           <>
-        <SettingsPanel title="运行告警" icon={<BellRing size={18} />} accent>
-          <div className="alert-route-summary">
-            <div className="alert-route-status">
-              <Space size={8} wrap>
-                <Switch aria-label="启用运行告警" checked={settings.alerts_enabled} onChange={(value) => update("alerts_enabled", value)} />
-                <Tag color={enabledTagColor(settings.alerts_enabled)}>{settings.alerts_enabled ? "已启用" : "已停用"}</Tag>
-              </Space>
-              <span>{settings.execution_notification_channel_ids.length > 0 ? `${executionChannelCount} 个指定渠道` : "全部可发送渠道"}</span>
-            </div>
-            <div className="alert-route-facts">
-              <div className="alert-route-fact">
-                <small>覆盖范围</small>
-                <strong>任务失败、恢复、连续失败冷却</strong>
-              </div>
-              <div className="alert-route-fact">
-                <small>当前路由</small>
-                <strong>{executionChannelCount > 0 ? `${executionChannelCount} 个渠道` : "未配置"}</strong>
-              </div>
-            </div>
-          </div>
-          <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-            <Form.Item label="恢复通知">
-              <Switch aria-label="恢复通知" checked={settings.recovery_notification} onChange={(value) => update("recovery_notification", value)} />
-            </Form.Item>
-            <Form.Item label="执行告警渠道" className="span-2">
-              <Select
-                mode="multiple"
-                allowClear
-                value={settings.execution_notification_channel_ids}
-                onChange={(value) => update("execution_notification_channel_ids", value)}
-                options={channelOptions}
-                placeholder="默认使用全部可发送渠道"
-              />
-            </Form.Item>
-            <NumberItem
-              label="失败冷却时间"
-              value={settings.alert_cooldown_minutes}
-              min={1}
-              max={1440}
-              suffix="分钟"
-              onChange={(value) => update("alert_cooldown_minutes", value)}
-            />
-          </Form>
-        </SettingsPanel>
+            <fieldset className="settings-readonly-fieldset" disabled={projectReadOnly}>
+              <div className="project-primary-grid project-alert-primary-grid">
+                <Card
+                  title={<Space size={8}><BellRing size={16} /><span>默认告警规则</span></Space>}
+                  extra={
+                    <Space size={8}>
+                      <Tag color={enabledTagColor(settings.alerts_enabled)}>{settings.alerts_enabled ? "运行中" : "已停用"}</Tag>
+                      <Switch aria-label="启用运行告警" checked={settings.alerts_enabled} onChange={(value) => update("alerts_enabled", value)} />
+                    </Space>
+                  }
+                >
+                  <Form layout="vertical" className="project-alert-rule-form" autoComplete="off">
+                    <Form.Item label="默认通知渠道">
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        value={settings.execution_notification_channel_ids}
+                        onChange={(value) => update("execution_notification_channel_ids", value)}
+                        options={channelOptions}
+                        placeholder="全部可发送渠道"
+                      />
+                    </Form.Item>
+                    <NumberItem
+                      label="失败冷却"
+                      value={settings.alert_cooldown_minutes}
+                      min={1}
+                      max={1440}
+                      suffix="分钟"
+                      onChange={(value) => update("alert_cooldown_minutes", value)}
+                    />
+                    <Form.Item label="恢复通知">
+                      <Switch aria-label="恢复通知" checked={settings.recovery_notification} onChange={(value) => update("recovery_notification", value)} />
+                    </Form.Item>
+                  </Form>
+                </Card>
 
-        <SettingsPanel title="系统告警" icon={<ShieldCheck size={18} />} accent>
-          <div className="alert-route-summary">
-            <div className="alert-route-status">
-              <Space size={8} wrap>
-                <Switch aria-label="启用系统告警" checked={settings.system_alerts_enabled} onChange={(value) => update("system_alerts_enabled", value)} />
-                <Tag color={enabledTagColor(settings.system_alerts_enabled)}>{settings.system_alerts_enabled ? "已启用" : "已停用"}</Tag>
-              </Space>
-              <span>{settings.system_notification_channel_ids.length === 0 ? "未选择渠道" : systemChannelCount > 0 ? `${systemChannelCount} 个指定渠道` : "未配置可发送渠道"}</span>
-            </div>
-            <div className="alert-route-facts">
-              <div className="alert-route-fact">
-                <small>覆盖范围</small>
-                <strong>浏览器崩溃、节点异常、执行环境异常</strong>
+                <Card title="发送链路" extra={<Tag>{alertSettingsChanged ? "草稿" : "已保存"}</Tag>}>
+                  <Descriptions
+                    className="project-state-descriptions"
+                    size="small"
+                    column={1}
+                    items={[
+                      { key: "event", label: "事件", children: settings.recovery_notification ? "失败、恢复" : "失败" },
+                      { key: "rule", label: "规则", children: enabledAlertTagPolicyCount > 0 ? `默认 + ${enabledAlertTagPolicyCount} 标签` : "默认" },
+                      { key: "delivery", label: "送达", children: settings.alerts_enabled ? (executionChannelCount > 0 ? `${executionChannelCount} 个渠道` : "未配置") : "已暂停" }
+                    ]}
+                  />
+                </Card>
               </div>
-              <div className="alert-route-fact">
-                <small>当前路由</small>
-                <strong>{systemChannelCount > 0 ? `${systemChannelCount} 个渠道` : "不会推送"}</strong>
-              </div>
-            </div>
-          </div>
-          <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-            <Form.Item label="系统告警渠道" className="span-2">
-              <Select
-                mode="multiple"
-                allowClear
-                value={settings.system_notification_channel_ids}
-                onChange={(value) => update("system_notification_channel_ids", value)}
-                options={channelOptions}
-                placeholder="选择系统告警渠道"
-              />
-            </Form.Item>
-          </Form>
-        </SettingsPanel>
+            </fieldset>
 
-        <SettingsPanel title="发送参数" icon={<Send size={18} />} className="settings-panel-wide">
-          <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-            <NumberItem
-              label="告警发送尝试次数"
-              value={settings.alert_delivery_attempts}
-              min={1}
-              max={5}
-              suffix="次"
-              onChange={(value) => update("alert_delivery_attempts", value)}
-            />
-            <Form.Item label="告警详情链接前缀" className="span-2">
-              <Input
-                name="alert-detail-base-url"
-                value={settings.alert_detail_base_url}
-                onChange={(event) => update("alert_detail_base_url", event.target.value)}
-                placeholder="例如：http://10.168.78.49:8787"
-                autoComplete="off"
-              />
-            </Form.Item>
-            <Form.Item label="可发送渠道">
-              <div className="setting-inline-metric">
-                <strong>{sendableChannelCount}</strong>
-                <span>个渠道可发送</span>
-              </div>
-            </Form.Item>
-            <Form.Item label="执行路由">
-              <div className="setting-inline-metric">
-                <strong>{executionChannelCount}</strong>
-                <span>个渠道</span>
-              </div>
-            </Form.Item>
-            <Form.Item label="系统路由">
-              <div className="setting-inline-metric">
-                <strong>{systemChannelCount > 0 ? systemChannelCount : "未选择"}</strong>
-                <span>{systemChannelCount > 0 ? "个渠道" : "不会推送"}</span>
-              </div>
-            </Form.Item>
-          </Form>
-        </SettingsPanel>
+            <Card
+              className="project-alert-config-card"
+              title="通知配置"
+              activeTabKey={projectAlertSection}
+              onTabChange={(key) => setProjectAlertSection(key as ProjectAlertSection)}
+              tabList={[
+                { key: "channels", tab: `通知渠道 ${settings.notification_channels.length}` },
+                { key: "policies", tab: `标签策略 ${settings.alert_tag_policies.length}` },
+                { key: "package", tab: "项目配置包" }
+              ]}
+            >
+                {projectAlertSection === "channels" && (
+                  <>
+                    <fieldset className="settings-readonly-fieldset" disabled={projectReadOnly}>
+                      <div className="project-alert-section-toolbar">
+                        <Tag color={sendableChannelCount > 0 ? "success" : "default"}>{sendableChannelCount} / {settings.notification_channels.length} 可发送</Tag>
+                        <Space size={8}>
+                          <AlertPreviewTool
+                            compact
+                            preview={alertPreview}
+                            loading={previewing}
+                            disabledReason={previewDisabledReason}
+                            usesDraft={alertSettingsChanged}
+                            onPreview={previewAlert}
+                            onClosePreview={() => setAlertPreview(null)}
+                          />
+                          <Space.Compact>
+                            <Select
+                              value={newChannelType}
+                              onChange={(value) => setNewChannelType(value)}
+                              options={CHANNEL_OPTIONS}
+                              className="channel-type-picker"
+                            />
+                            <Button icon={<Plus size={16} />} onClick={addChannel}>添加渠道</Button>
+                          </Space.Compact>
+                        </Space>
+                      </div>
+                      {settings.notification_channels.length === 0 ? (
+                        <Empty description="暂无通知渠道" />
+                      ) : (
+                        <div className="notification-channel-list">
+                          {settings.notification_channels.map((channel, index) => (
+                            <NotificationChannelEditor
+                              key={channel.id}
+                              channel={channel}
+                              index={index}
+                              editing={editingChannelIds.has(channel.id)}
+                              testing={testingChannelId === channel.id}
+                              testDisabledReason={channelTestDisabledReason(channel)}
+                              usesDraft={alertSettingsChanged}
+                              onPatch={(patch) => updateChannel(channel.id, patch)}
+                              onRemove={() => removeChannel(channel.id)}
+                              onEdit={() => setChannelEditing(channel.id, true)}
+                              onDone={() => setChannelEditing(channel.id, false)}
+                              onTest={() => testAlert(channel)}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </fieldset>
+                  </>
+                )}
 
-        <SettingsPanel title="标签告警策略" icon={<BellRing size={18} />} className="settings-panel-wide">
-          <div className="channel-toolbar">
-            <Button icon={<Plus size={16} />} onClick={addAlertTagPolicy}>
-              添加标签策略
-            </Button>
-          </div>
-          {settings.alert_tag_policies.length === 0 ? (
-            <Empty description="暂无标签告警策略" />
-          ) : (
-            <div className="notification-channel-list">
-              {settings.alert_tag_policies.map((policy, index) => (
-                <AlertTagPolicyEditor
-                  key={policy.id}
-                  policy={policy}
-                  index={index}
-                  channels={settings.notification_channels}
-                  policies={settings.alert_tag_policies}
-                  onPatch={(patch) => updateAlertTagPolicy(policy.id, patch)}
-                  onRemove={() => removeAlertTagPolicy(policy.id)}
+                {projectAlertSection === "policies" && (
+                  <fieldset className="settings-readonly-fieldset" disabled={projectReadOnly}>
+                    <div className="project-alert-section-toolbar">
+                      <Tag color={enabledAlertTagPolicyCount > 0 ? "success" : "default"}>{enabledAlertTagPolicyCount} 个已启用</Tag>
+                      <Button icon={<Plus size={16} />} onClick={addAlertTagPolicy}>添加标签策略</Button>
+                    </div>
+                    {settings.alert_tag_policies.length === 0 ? (
+                      <Empty description="暂无标签告警策略" />
+                    ) : (
+                      <div className="notification-channel-list">
+                        {settings.alert_tag_policies.map((policy, index) => (
+                          <AlertTagPolicyEditor
+                            key={policy.id}
+                            policy={policy}
+                            index={index}
+                            channels={settings.notification_channels}
+                            policies={settings.alert_tag_policies}
+                            onPatch={(patch) => updateAlertTagPolicy(policy.id, patch)}
+                            onRemove={() => removeAlertTagPolicy(policy.id)}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </fieldset>
+                )}
+
+                {projectAlertSection === "package" && (
+                  <ConfigTransferPanel
+                    embedded
+                    scope="project"
+                    exporting={exportingConfig}
+                    uploadProps={importUploadProps}
+                    drawerOpen={importDrawerOpen}
+                    fileName={importFileName}
+                    hasImportBundle={Boolean(importBundle)}
+                    preview={importPreview}
+                    previewing={importPreviewing}
+                    importing={importingConfig}
+                    applyDisabledReason={importApplyDisabledReason}
+                    importDisabledReason={projectReadOnly ? "归档项目不能导入项目包" : ""}
+                    hasUnsavedChanges={hasUnsavedChanges}
+                    onExport={exportConfig}
+                    onOpenImport={() => setImportDrawerOpen(true)}
+                    onCloseImport={() => setImportDrawerOpen(false)}
+                    onResetImport={resetImportDraft}
+                    onPreviewImport={previewConfigImport}
+                    onRequestApply={() => setImportConfirmOpen(true)}
+                  />
+                )}
+            </Card>
+
+          </>
+        )}
+
+        {activeTab === "system-alerts" && (
+          <>
+            <SettingsPanel
+              title="告警规则"
+              icon={<ShieldCheck size={18} />}
+              accent
+              extra={
+                <Space size={8}>
+                  <Tag color={enabledTagColor(settings.system_alerts_enabled)}>{settings.system_alerts_enabled ? "运行中" : "已停用"}</Tag>
+                  <Switch
+                    aria-label="启用系统告警"
+                    checked={settings.system_alerts_enabled}
+                    onChange={(value) => update("system_alerts_enabled", value)}
+                  />
+                </Space>
+              }
+            >
+              <Form layout="vertical" className="settings-form-grid settings-form-grid-single" autoComplete="off">
+                <Form.Item label="系统告警渠道" className="span-2">
+                  <Select
+                    mode="multiple"
+                    allowClear
+                    value={settings.system_notification_channel_ids}
+                    onChange={(value) => update("system_notification_channel_ids", value)}
+                    options={systemChannelOptions}
+                    placeholder="选择系统通知渠道"
+                  />
+                </Form.Item>
+                <NumberItem
+                  label="发送尝试次数"
+                  value={settings.alert_delivery_attempts}
+                  min={1}
+                  max={5}
+                  suffix="次"
+                  onChange={(value) => update("alert_delivery_attempts", value)}
                 />
-              ))}
-            </div>
-          )}
-        </SettingsPanel>
+                <Form.Item label="告警详情链接前缀">
+                  <Input
+                    name="alert-detail-base-url"
+                    value={settings.alert_detail_base_url}
+                    onChange={(event) => update("alert_detail_base_url", event.target.value)}
+                    placeholder="例如：http://10.168.78.49:8787"
+                    autoComplete="off"
+                  />
+                </Form.Item>
+              </Form>
+            </SettingsPanel>
 
-        <SettingsPanel title="通知渠道" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
-          <AlertPreviewTool
-            preview={alertPreview}
-            loading={previewing}
-            disabledReason={previewDisabledReason}
-            usesDraft={alertSettingsChanged}
-            onPreview={previewAlert}
-          />
-          <div className="channel-toolbar">
-            <Space.Compact>
-              <Select
-                value={newChannelType}
-                onChange={(value) => setNewChannelType(value)}
-                options={CHANNEL_OPTIONS}
-                className="channel-type-picker"
+            <SettingsPanel title="发送链路" icon={<Send size={18} />}>
+              <Descriptions
+                bordered
+                size="small"
+                column={1}
+                items={[
+                  { key: "status", label: "状态", children: settings.system_alerts_enabled ? "接收系统事件" : "已暂停" },
+                  { key: "channels", label: "送达渠道", children: settings.system_alerts_enabled && systemChannelCount > 0 ? `${systemChannelCount} 个渠道` : "不会推送" },
+                  { key: "attempts", label: "失败重试", children: `${settings.alert_delivery_attempts} 次尝试` },
+                  { key: "detail", label: "详情链接", children: settings.alert_detail_base_url.trim() || "使用当前访问地址" }
+                ]}
               />
-              <Button icon={<Plus size={16} />} onClick={addChannel}>
-                添加渠道
-              </Button>
-            </Space.Compact>
-          </div>
-          {settings.notification_channels.length === 0 ? (
-            <Empty description="暂无通知渠道" />
-          ) : (
-            <div className="notification-channel-list">
-              {settings.notification_channels.map((channel, index) => (
-                <NotificationChannelEditor
-                  key={channel.id}
-                  channel={channel}
-                  index={index}
-                  editing={editingChannelIds.has(channel.id)}
-                  testing={testingChannelId === channel.id}
-                  testDisabledReason={channelTestDisabledReason(channel)}
-                  usesDraft={alertSettingsChanged}
-                  onPatch={(patch) => updateChannel(channel.id, patch)}
-                  onRemove={() => removeChannel(channel.id)}
-                  onEdit={() => setChannelEditing(channel.id, true)}
-                  onDone={() => setChannelEditing(channel.id, false)}
-                  onTest={() => testAlert(channel)}
-                />
-              ))}
-            </div>
-          )}
-        </SettingsPanel>
+            </SettingsPanel>
 
+            <SettingsPanel
+              title="系统通知渠道"
+              icon={<BellRing size={18} />}
+              className="settings-panel-wide"
+              extra={
+                <Space size={8}>
+                  <AlertPreviewTool
+                    compact
+                    preview={alertPreview}
+                    loading={previewing}
+                    disabledReason={previewDisabledReason}
+                    usesDraft={activeTabChanged}
+                    onPreview={previewAlert}
+                    onClosePreview={() => setAlertPreview(null)}
+                  />
+                  <Space.Compact>
+                    <Select
+                      value={newChannelType}
+                      onChange={(value) => setNewChannelType(value)}
+                      options={CHANNEL_OPTIONS}
+                      className="channel-type-picker"
+                    />
+                    <Button icon={<Plus size={16} />} onClick={addChannel}>添加渠道</Button>
+                  </Space.Compact>
+                </Space>
+              }
+            >
+              {settings.system_notification_channels.length === 0 ? (
+                <Empty description="暂无系统通知渠道" />
+              ) : (
+                <div className="notification-channel-list">
+                  {settings.system_notification_channels.map((channel, index) => (
+                    <NotificationChannelEditor
+                      key={channel.id}
+                      channel={channel}
+                      index={index}
+                      editing={editingChannelIds.has(channel.id)}
+                      testing={testingChannelId === channel.id}
+                      testDisabledReason={channelTestDisabledReason(channel)}
+                      usesDraft={activeTabChanged}
+                      onPatch={(patch) => updateChannel(channel.id, patch)}
+                      onRemove={() => removeChannel(channel.id)}
+                      onEdit={() => setChannelEditing(channel.id, true)}
+                      onDone={() => setChannelEditing(channel.id, false)}
+                      onTest={() => testAlert(channel)}
+                    />
+                  ))}
+                </div>
+              )}
+            </SettingsPanel>
           </>
         )}
 
         {activeTab === "execution" && (
         <>
-        <SettingsPanel title="执行设置" icon={<Zap size={18} />}>
+        <SettingsPanel title="调度与容量" icon={<Zap size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
             <NumberItem label="默认执行频率" value={settings.default_interval_seconds} min={5} max={86400} suffix="秒" onChange={(value) => update("default_interval_seconds", value)} />
             <NumberItem label="最大并发任务数" value={settings.max_concurrency} min={1} max={20} onChange={(value) => update("max_concurrency", value)} />
@@ -860,6 +1011,11 @@ export function SettingsPage() {
             <NumberItem label="默认 UI 超时" value={settings.default_ui_timeout_ms} min={500} max={300000} suffix="ms" onChange={(value) => update("default_ui_timeout_ms", value)} />
             <NumberItem label="默认 API 超时" value={settings.default_api_timeout_ms} min={500} max={300000} suffix="ms" onChange={(value) => update("default_api_timeout_ms", value)} />
             <NumberItem label="单任务最大运行时长" value={settings.max_task_runtime_seconds} min={1} max={600} suffix="秒" onChange={(value) => update("max_task_runtime_seconds", value)} />
+          </Form>
+        </SettingsPanel>
+
+        <SettingsPanel title="故障判定" icon={<ShieldCheck size={18} />}>
+          <Form layout="vertical" className="settings-form-grid" autoComplete="off">
             <NumberItem label="API 故障确认轮数" value={settings.api_failure_confirmation_count} min={1} max={10} suffix="轮" onChange={(value) => update("api_failure_confirmation_count", value)} />
             <NumberItem label="UI 故障确认轮数" value={settings.ui_failure_confirmation_count} min={1} max={10} suffix="轮" onChange={(value) => update("ui_failure_confirmation_count", value)} />
             <NumberItem label="恢复确认次数" value={settings.recovery_confirmation_count} min={1} max={10} suffix="次" onChange={(value) => update("recovery_confirmation_count", value)} />
@@ -874,7 +1030,7 @@ export function SettingsPage() {
         {activeTab === "execution" && <RunnerNodePanel />}
 
         {activeTab === "execution" && (
-        <SettingsPanel title="浏览器设置" icon={<Monitor size={18} />}>
+        <SettingsPanel title="浏览器运行" icon={<Monitor size={18} />} className="settings-panel-wide">
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
             <Form.Item label="Headless">
               <Switch aria-label="浏览器 Headless 模式" checked={settings.browser_headless} onChange={(value) => update("browser_headless", value)} />
@@ -955,13 +1111,18 @@ export function SettingsPage() {
         </SettingsPanel>
         )}
 
-        {activeTab === "variables" && (
-        <SettingsPanel title="环境变量" icon={<KeyRound size={18} />} className="settings-panel-wide">
-          <div className="variable-toolbar">
-            <Button icon={<Plus size={16} />} onClick={addEnvironmentVariable}>
-              添加变量
-            </Button>
-          </div>
+        {activeTab === "variables" && variableScope === "global" && (
+        <SettingsPanel
+          title="环境变量"
+          icon={<KeyRound size={18} />}
+          className="settings-panel-wide"
+          extra={
+            <Space size={8}>
+              <Tag>{settings.environment_variables.length} 个变量</Tag>
+              <Button type="primary" icon={<Plus size={16} />} onClick={addEnvironmentVariable}>添加变量</Button>
+            </Space>
+          }
+        >
           {settings.environment_variables.length === 0 ? (
             <Empty description="暂无环境变量" />
           ) : (
@@ -982,169 +1143,164 @@ export function SettingsPage() {
         )}
 
         {activeTab === "system" && (
-        <>
-        <SettingsPanel title="数据保留" icon={<Database size={18} />}>
-          <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-            <NumberItem label="运行记录保留" value={settings.run_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("run_retention_days", value)} />
-            <NumberItem label="截图保留" value={settings.screenshot_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("screenshot_retention_days", value)} />
-            <NumberItem label="Trace 保留" value={settings.trace_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("trace_retention_days", value)} />
-            <NumberItem label="Response Body 保留" value={settings.response_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("response_retention_days", value)} />
-            <NumberItem label="同错失败保留" value={settings.similar_failure_retention_count} min={1} max={100} suffix="条" onChange={(value) => update("similar_failure_retention_count", value)} />
-            <NumberItem label="数据库备份保留" value={settings.database_backup_retention} min={1} max={30} suffix="份" onChange={(value) => update("database_backup_retention", value)} />
-            <Form.Item label="记录失败 Trace">
-              <Switch
-                aria-label="记录失败 Trace"
-                checked={settings.trace_artifacts_enabled}
-                onChange={(value) => update("trace_artifacts_enabled", value)}
-              />
-            </Form.Item>
-            <Form.Item label="成功响应产物">
-              <Switch
-                aria-label="保存成功响应产物"
-                checked={settings.success_response_artifacts_enabled}
-                onChange={(value) => update("success_response_artifacts_enabled", value)}
-              />
-            </Form.Item>
-          </Form>
-        </SettingsPanel>
-        <SettingsPanel title="数据库备份与恢复" icon={<Database size={18} />} className="settings-panel-wide">
-          <Space orientation="vertical" size={12} className="drawer-stack">
-            <Button icon={<Database size={16} />} loading={backupBusy} onClick={createDatabaseBackup}>
-              创建备份
-            </Button>
-            {databaseBackups.length === 0 ? (
-              <Empty description="暂无数据库备份" />
-            ) : (
-              databaseBackups.map((backup) => (
-                <Card size="small" key={backup.filename}>
-                  <Space wrap>
-                    <strong>{backup.filename}</strong>
-                    <span>{formatBytes(backup.size_bytes)}</span>
-                    <span>{new Date(backup.created_at).toLocaleString("zh-CN", { hour12: false })}</span>
-                    <Popconfirm
-                      title="恢复数据库备份"
-                      description="恢复会覆盖当前数据库，并自动创建恢复前安全备份。"
-                      okText="确认恢复"
-                      cancelText="取消"
-                      onConfirm={() => restoreDatabaseBackup(backup.filename)}
-                    >
-                      <Button icon={<RotateCcw size={15} />} loading={backupBusy}>
-                        恢复
-                      </Button>
-                    </Popconfirm>
-                  </Space>
+          <Card
+            className="settings-system-workspace settings-panel-wide"
+            activeTabKey={systemSettingsSection}
+            onTabChange={(key) => setSystemSettingsSection(key as SystemSettingsSection)}
+            tabList={[
+              { key: "storage", tab: "数据与备份" },
+              { key: "access", tab: "开放接口" },
+              { key: "maintenance", tab: "维护公告" },
+              { key: "package", tab: "配置包" }
+            ]}
+          >
+            {systemSettingsSection === "storage" && (
+              <div className="settings-system-grid">
+                <Card type="inner" title={<Space size={8}><Database size={16} /><span>数据保留</span></Space>}>
+                  <Form layout="vertical" className="settings-form-grid" autoComplete="off">
+                    <NumberItem label="运行记录保留" value={settings.run_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("run_retention_days", value)} />
+                    <NumberItem label="截图保留" value={settings.screenshot_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("screenshot_retention_days", value)} />
+                    <NumberItem label="Trace 保留" value={settings.trace_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("trace_retention_days", value)} />
+                    <NumberItem label="Response Body 保留" value={settings.response_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("response_retention_days", value)} />
+                    <NumberItem label="同错失败保留" value={settings.similar_failure_retention_count} min={1} max={100} suffix="条" onChange={(value) => update("similar_failure_retention_count", value)} />
+                    <NumberItem label="数据库备份保留" value={settings.database_backup_retention} min={1} max={30} suffix="份" onChange={(value) => update("database_backup_retention", value)} />
+                    <Form.Item label="记录失败 Trace">
+                      <Switch aria-label="记录失败 Trace" checked={settings.trace_artifacts_enabled} onChange={(value) => update("trace_artifacts_enabled", value)} />
+                    </Form.Item>
+                    <Form.Item label="成功响应产物">
+                      <Switch aria-label="保存成功响应产物" checked={settings.success_response_artifacts_enabled} onChange={(value) => update("success_response_artifacts_enabled", value)} />
+                    </Form.Item>
+                  </Form>
                 </Card>
-              ))
-            )}
-          </Space>
-        </SettingsPanel>
-        </>
-        )}
 
-        {activeTab === "system" && (
-          <>
-            <SettingsPanel title="开放接口令牌" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
-              <Space orientation="vertical" size={14} className="drawer-stack">
-                <div className="read-only-token-toolbar">
-                  <Space size={8} wrap>
-                    <strong>令牌状态</strong>
-                    <Tag color={readOnlyTokens.length > 0 ? "success" : "default"}>
-                      {readOnlyTokens.length > 0 ? `${readOnlyTokens.length} 个已配置` : "未配置"}
-                    </Tag>
-                    <Tooltip title="允许多个令牌共存；已有令牌只可删除。">
-                      <Button type="text" size="small" icon={<Info size={14} />} aria-label="令牌说明" />
-                    </Tooltip>
-                  </Space>
-                  <Button type="primary" icon={<KeyRound size={16} />} loading={savingReadOnlyToken} onClick={openReadOnlyTokenCreate}>
-                    新建令牌
-                  </Button>
-                </div>
-                {readOnlyTokens.length === 0 ? (
-                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无开放接口令牌" />
-                ) : (
-                  <Space orientation="vertical" size={10} className="drawer-stack">
-                    {readOnlyTokens.map((token) => (
-                      <Card size="small" key={token.id}>
-                        <div className="read-only-token-card">
-                          <div>
-                            <strong>{token.name || "未命名令牌"}</strong>
-                            <span>创建时间 {formatDate(token.created_at)}</span>
-                          </div>
+                <Card
+                  type="inner"
+                  title={<Space size={8}><Database size={16} /><span>数据库备份</span></Space>}
+                  extra={<Button icon={<Database size={16} />} loading={backupBusy} onClick={createDatabaseBackup}>创建备份</Button>}
+                >
+                  <Table<DatabaseBackup>
+                    className="settings-backup-table"
+                    rowKey="filename"
+                    size="small"
+                    pagination={false}
+                    dataSource={databaseBackups}
+                    locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无数据库备份" /> }}
+                    columns={[
+                      { title: "备份文件", dataIndex: "filename", ellipsis: true },
+                      { title: "大小", dataIndex: "size_bytes", width: 92, render: (value: number) => formatBytes(value) },
+                      { title: "创建时间", dataIndex: "created_at", width: 176, render: (value: string) => new Date(value).toLocaleString("zh-CN", { hour12: false }) },
+                      {
+                        title: "操作",
+                        width: 92,
+                        render: (_, backup) => (
                           <Popconfirm
-                            title="删除开放接口令牌"
-                            description="删除后，使用该令牌的外部调用会立即失效。"
-                            okText="删除"
+                            title="恢复数据库备份"
+                            description="恢复会覆盖当前数据库，并自动创建恢复前安全备份。"
+                            okText="确认恢复"
                             cancelText="取消"
-                            onConfirm={() => deleteReadOnlyToken(token.id)}
+                            onConfirm={() => restoreDatabaseBackup(backup.filename)}
                           >
-                            <Button danger icon={<Trash2 size={16} />} loading={savingReadOnlyToken}>
-                              删除
-                            </Button>
+                            <Button size="small" icon={<RotateCcw size={15} />} loading={backupBusy}>恢复</Button>
                           </Popconfirm>
-                        </div>
-                      </Card>
-                    ))}
-                  </Space>
-                )}
-              </Space>
-            </SettingsPanel>
-
-            <ReadOnlyApiDocs onCopyPath={(path) => copyValue(path, "已复制 Path")} />
-          </>
-        )}
-
-        {activeTab === "system" && (
-          <SettingsPanel title="维护公告" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
-              <Alert
-                type="info"
-                showIcon
-                title="展示位置：所有页面顶栏右侧"
-                description="启用并保存后，所有页面右上角“本地运行”旁都会出现公告按钮；点击按钮查看公告详情。关闭后顶栏不展示公告。"
-                className="settings-inline-alert"
-              />
-              <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-                <Form.Item label="启用公告">
-                  <Switch aria-label="启用维护公告" checked={Boolean(settings.maintenance_enabled)} onChange={(value) => update("maintenance_enabled", value)} />
-                </Form.Item>
-                <Form.Item label="标题">
-                  <Input value={settings.maintenance_title || ""} onChange={(event) => update("maintenance_title", event.target.value)} />
-                </Form.Item>
-                <Form.Item label="开始时间">
-                  <Input value={settings.maintenance_starts_at || ""} onChange={(event) => update("maintenance_starts_at", event.target.value)} placeholder="2026-06-08T22:00:00+08:00" />
-                </Form.Item>
-                <Form.Item label="结束时间">
-                  <Input value={settings.maintenance_ends_at || ""} onChange={(event) => update("maintenance_ends_at", event.target.value)} placeholder="2026-06-08T23:00:00+08:00" />
-                </Form.Item>
-                <Form.Item label="公告内容" className="span-2">
-                  <Input.TextArea
-                    value={settings.maintenance_message || ""}
-                    rows={4}
-                    onChange={(event) => update("maintenance_message", event.target.value)}
+                        )
+                      }
+                    ]}
                   />
-                </Form.Item>
-              </Form>
-            </SettingsPanel>
-        )}
+                </Card>
+              </div>
+            )}
 
-        {activeTab === "system" && (
-        <ConfigTransferPanel
-          exporting={exportingConfig}
-          uploadProps={importUploadProps}
-          drawerOpen={importDrawerOpen}
-          fileName={importFileName}
-          hasImportBundle={Boolean(importBundle)}
-          preview={importPreview}
-          previewing={importPreviewing}
-          importing={importingConfig}
-          applyDisabledReason={importApplyDisabledReason}
-          hasUnsavedChanges={hasUnsavedChanges}
-          onExport={exportConfig}
-          onOpenImport={() => setImportDrawerOpen(true)}
-          onCloseImport={() => setImportDrawerOpen(false)}
-          onResetImport={resetImportDraft}
-          onPreviewImport={previewConfigImport}
-          onRequestApply={() => setImportConfirmOpen(true)}
-        />
+            {systemSettingsSection === "access" && (
+              <div className="settings-system-stack">
+                <Card
+                  type="inner"
+                  title={<Space size={8}><ShieldCheck size={16} /><span>开放接口令牌</span><Tag>{readOnlyTokens.length} 个</Tag></Space>}
+                  extra={<Button type="primary" icon={<KeyRound size={16} />} loading={savingReadOnlyToken} onClick={openReadOnlyTokenCreate}>新建令牌</Button>}
+                >
+                  {readOnlyTokens.length === 0 ? (
+                    <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无开放接口令牌" />
+                  ) : (
+                    <div className="read-only-token-list">
+                      {readOnlyTokens.map((token) => (
+                        <Card size="small" key={token.id}>
+                          <div className="read-only-token-card">
+                            <div>
+                              <strong>{token.name || "未命名令牌"}</strong>
+                              <span>创建时间 {formatDate(token.created_at)}</span>
+                              <span>项目范围：{token.project_ids.map((projectId) => projects.find((project) => project.id === projectId)?.name || `#${projectId}`).join("、")}</span>
+                            </div>
+                            <Popconfirm
+                              title="删除开放接口令牌"
+                              description="删除后，使用该令牌的外部调用会立即失效。"
+                              okText="删除"
+                              cancelText="取消"
+                              onConfirm={() => deleteReadOnlyToken(token.id)}
+                            >
+                              <Button danger icon={<Trash2 size={16} />} loading={savingReadOnlyToken}>删除</Button>
+                            </Popconfirm>
+                          </div>
+                        </Card>
+                      ))}
+                    </div>
+                  )}
+                </Card>
+                <ReadOnlyApiDocs onCopyPath={(path) => copyValue(path, "已复制 Path")} />
+              </div>
+            )}
+
+            {systemSettingsSection === "maintenance" && (
+              <Card
+                type="inner"
+                title={<Space size={8}><ShieldCheck size={16} /><span>维护公告</span></Space>}
+                extra={
+                  <Space size={8}>
+                    <Tag color={enabledTagColor(Boolean(settings.maintenance_enabled))}>{settings.maintenance_enabled ? "展示中" : "未启用"}</Tag>
+                    <Switch aria-label="启用维护公告" checked={Boolean(settings.maintenance_enabled)} onChange={(value) => update("maintenance_enabled", value)} />
+                  </Space>
+                }
+              >
+                <Descriptions size="small" column={1} items={[{ key: "position", label: "展示位置", children: "所有页面顶栏公告入口" }]} />
+                <Form layout="vertical" className="settings-form-grid settings-maintenance-form" autoComplete="off">
+                  <Form.Item label="标题" className="span-2">
+                    <Input value={settings.maintenance_title || ""} onChange={(event) => update("maintenance_title", event.target.value)} />
+                  </Form.Item>
+                  <Form.Item label="开始时间">
+                    <Input value={settings.maintenance_starts_at || ""} onChange={(event) => update("maintenance_starts_at", event.target.value)} placeholder="2026-06-08T22:00:00+08:00" />
+                  </Form.Item>
+                  <Form.Item label="结束时间">
+                    <Input value={settings.maintenance_ends_at || ""} onChange={(event) => update("maintenance_ends_at", event.target.value)} placeholder="2026-06-08T23:00:00+08:00" />
+                  </Form.Item>
+                  <Form.Item label="公告内容" className="span-2">
+                    <Input.TextArea value={settings.maintenance_message || ""} rows={5} onChange={(event) => update("maintenance_message", event.target.value)} />
+                  </Form.Item>
+                </Form>
+              </Card>
+            )}
+
+            {systemSettingsSection === "package" && (
+              <ConfigTransferPanel
+                embedded
+                scope="system"
+                exporting={exportingConfig}
+                uploadProps={importUploadProps}
+                drawerOpen={importDrawerOpen}
+                fileName={importFileName}
+                hasImportBundle={Boolean(importBundle)}
+                preview={importPreview}
+                previewing={importPreviewing}
+                importing={importingConfig}
+                applyDisabledReason={importApplyDisabledReason}
+                importDisabledReason=""
+                hasUnsavedChanges={hasUnsavedChanges}
+                onExport={exportConfig}
+                onOpenImport={() => setImportDrawerOpen(true)}
+                onCloseImport={() => setImportDrawerOpen(false)}
+                onResetImport={resetImportDraft}
+                onPreviewImport={previewConfigImport}
+                onRequestApply={() => setImportConfirmOpen(true)}
+              />
+            )}
+          </Card>
         )}
       </section>
 
@@ -1175,6 +1331,7 @@ export function SettingsPage() {
         okText="新建"
         cancelText="取消"
         confirmLoading={savingReadOnlyToken}
+        okButtonProps={{ disabled: readOnlyTokenProjectIds.length === 0 }}
         onOk={createReadOnlyToken}
         onCancel={() => setReadOnlyTokenCreateOpen(false)}
       >
@@ -1195,6 +1352,15 @@ export function SettingsPage() {
                 maxLength={120}
                 placeholder="例如：外部看板、巡检脚本"
                 onChange={(event) => setReadOnlyTokenNameDraft(event.target.value)}
+              />
+            </Form.Item>
+            <Form.Item label="允许访问的项目" required>
+              <Select
+                mode="multiple"
+                value={readOnlyTokenProjectIds}
+                onChange={setReadOnlyTokenProjectIds}
+                options={projects.map((project) => ({ label: project.name, value: project.id }))}
+                placeholder="至少选择一个项目"
               />
             </Form.Item>
           </Form>
@@ -1240,7 +1406,8 @@ const emptyRunnerDraft: ProbeRunnerPayload = {
   address: "",
   network_region: "local",
   enabled: true,
-  token: ""
+  token: "",
+  allow_insecure_http: false
 };
 
 type RunnerCreateMode = "manual" | "relay";
@@ -1289,6 +1456,11 @@ function runnerImageSummary(image: string): string {
   if (!image) return "-";
   const parts = image.split("/");
   return parts[parts.length - 1] || image;
+}
+
+function runnerAddressUsesInsecureHttp(address: string): boolean {
+  const value = address.trim().toLowerCase();
+  return Boolean(value) && (value.startsWith("http://") || !value.includes("://"));
 }
 
 function wait(ms: number): Promise<void> {
@@ -1374,7 +1546,8 @@ function RunnerNodePanel() {
         name: runner.name || runner.runner_id,
         address: runner.address || "",
         network_region: runner.network_region || "local",
-        enabled: runner.enabled
+        enabled: runner.enabled,
+        allow_insecure_http: Boolean(runner.allow_insecure_http)
       }
     });
   }
@@ -1411,10 +1584,15 @@ function RunnerNodePanel() {
       address: draft.address.trim(),
       network_region: draft.network_region.trim() || "local",
       enabled: draft.enabled !== false,
-      token: draft.token?.trim() || ""
+      token: draft.token?.trim() || "",
+      allow_insecure_http: runnerAddressUsesInsecureHttp(draft.address) && Boolean(draft.allow_insecure_http)
     };
     if (!payload.name || !payload.address || !payload.token) {
       message.error("请填写节点名称、地址和认证信息");
+      return;
+    }
+    if (runnerAddressUsesInsecureHttp(payload.address) && !payload.allow_insecure_http) {
+      message.error("请确认手工 HTTP 节点的明文传输风险，或改用 HTTPS / Relay");
       return;
     }
     setSaving(true);
@@ -1449,10 +1627,24 @@ function RunnerNodePanel() {
       name: editRunner.draft.name.trim(),
       address: editRunner.draft.address.trim(),
       network_region: editRunner.draft.network_region.trim() || "local",
-      enabled: editRunner.draft.enabled !== false
+      enabled: editRunner.draft.enabled !== false,
+      allow_insecure_http:
+        editRunner.runner.role === "child" &&
+        editRunner.runner.connection_mode !== "relay" &&
+        runnerAddressUsesInsecureHttp(editRunner.draft.address) &&
+        Boolean(editRunner.draft.allow_insecure_http)
     };
     if (!payload.name || !payload.address) {
       message.error("请填写节点名称和地址");
+      return;
+    }
+    if (
+      editRunner.runner.role === "child" &&
+      editRunner.runner.connection_mode !== "relay" &&
+      runnerAddressUsesInsecureHttp(payload.address) &&
+      !payload.allow_insecure_http
+    ) {
+      message.error("请确认手工 HTTP 节点的明文传输风险，或改用 HTTPS / Relay");
       return;
     }
     setSaving(true);
@@ -1692,6 +1884,13 @@ function RunnerNodePanel() {
                           <Space size={6} wrap className="runner-node-tags">
                             <Tag>{runner.role === "local" ? "本机" : "子节点"}</Tag>
                             {runner.role !== "local" && <Tag>{runner.connection_mode === "relay" ? "Relay 自动" : "手动直连"}</Tag>}
+                            {runner.role !== "local" &&
+                              runner.connection_mode !== "relay" &&
+                              runnerAddressUsesInsecureHttp(runner.address) && (
+                                <Tag color={runner.allow_insecure_http ? "warning" : "error"}>
+                                  {runner.allow_insecure_http ? "HTTP 风险已确认" : "HTTP 未确认"}
+                                </Tag>
+                              )}
                             <Tag color={runner.enabled ? "success" : "default"}>{runner.enabled ? "已启用" : "已停用"}</Tag>
                             <Tag color={runnerStatusColor(runner)}>{runnerStatusLabel(runner)}</Tag>
                             <Tag>{runner.network_region || "local"}</Tag>
@@ -1787,13 +1986,25 @@ function RunnerNodePanel() {
           </Form.Item>
           {createMode === "manual" && (
             <>
-              <Form.Item label="节点地址" required help="可填写裸 IP/域名，系统会按 worker 默认端口补成 http://地址:8788。">
+              <Form.Item label="节点地址" required help="优先填写 HTTPS 地址；裸 IP/域名会按 worker 默认端口补成 http://地址:8788。">
                 <Input
                   value={draft.address}
                   placeholder="10.0.0.12 或 http://10.0.0.12:8788"
                   onChange={(event) => setDraft((current) => ({ ...current, address: event.target.value }))}
                 />
               </Form.Item>
+              {runnerAddressUsesInsecureHttp(draft.address) && (
+                <Form.Item>
+                  <Checkbox
+                    checked={Boolean(draft.allow_insecure_http)}
+                    onChange={(event) =>
+                      setDraft((current) => ({ ...current, allow_insecure_http: event.target.checked }))
+                    }
+                  >
+                    我确认该节点位于可信网络，允许 token、任务参数和环境变量通过明文 HTTP 传输
+                  </Checkbox>
+                </Form.Item>
+              )}
               <Form.Item label="认证信息" required help="粘贴 pgrn_ 开头的 token；也可以粘贴日志里的 token: pgrn_... 整行。">
                 <Input.Password
                   value={draft.token}
@@ -1878,6 +2089,27 @@ function RunnerNodePanel() {
               }
             />
           </Form.Item>
+          {editRunner?.runner.role === "child" &&
+            editRunner.runner.connection_mode !== "relay" &&
+            runnerAddressUsesInsecureHttp(editRunner.draft.address) && (
+              <Form.Item>
+                <Checkbox
+                  checked={Boolean(editRunner.draft.allow_insecure_http)}
+                  onChange={(event) =>
+                    setEditRunner((current) =>
+                      current
+                        ? {
+                            ...current,
+                            draft: { ...current.draft, allow_insecure_http: event.target.checked }
+                          }
+                        : current
+                    )
+                  }
+                >
+                  我确认该节点位于可信网络，允许 token、任务参数和环境变量通过明文 HTTP 传输
+                </Checkbox>
+              </Form.Item>
+            )}
           <Form.Item label="网络区域">
             <Input
               value={editRunner?.draft.network_region || ""}
@@ -1955,7 +2187,7 @@ function RunnerNodePanel() {
             <pre>{`docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d`}</pre>
             <span>主节点启用 relay 后，在新增子节点里选择“生成部署命令”，复制命令到 worker 宿主机执行。worker 不需要开放 8788 入站端口，部署命令默认启动 updater。</span>
           </div>
-          <span>手动添加模式下，先在子节点服务器启动 worker，再回到这里填写子节点地址和日志输出的 token。</span>
+          <span>手动添加模式优先使用 HTTPS。仅在可信内网无法提供 HTTPS 时，才显式确认使用明文 HTTP；否则使用 Relay 自动接入。</span>
           <div className="worker-help-block">
             <strong>推荐部署：公司 Git 源码构建（Windows PowerShell）</strong>
             <pre>{`git clone git@git.corpautohome.com:liyanqing/PulseGuard.git
@@ -2038,33 +2270,44 @@ function copyTextWithTextarea(value: string): boolean {
 }
 
 function ReadOnlyApiDocs({ onCopyPath }: { onCopyPath: (path: string) => void }) {
+  const endpoints = [
+    {
+      key: "snapshot",
+      paths: ["/api/read-only/snapshot"],
+      purpose: "读取任务状态与最近运行",
+      auth: "Bearer 只读令牌"
+    },
+    {
+      key: "metrics",
+      paths: ["/api/metrics", "/api/metrics.json"],
+      purpose: "Prometheus 或 JSON 指标采集",
+      auth: "无需令牌"
+    }
+  ];
   return (
-    <SettingsPanel title="开放接口文档" icon={<Clipboard size={18} />} className="settings-panel-wide">
-      <Space orientation="vertical" size={12} className="drawer-stack">
-        <Card size="small" title={<EndpointTitle path="/api/read-only/snapshot" onCopy={onCopyPath} />}>
-          <Space orientation="vertical" size={8}>
-            <span>用途：给外部看板、脚本或巡检工具读取当前监控概况、任务状态和最近运行。</span>
-            <span>鉴权：需要开放接口令牌，推荐使用 Authorization: Bearer &lt;token&gt;；也兼容 X-PulseGuard-Read-Only-Token 请求头或 token 查询参数。</span>
-            <pre>{`curl -H "Authorization: Bearer <token>" "http://<host>:8787/api/read-only/snapshot"`}</pre>
-          </Space>
-        </Card>
-
-        <Card
-          size="small"
-          title={
-            <div className="endpoint-title-group">
-              <EndpointTitle path="/api/metrics" onCopy={onCopyPath} />
-              <EndpointTitle path="/api/metrics.json" onCopy={onCopyPath} />
-            </div>
-          }
-        >
-          <Space orientation="vertical" size={8}>
-            <span>用途：监控系统采集指标，Prometheus 使用 /api/metrics，JSON 集成使用 /api/metrics.json。</span>
-            <span>鉴权：不需要只读令牌。</span>
-          </Space>
-        </Card>
-      </Space>
-    </SettingsPanel>
+    <Card type="inner" title={<Space size={8}><Clipboard size={16} /><span>开放接口</span></Space>}>
+      <Table
+        className="settings-endpoint-table"
+        rowKey="key"
+        size="small"
+        pagination={false}
+        dataSource={endpoints}
+        columns={[
+          {
+            title: "接口",
+            dataIndex: "paths",
+            width: 360,
+            render: (paths: string[]) => (
+              <Space orientation="vertical" size={2}>
+                {paths.map((path) => <EndpointTitle key={path} path={path} onCopy={onCopyPath} />)}
+              </Space>
+            )
+          },
+          { title: "用途", dataIndex: "purpose" },
+          { title: "认证", dataIndex: "auth", width: 180 }
+        ]}
+      />
+    </Card>
   );
 }
 
@@ -2083,6 +2326,8 @@ function EndpointTitle({ path, onCopy }: { path: string; onCopy: (path: string) 
 }
 
 function ConfigTransferPanel({
+  embedded = false,
+  scope,
   exporting,
   uploadProps,
   drawerOpen,
@@ -2092,6 +2337,7 @@ function ConfigTransferPanel({
   previewing,
   importing,
   applyDisabledReason,
+  importDisabledReason,
   hasUnsavedChanges,
   onExport,
   onOpenImport,
@@ -2100,6 +2346,8 @@ function ConfigTransferPanel({
   onPreviewImport,
   onRequestApply
 }: {
+  embedded?: boolean;
+  scope: "project" | "system";
   exporting: boolean;
   uploadProps: UploadProps;
   drawerOpen: boolean;
@@ -2109,6 +2357,7 @@ function ConfigTransferPanel({
   previewing: boolean;
   importing: boolean;
   applyDisabledReason: string;
+  importDisabledReason: string;
   hasUnsavedChanges: boolean;
   onExport: () => void;
   onOpenImport: () => void;
@@ -2119,15 +2368,17 @@ function ConfigTransferPanel({
 }) {
   const canResetImport = hasImportBundle || Boolean(preview);
 
-  return (
-    <SettingsPanel title="配置导入导出" icon={<FileJson2 size={18} />} className="settings-panel-wide">
+  const content = (
+    <>
       <div className="config-transfer-grid">
         <section className="config-transfer-block">
           <div className="config-transfer-heading">
             <strong>导出配置</strong>
             <Tag color="blue">默认脱敏</Tag>
           </div>
-          <span className="config-transfer-meta">任务、告警、运行参数、浏览器和保留策略</span>
+          <span className="config-transfer-meta">
+            {scope === "project" ? "仅当前项目任务与项目告警，不包含全局设置" : "仅全局设置、Runner 与成员，不包含项目数据"}
+          </span>
           <Button icon={<Download size={16} />} loading={exporting} onClick={onExport}>
             导出 JSON
           </Button>
@@ -2141,9 +2392,13 @@ function ConfigTransferPanel({
             </Tag>
           </div>
           <span className="config-transfer-meta">选择 JSON 后先预检，预检通过后应用导入</span>
-          <Button icon={<UploadCloud size={16} />} onClick={onOpenImport}>
-            导入 JSON
-          </Button>
+          <Tooltip title={importDisabledReason}>
+            <span className="tooltip-button-wrapper">
+              <Button icon={<UploadCloud size={16} />} onClick={onOpenImport} disabled={Boolean(importDisabledReason)}>
+                导入 JSON
+              </Button>
+            </span>
+          </Tooltip>
         </section>
       </div>
 
@@ -2205,6 +2460,13 @@ function ConfigTransferPanel({
           {preview && <ConfigImportPreviewResult preview={preview} />}
         </div>
       </Drawer>
+    </>
+  );
+
+  if (embedded) return <div className="config-transfer-embedded">{content}</div>;
+  return (
+    <SettingsPanel title={scope === "project" ? "项目包导入导出" : "系统配置包导入导出"} icon={<FileJson2 size={18} />} className="settings-panel-wide">
+      {content}
     </SettingsPanel>
   );
 }
@@ -2247,6 +2509,52 @@ function ConfigImportIssueList({ title, tone, messages }: { title: string; tone:
       </ul>
     </section>
   );
+}
+
+function ProjectVariablesPanel({ projectName, readOnly }: { projectName: string; readOnly: boolean }) {
+  const { message } = App.useApp();
+  const [variables, setVariables] = useState<EnvironmentVariable[]>([]);
+  const [saved, setSaved] = useState<EnvironmentVariable[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let active = true;
+    api.projectVariables().then((values) => {
+      if (active) { setVariables(values); setSaved(values); }
+    }).catch((err: Error) => { if (active) setError(err.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
+  const changed = JSON.stringify(variables) !== JSON.stringify(saved);
+  const invalid = firstVariableBlockingError(variables);
+  async function saveVariables() {
+    setSaving(true);
+    try {
+      const values = await api.updateProjectVariables(variables.map(toPayloadEnvironmentVariable));
+      setVariables(values); setSaved(values);
+      message.success("项目变量已保存");
+    } catch (err) { message.error((err as Error).message); }
+    finally { setSaving(false); }
+  }
+  return <Card title={`${projectName} · 项目变量`} className="settings-panel-wide" loading={loading} extra={
+    <Space>
+      <Tooltip title="使用 ${变量名} 引用；本次运行的临时变量优先于项目变量，项目变量优先于全局变量。">
+        <Button type="text" aria-label="变量引用说明" icon={<Info size={16} />} />
+      </Tooltip>
+      <Button disabled={readOnly || loading || saving || Boolean(error)} onClick={() => setVariables([...variables, createEnvironmentVariable()])}>添加变量</Button>
+      <Button type="primary" loading={saving} disabled={readOnly || loading || Boolean(error) || !changed || Boolean(invalid)} onClick={saveVariables}>保存变量</Button>
+    </Space>
+  }>
+    {error ? <Alert type="error" message={error} /> : <fieldset className="settings-readonly-fieldset" disabled={readOnly || saving}>
+      {variables.length === 0 ? <Empty description="暂无项目变量" /> : <div className="environment-variable-list">
+        {variables.map((variable, index) => <EnvironmentVariableEditor key={variable.id} variable={variable} variables={variables} index={index}
+          onPatch={(patch) => setVariables((current) => current.map((item) => item.id === variable.id ? { ...item, ...patch } : item))}
+          onRemove={() => setVariables((current) => current.filter((item) => item.id !== variable.id))}
+        />)}
+      </div>}
+    </fieldset>}
+  </Card>;
 }
 
 function EnvironmentVariableEditor({
@@ -2598,19 +2906,55 @@ function NotificationChannelEditor({
 }
 
 function AlertPreviewTool({
+  compact = false,
   preview,
   loading,
   disabledReason,
   usesDraft,
-  onPreview
+  onPreview,
+  onClosePreview
 }: {
+  compact?: boolean;
   preview: AlertPreview | null;
   loading: boolean;
   disabledReason: string;
   usesDraft: boolean;
   onPreview: () => void;
+  onClosePreview?: () => void;
 }) {
   const disabled = Boolean(disabledReason);
+  const previewContent = preview && (
+    <div className="alert-preview-body">
+      {preview.channels.length === 0 ? (
+        <Empty description="暂无可预检渠道" />
+      ) : (
+        <div className="alert-preview-channel-list">
+          {preview.channels.map((channel) => (
+            <PreviewChannel key={channel.id || `${channel.type}-${channel.name}`} channel={channel} />
+          ))}
+        </div>
+      )}
+      <StructuredViewer title="消息正文" value={preview.message_text} defaultMode="markdown" />
+    </div>
+  );
+
+  if (compact) {
+    return (
+      <>
+        <Tooltip title={disabledReason || (usesDraft ? "使用当前草稿生成，不保存、不发送" : "生成预检，不发送网络请求")}>
+          <span className="tooltip-button-wrapper">
+            <Button icon={<ShieldCheck size={16} />} loading={loading} disabled={disabled} onClick={onPreview}>
+              预检渠道
+            </Button>
+          </span>
+        </Tooltip>
+        <Drawer title="发送预检" open={Boolean(preview)} size={780} onClose={onClosePreview}>
+          {previewContent}
+        </Drawer>
+      </>
+    );
+  }
+
   return (
     <section className="alert-preview-tool">
       <div className="alert-preview-header">
@@ -2627,20 +2971,7 @@ function AlertPreviewTool({
         </Tooltip>
       </div>
 
-      {preview && (
-        <div className="alert-preview-body">
-          {preview.channels.length === 0 ? (
-            <Empty description="暂无可预检渠道" />
-          ) : (
-            <div className="alert-preview-channel-list">
-              {preview.channels.map((channel) => (
-                <PreviewChannel key={channel.id || `${channel.type}-${channel.name}`} channel={channel} />
-              ))}
-            </div>
-          )}
-          <StructuredViewer title="消息正文" value={preview.message_text} defaultMode="markdown" />
-        </div>
-      )}
+      {previewContent}
     </section>
   );
 }
@@ -2681,22 +3012,24 @@ function SettingsPanel({
   icon,
   children,
   accent,
-  className
+  className,
+  extra
 }: {
   title: string;
   icon: ReactNode;
   children: ReactNode;
   accent?: boolean;
   className?: string;
+  extra?: ReactNode;
 }) {
   return (
-    <section className={["settings-panel", accent ? "settings-panel-accent" : "", className].filter(Boolean).join(" ")}>
-      <div className="settings-panel-header">
-        <span className="settings-panel-icon">{icon}</span>
-        <h3>{title}</h3>
-      </div>
+    <Card
+      className={["settings-panel", accent ? "settings-panel-accent" : "", className].filter(Boolean).join(" ")}
+      title={<Space size={8}>{icon}<span>{title}</span></Space>}
+      extra={extra}
+    >
       {children}
-    </section>
+    </Card>
   );
 }
 
@@ -2736,9 +3069,18 @@ function NumberItem({
   min?: number;
   max?: number;
 }) {
+  const inputId = useId();
   return (
-    <Form.Item label={label}>
-      <InputNumber min={min} max={max} value={value} suffix={suffix} onChange={(next) => onChange(Number(next || 0))} />
+    <Form.Item label={label} htmlFor={inputId}>
+      <InputNumber
+        id={inputId}
+        aria-label={label}
+        min={min}
+        max={max}
+        value={value}
+        suffix={suffix}
+        onChange={(next) => onChange(Number(next || 0))}
+      />
     </Form.Item>
   );
 }
@@ -3070,13 +3412,9 @@ function settingsTabChanged(current: SettingsValues, saved: SettingsValues, tab:
 function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
   const alerts = {
     alerts_enabled: values.alerts_enabled,
-    system_alerts_enabled: values.system_alerts_enabled,
-    alert_detail_base_url: values.alert_detail_base_url,
     alert_cooldown_minutes: values.alert_cooldown_minutes,
-    alert_delivery_attempts: values.alert_delivery_attempts,
     recovery_notification: values.recovery_notification,
     execution_notification_channel_ids: values.execution_notification_channel_ids || [],
-    system_notification_channel_ids: values.system_notification_channel_ids || [],
     alert_tag_policies: (values.alert_tag_policies || []).map((policy) => ({
       id: policy.id,
       name: policy.name,
@@ -3087,6 +3425,22 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
       notification_channel_ids: policy.notification_channel_ids || []
     })),
     notification_channels: values.notification_channels.map((channel) => ({
+      id: channel.id,
+      name: channel.name,
+      type: channel.type,
+      enabled: channel.enabled,
+      webhook_url: channel.webhook_url,
+      dingtalk_secret: channel.dingtalk_secret || "",
+      dingtalk_secret_set: Boolean(channel.dingtalk_secret_set),
+      dingtalk_secret_clear: Boolean(channel.dingtalk_secret_clear)
+    }))
+  };
+  const systemAlerts = {
+    system_alerts_enabled: values.system_alerts_enabled,
+    alert_detail_base_url: values.alert_detail_base_url,
+    alert_delivery_attempts: values.alert_delivery_attempts,
+    system_notification_channel_ids: values.system_notification_channel_ids || [],
+    system_notification_channels: (values.system_notification_channels || []).map((channel) => ({
       id: channel.id,
       name: channel.name,
       type: channel.type,
@@ -3147,7 +3501,8 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     read_only_tokens: (values.read_only_tokens || []).map((token) => ({
       id: token.id,
       name: token.name || "",
-      created_at: token.created_at || ""
+      created_at: token.created_at || "",
+      project_ids: token.project_ids || []
     }))
   };
   const maintenance = {
@@ -3160,10 +3515,11 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
   const execution = { runtime, browser };
   const system = { retention, access, maintenance };
   if (tab === "alerts") return alerts;
+  if (tab === "system-alerts") return systemAlerts;
   if (tab === "execution") return execution;
   if (tab === "variables") return variables;
   if (tab === "system") return system;
-  return { alerts, execution, variables, system };
+  return { alerts, systemAlerts, execution, variables, system };
 }
 
 function cloneSettings(values: SettingsValues): SettingsValues {
@@ -3187,6 +3543,7 @@ function cloneSettings(values: SettingsValues): SettingsValues {
     maintenance_starts_at: cloned.maintenance_starts_at || "",
     maintenance_ends_at: cloned.maintenance_ends_at || "",
     notification_channels: cloned.notification_channels || [],
+    system_notification_channels: cloned.system_notification_channels || [],
     execution_notification_channel_ids: cloned.execution_notification_channel_ids || [],
     system_notification_channel_ids: cloned.system_notification_channel_ids || [],
     system_alerts_enabled: cloned.system_alerts_enabled ?? true,

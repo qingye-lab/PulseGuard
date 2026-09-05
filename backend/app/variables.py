@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+from copy import deepcopy
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 
 VARIABLE_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -34,6 +36,65 @@ MASK = "***"
 
 class VariableResolutionError(ValueError):
     pass
+
+
+class RuntimeVariables:
+    """Attempt-local overlay. Never writes project settings or process environment."""
+
+    def __init__(self, settings: dict[str, Any]) -> None:
+        self.settings = deepcopy(settings)
+        self.settings["_runtime_secret_values"] = _secret_values(settings) + [
+            str(item.get("value") or "") for item in environment_variables(settings)
+            if item.get("secret") or is_sensitive_variable_name(str(item.get("name") or ""))
+        ]
+        self._values: dict[str, str] = {}
+
+    def get(self, name: str, default: Any = None) -> Any:
+        return variable_lookup(self.settings).get(name, default)
+
+    def set(self, name: str, value: Any, *, secret: bool = False) -> None:
+        if not isinstance(name, str) or not VARIABLE_NAME_PATTERN.fullmatch(name) or len(name) > 80:
+            raise VariableResolutionError("变量名称必须是字母、数字、下划线，且不能以数字开头")
+        if value is None or not isinstance(value, (str, int, float, bool)):
+            raise VariableResolutionError(f"变量 {name} 必须是非 null 的文本、数字或布尔值")
+        text = str(value)
+        if len(text) > 16384 or (name not in self._values and len(self._values) >= 200):
+            raise VariableResolutionError("临时变量超过大小或数量限制")
+        inherited_secret = any(
+            item.get("name") == name and item.get("secret") for item in environment_variables(self.settings)
+        )
+        secret = secret or inherited_secret or is_sensitive_variable_name(name)
+        if secret:
+            self.settings["_runtime_secret_values"].append(text)
+        self._values[name] = text
+        self.settings["environment_variables"] = [
+            item for item in environment_variables(self.settings) if item.get("name") != name
+        ] + [{"name": name, "value": text, "secret": secret, "url_encode": True}]
+
+    def snapshot(self) -> dict[str, str]:
+        return mask_data(self._values, self.settings)
+
+
+def resolve_url(value: Any, settings: dict[str, Any]) -> str:
+    """Preserve URL literals; encode substitutions inside query/fragment components.
+
+    Project/runtime variables hold raw values. Legacy global/process variables and
+    whole URL/base URL placeholders retain the existing text semantics.
+    """
+    text = "" if value is None else str(value)
+    before_fragment, fragment_sep, fragment = text.partition("#")
+    base, query_sep, query = before_fragment.partition("?")
+    encoded_names = {item.get("name") for item in environment_variables(settings) if item.get("url_encode")}
+
+    def encoded(component: str) -> str:
+        return VARIABLE_PLACEHOLDER_PATTERN.sub(
+            lambda match: quote(resolve_text(match.group(0), settings), safe="")
+            if match.group(1) in encoded_names else resolve_text(match.group(0), settings), component
+        )
+
+    return resolve_text(base, settings) + (query_sep + encoded(query) if query_sep else "") + (
+        fragment_sep + encoded(fragment) if fragment_sep else ""
+    )
 
 
 def environment_variables(settings: dict[str, Any]) -> list[dict[str, Any]]:
@@ -142,6 +203,9 @@ def _secret_values(settings: dict[str, Any]) -> list[str]:
         seen.add(value)
         values.append(value)
 
+    values.extend(str(value) for value in settings.get("_runtime_secret_values", []) if value)
+    # URLs and exceptions can contain encoded secrets, including short runtime values.
+    values = list({variant for value in values for variant in (value, quote(value, safe=""), quote_plus(value)) if variant})
     values.sort(key=len, reverse=True)
     return values
 

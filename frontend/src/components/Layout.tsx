@@ -1,16 +1,21 @@
-import { Button, Dropdown, Menu, Modal, Typography } from "antd";
+import { Button, Dropdown, Menu, Modal, Tag, Typography } from "antd";
 import type { MenuProps } from "antd";
 import {
   Activity,
   BellRing,
+  Check,
+  ChevronDown,
   History,
   KeyRound,
   LayoutDashboard,
   Megaphone,
   MonitorCheck,
   MoreHorizontal,
+  FolderKanban,
+  Plus,
   PlugZap,
   ScrollText,
+  ShieldCheck,
   Settings,
   Users
 } from "lucide-react";
@@ -18,12 +23,13 @@ import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
+import { ProjectCreateModal } from "./ProjectCreateModal";
 import { Button as UiButton } from "./ui/button";
 import type { StatusPageSnapshot } from "../types";
 import { formatDate } from "../utils";
+import { useProject } from "../ProjectContext";
 
 const { Text, Title } = Typography;
-const APP_TEAM_NAME = "新零售测试团队";
 
 type NavLeaf = {
   to: string;
@@ -55,12 +61,21 @@ const navEntries: NavEntry[] = [
   { to: "/runs", label: "运行记录", icon: <History size={16} /> },
   { to: "/members", label: "成员管理", icon: <Users size={16} /> },
   {
+    key: "projects",
+    label: "项目管理",
+    icon: <FolderKanban size={16} />,
+    children: [
+      { to: "/projects", label: "项目列表", icon: <FolderKanban size={16} /> },
+      { to: "/projects/alerts", label: "项目告警", icon: <BellRing size={16} /> }
+    ]
+  },
+  {
     key: "system",
     label: "系统设置",
     icon: <Settings size={16} />,
     children: [
       { to: "/settings/execution", label: "执行配置", icon: <Activity size={16} /> },
-      { to: "/settings/alerts", label: "告警配置", icon: <BellRing size={16} /> },
+      { to: "/settings/system-alerts", label: "系统告警", icon: <ShieldCheck size={16} /> },
       { to: "/settings/variables", label: "变量管理", icon: <KeyRound size={16} /> },
       { to: "/settings/system", label: "系统配置", icon: <Settings size={16} /> },
       { to: "/operations", label: "运维审计", icon: <ScrollText size={16} /> }
@@ -94,8 +109,10 @@ const mobilePrimaryItems = [
 const mobileMoreItems: NavLeaf[] = [
   { to: "/monitoring", label: "监控趋势", icon: <Activity size={16} /> },
   { to: "/members", label: "成员管理", icon: <Users size={16} /> },
+  { to: "/projects", label: "项目列表", icon: <FolderKanban size={16} /> },
+  { to: "/projects/alerts", label: "项目告警", icon: <BellRing size={16} /> },
   { to: "/settings/execution", label: "执行配置", icon: <Activity size={16} /> },
-  { to: "/settings/alerts", label: "告警配置", icon: <BellRing size={16} /> },
+  { to: "/settings/system-alerts", label: "系统告警", icon: <ShieldCheck size={16} /> },
   { to: "/settings/variables", label: "变量管理", icon: <KeyRound size={16} /> },
   { to: "/settings/system", label: "系统配置", icon: <Settings size={16} /> },
   { to: "/operations", label: "运维审计", icon: <ScrollText size={16} /> }
@@ -109,10 +126,13 @@ function pathMatchesNavItem(pathname: string, itemPath: string): boolean {
 }
 
 export function Layout() {
+  const { projects, currentProject, selectProject } = useProject();
   const location = useLocation();
   const navigate = useNavigate();
   const [maintenance, setMaintenance] = useState<StatusPageSnapshot["maintenance"] | null>(null);
+  const [serviceConnected, setServiceConnected] = useState<boolean | null>(null);
   const [maintenanceOpen, setMaintenanceOpen] = useState(false);
+  const [createProjectOpen, setCreateProjectOpen] = useState(false);
   const selectedPath =
     [...navItems]
       .sort((left, right) => right.to.length - left.to.length)
@@ -130,10 +150,16 @@ export function Layout() {
       api
         .statusPage()
         .then((snapshot) => {
-          if (!disposed) setMaintenance(snapshot.maintenance);
+          if (!disposed) {
+            setMaintenance(snapshot.maintenance);
+            setServiceConnected(true);
+          }
         })
         .catch(() => {
-          if (!disposed) setMaintenance(null);
+          if (!disposed) {
+            setMaintenance(null);
+            setServiceConnected(false);
+          }
         });
     };
     loadMaintenance();
@@ -142,7 +168,22 @@ export function Layout() {
       disposed = true;
       window.removeEventListener("pulseguard:maintenance-updated", loadMaintenance);
     };
-  }, [location.pathname]);
+  }, []);
+
+  const projectMenuItems: MenuProps["items"] = [
+    ...projects.map((project) => ({
+      key: `project:${project.id}`,
+      icon: project.id === currentProject.id ? <Check size={15} /> : <span className="project-menu-icon-placeholder" />,
+      label: (
+        <span className="project-menu-option">
+          <span className="project-menu-name">{project.name}</span>
+          {project.status === "archived" && <Tag>只读</Tag>}
+        </span>
+      )
+    })),
+    { type: "divider" },
+    { key: "create-project", icon: <Plus size={15} />, label: "新建项目" }
+  ];
 
   return (
     <div className="app-shell">
@@ -159,7 +200,6 @@ export function Layout() {
               <Text strong className="brand-name">
                 PulseGuard
               </Text>
-              <span className="brand-team">{APP_TEAM_NAME}</span>
             </div>
           </div>
         </div>
@@ -220,6 +260,39 @@ export function Layout() {
             </UiButton>
           </Dropdown>
         </div>
+        <div className="sidebar-project-dock">
+          <Dropdown
+            trigger={["click"]}
+            placement="topLeft"
+            menu={{
+              className: "project-switch-menu",
+              items: projectMenuItems,
+              selectedKeys: [`project:${currentProject.id}`],
+              onClick: ({ key }) => {
+                if (key === "create-project") {
+                  setCreateProjectOpen(true);
+                  return;
+                }
+                const projectId = Number(String(key).replace("project:", ""));
+                if (Number.isFinite(projectId)) selectProject(projectId);
+              }
+            }}
+          >
+            <Button
+              className="sidebar-project-button"
+              aria-label={`当前项目：${currentProject.name}，点击切换项目`}
+              aria-haspopup="menu"
+            >
+              <span className="sidebar-project-icon" aria-hidden="true"><FolderKanban size={16} /></span>
+              <span className="sidebar-project-copy">
+                <span className="sidebar-project-label">当前项目</span>
+                <strong>{currentProject.name}</strong>
+              </span>
+              {currentProject.status === "archived" && <Tag>只读</Tag>}
+              <ChevronDown className="sidebar-project-chevron" size={15} aria-hidden="true" />
+            </Button>
+          </Dropdown>
+        </div>
       </aside>
       <main className="main-area" id="main-content">
         <header className="topbar">
@@ -234,13 +307,20 @@ export function Layout() {
                 公告
               </Button>
             )}
-            <div className="runtime-pill">
-              <span className="runtime-dot" />
-              本地运行
+            <div className="runtime-pill" role="status" aria-live="polite">
+              {serviceConnected === true && <span className="runtime-dot" />}
+              {serviceConnected === null ? "连接检查中" : serviceConnected ? "服务已连接" : "服务连接异常"}
             </div>
           </div>
         </header>
-        <Outlet />
+        <div className={currentProject.status === "archived" ? "project-content is-archived" : "project-content"}>
+          {currentProject.status === "archived" && (
+            <div className="archived-project-banner" role="status">
+              当前项目已归档，历史数据可查看；创建、编辑、执行、重跑和导入均已停用。
+            </div>
+          )}
+          <Outlet />
+        </div>
       </main>
       <Modal
         title={maintenance?.title || "维护公告"}
@@ -258,6 +338,7 @@ export function Layout() {
           )}
         </div>
       </Modal>
+      <ProjectCreateModal open={createProjectOpen} onClose={() => setCreateProjectOpen(false)} />
     </div>
   );
 }

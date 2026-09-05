@@ -1,5 +1,6 @@
 import Editor from "@monaco-editor/react";
 import type { ReactNode } from "react";
+import "./localMonaco";
 
 export interface CodeEditorPanelProps {
   title: string;

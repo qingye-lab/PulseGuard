@@ -189,7 +189,7 @@ PulseGuard uses tonal layering and borders first. Shadows are reserved for overl
 - **Error / Disabled:** Use semantic status color and text, not color alone.
 
 ### Navigation
-- **Style:** Left rail on desktop, compact five-item grid on mobile.
+- **Style:** Left rail for desktop and laptop operations. Phone-specific navigation and phone viewport compatibility are out of scope.
 - **Active State:** Neutral filled row, 1px border, and restrained blue icon only. No blue pill block and no colored side stripe.
 
 ### Feedback Taxonomy
@@ -200,6 +200,12 @@ PulseGuard uses tonal layering and borders first. Shadows are reserved for overl
 - **Blocking Alert:** Use `Alert` only for blocking page or section failures that prevent normal work from continuing.
 - **Empty:** Use `Empty` only for true data absence. Avoid instructional descriptions unless the empty state replaces the whole workflow and includes one primary action.
 - **Forbidden:** Do not add persistent informational callouts for routine work surfaces. Draft-run explanations, scan instructions, and “click here” guidance belong in toast, tooltip, or an explicit overlay.
+
+### Viewport Acceptance
+
+- Verify the console on desktop/laptop browser widths, including a constrained desktop window and a full desktop window.
+- Do not add phone-specific layouts or include phone viewport compatibility in release acceptance. Existing narrow-screen styles may remain, but do not constitute supported phone UX.
+- This does not affect H5 page mode or mobile target viewport settings in UI probes.
 
 ## 6. Do's and Don'ts
 

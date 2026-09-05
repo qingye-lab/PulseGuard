@@ -7,11 +7,12 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "test:bundle": "node --test scripts/*.test.mjs",
     "build": "npm run typecheck && vite build",
     "preview": "vite preview --host 127.0.0.1 --port 4173"
   },
   "dependencies": {
-    "@ant-design/plots": "^2.6.8",
+    "@antv/g2": "^5.4.8",
     "@monaco-editor/react": "^4.6.0",
     "@tailwindcss/vite": "^4.3.1",
     "@uiw/react-json-view": "^2.0.0-alpha.43",
@@ -20,6 +21,7 @@
     "clsx": "^2.1.1",
     "dayjs": "^1.11.21",
     "lucide-react": "^0.468.0",
+    "monaco-editor": "^0.55.1",
     "radix-ui": "^1.6.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

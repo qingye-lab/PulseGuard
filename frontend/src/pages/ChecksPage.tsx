@@ -7,6 +7,7 @@ import type { ReactElement } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { checkToCopyPayload } from "../checkPayload";
+import { useProject } from "../ProjectContext";
 import {
   BatchRunActions,
   BatchRunBreakdown,
@@ -28,10 +29,10 @@ function TaskStatusTag({ check }: { check: Check }) {
   return <Tag color={taskStatusTagColor(status)}>{taskStatusLabel(status)}</Tag>;
 }
 
-function checkSecondaryActionItems(isDuplicating: boolean): MenuProps["items"] {
+function checkSecondaryActionItems(isDuplicating: boolean, readOnly: boolean): MenuProps["items"] {
   return [
-    { key: "duplicate", icon: <Copy size={15} />, label: "复制", disabled: isDuplicating },
-    { key: "delete", icon: <Trash2 size={15} />, label: "删除", danger: true }
+    { key: "duplicate", icon: <Copy size={15} />, label: "复制", disabled: readOnly || isDuplicating },
+    { key: "delete", icon: <Trash2 size={15} />, label: "删除", danger: true, disabled: readOnly }
   ];
 }
 
@@ -43,6 +44,8 @@ const checkPaginationItemRender: PaginationProps["itemRender"] = (_, itemType, o
 
 export function ChecksPage({ type }: { type: CheckType }) {
   const { message, modal } = App.useApp();
+  const { currentProject } = useProject();
+  const readOnly = currentProject.status === "archived";
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [checks, setChecks] = useState<Check[]>([]);
@@ -160,8 +163,8 @@ export function ChecksPage({ type }: { type: CheckType }) {
   const hasFilters = Boolean(query || statusFilter || enabledFilter || tagFilter || runnerFilter || focusedCheckId);
   const selectedCount = selectedChecks.length;
   const selectedStateActionItems: MenuProps["items"] = [
-    { key: "enable", icon: <Power size={15} />, label: `启用选中任务（${selectedCount}）`, disabled: selectedCount === 0 },
-    { key: "disable", icon: <PowerOff size={15} />, label: `禁用选中任务（${selectedCount}）`, disabled: selectedCount === 0 }
+    { key: "enable", icon: <Power size={15} />, label: `启用选中任务（${selectedCount}）`, disabled: readOnly || selectedCount === 0 },
+    { key: "disable", icon: <PowerOff size={15} />, label: `禁用选中任务（${selectedCount}）`, disabled: readOnly || selectedCount === 0 }
   ];
 
   async function runCheck(check: Check) {
@@ -371,6 +374,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
           aria-label={`${check.name} 启用状态`}
           checked={check.enabled}
           loading={busy === check.id}
+          disabled={readOnly}
           onChange={() => toggle(check)}
         />
       ),
@@ -396,6 +400,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
               aria-label={`${check.name} 执行`}
               icon={<Play size={15} />}
               loading={busy === check.id}
+              disabled={readOnly}
               onClick={() => runCheck(check)}
             />
             {["failing", "suspected_failing", "suspected_recovery", "stale", "unknown"].includes(taskStatus(check)) && (
@@ -405,6 +410,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
                 aria-label={`${check.name} 确认恢复`}
                 icon={<RefreshCw size={15} />}
                 loading={busy === check.id}
+                disabled={readOnly}
                 onClick={() => confirmRecovery(check)}
               />
             )}
@@ -413,6 +419,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
               title="编辑"
               aria-label={`${check.name} 编辑`}
               icon={<Edit3 size={15} />}
+              disabled={readOnly}
               onClick={() => {
                 setEditing(check);
                 setDrawerOpen(true);
@@ -429,7 +436,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
               trigger={["click"]}
               placement="bottomRight"
               menu={{
-                items: checkSecondaryActionItems(isDuplicating),
+                items: checkSecondaryActionItems(isDuplicating, readOnly),
                 onClick: ({ key }) => {
                   if (key === "duplicate") duplicate(check);
                   if (key === "delete") confirmRemove(check);
@@ -448,190 +455,190 @@ export function ChecksPage({ type }: { type: CheckType }) {
     <div className="page-content">
       {error && <Alert type="error" title={error} showIcon />}
 
-      <section className="check-summary">
-        <Card className="summary-card">
+      <Card title="任务状态" className="project-summary-card">
+        <div className="project-stat-grid project-stat-grid-five">
           <Statistic title="全部任务" value={summary.total} />
-        </Card>
-        <Card className="summary-card metric-success">
-          <Statistic title="健康" value={summary.healthy} />
-        </Card>
-        <Card className={`summary-card ${summary.failing ? "metric-danger" : ""}`}>
-          <Statistic title="故障" value={summary.failing} />
-        </Card>
-        <Card className="summary-card metric-info">
+          <Statistic className="project-stat-success" title="健康" value={summary.healthy} />
+          <Statistic className={summary.failing ? "project-stat-danger" : undefined} title="故障" value={summary.failing} />
           <Statistic title="确认中/待观测" value={summary.suspected_failing + summary.suspected_recovery + summary.unknown + summary.stale} />
-        </Card>
-        <Card className="summary-card metric-success">
           <Statistic title="已启用" value={summary.enabled} />
-        </Card>
-      </section>
-
-      <section className="checks-toolbar">
-        <div className="checks-filter-row">
-          <Input
-            className="checks-search"
-            name="checks-search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            aria-label="搜索任务"
-            prefix={<Search size={15} />}
-            placeholder="搜索名称、URL 或标签…"
-            allowClear
-            autoComplete="off"
-          />
-          <Select
-            value={statusFilter}
-            className="checks-filter-control"
-            onChange={(value) => setStatusFilter(value)}
-            options={[
-              { label: "全部状态", value: "" },
-              { label: "健康", value: "healthy" },
-              { label: "疑似故障", value: "suspected_failing" },
-              { label: "故障", value: "failing" },
-              { label: "疑似恢复", value: "suspected_recovery" },
-              { label: "无有效观测", value: "unknown" },
-              { label: "观测过期", value: "stale" },
-              { label: "已禁用", value: "disabled" }
-            ]}
-          />
-          <Select
-            value={enabledFilter}
-            className="checks-filter-control"
-            onChange={(value) => setEnabledFilter(value)}
-            options={[
-              { label: "全部启用状态", value: "" },
-              { label: "已启用", value: "enabled" },
-              { label: "已禁用", value: "disabled" }
-            ]}
-          />
-          <Select
-            showSearch
-            value={tagFilter}
-            className="checks-filter-control"
-            onChange={(value) => setTagFilter(value)}
-            options={[{ label: "全部标签", value: "" }, ...tagOptions]}
-            aria-label="按标签筛选任务"
-          />
-          <Select
-            value={runnerFilter}
-            className="checks-filter-control"
-            onChange={(value) => setRunnerFilter(value)}
-            options={[
-              { label: "全部节点", value: "" },
-              ...runners.map((runner) => ({ label: runner.name || runner.runner_id, value: runner.runner_id }))
-            ]}
-            aria-label="按执行节点筛选任务"
-          />
         </div>
-        <Space wrap>
-          <Button icon={<FilterX size={16} />} onClick={resetFilters} disabled={!hasFilters}>
-            清空筛选
-          </Button>
-          <Button icon={<RefreshCw size={16} />} onClick={load} loading={loading}>
-            刷新
-          </Button>
-          <Button type="primary" icon={<Plus size={16} />} onClick={openCreateDrawer}>
-            新增{type === "ui" ? " UI" : "接口"}任务
-          </Button>
-        </Space>
-      </section>
+      </Card>
 
-      <div className="checks-result-bar">
-        <span>当前结果</span>
-        <strong>{summary.visible}</strong>
-        <span>条</span>
-        {statusFilter && <Tag>{taskStatusLabel(statusFilter)}</Tag>}
-        {enabledFilter && <Tag>{enabledFilter === "enabled" ? "已启用" : "已禁用"}</Tag>}
-        {tagFilter && <Tag>标签：{tagFilter}</Tag>}
-        {runnerFilter && <Tag>执行节点：{runnerName(runnerFilter, runners)}</Tag>}
-        {focusedCheckId && (
-          <Tag
-            closable
-            onClose={(event) => {
-              event.preventDefault();
-              clearTaskFocus();
-            }}
-          >
-            任务 #{focusedCheckId}
-          </Tag>
-        )}
-        {query && <Tag>关键词：{query}</Tag>}
-      </div>
-
-      {selectedCount > 0 && (
-        <section className="checks-selection-bar" aria-label="已选任务操作">
-          <span>
-            已选择 <strong>{selectedCount}</strong> 条任务
-          </span>
+      <Card
+        title={type === "ui" ? "页面监控任务" : "接口监控任务"}
+        className="project-data-card"
+        extra={
+          <Button type="primary" icon={<Plus size={16} />} onClick={openCreateDrawer} disabled={readOnly}>
+            新增任务
+          </Button>
+        }
+      >
+        <div className="project-data-toolbar">
+          <div className="checks-filter-row">
+            <Input
+              className="checks-search"
+              name="checks-search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              aria-label="搜索任务"
+              prefix={<Search size={15} />}
+              placeholder="搜索名称、URL 或标签…"
+              allowClear
+              autoComplete="off"
+            />
+            <Select
+              value={statusFilter}
+              className="checks-filter-control"
+              onChange={(value) => setStatusFilter(value)}
+              options={[
+                { label: "全部状态", value: "" },
+                { label: "健康", value: "healthy" },
+                { label: "疑似故障", value: "suspected_failing" },
+                { label: "故障", value: "failing" },
+                { label: "疑似恢复", value: "suspected_recovery" },
+                { label: "无有效观测", value: "unknown" },
+                { label: "观测过期", value: "stale" },
+                { label: "已禁用", value: "disabled" }
+              ]}
+            />
+            <Select
+              value={enabledFilter}
+              className="checks-filter-control"
+              onChange={(value) => setEnabledFilter(value)}
+              options={[
+                { label: "全部启用状态", value: "" },
+                { label: "已启用", value: "enabled" },
+                { label: "已禁用", value: "disabled" }
+              ]}
+            />
+            <Select
+              showSearch
+              value={tagFilter}
+              className="checks-filter-control"
+              onChange={(value) => setTagFilter(value)}
+              options={[{ label: "全部标签", value: "" }, ...tagOptions]}
+              aria-label="按标签筛选任务"
+            />
+            <Select
+              value={runnerFilter}
+              className="checks-filter-control"
+              onChange={(value) => setRunnerFilter(value)}
+              options={[
+                { label: "全部节点", value: "" },
+                ...runners.map((runner) => ({ label: runner.name || runner.runner_id, value: runner.runner_id }))
+              ]}
+              aria-label="按执行节点筛选任务"
+            />
+          </div>
           <Space wrap>
-            <Button icon={<Play size={16} />} loading={busy === "batch"} disabled={selectedEnabledIds.length === 0} onClick={() => requestBatchAction("run")}>
-              批量执行
+            <Button icon={<FilterX size={16} />} onClick={resetFilters} disabled={!hasFilters}>
+              清空筛选
             </Button>
-            <Dropdown
-              trigger={["click"]}
-              placement="bottomRight"
-              menu={{
-                items: selectedStateActionItems,
-                onClick: ({ key }) => requestBatchAction(key as CheckBatchAction)
+            <Button icon={<RefreshCw size={16} />} onClick={load} loading={loading}>
+              刷新
+            </Button>
+          </Space>
+        </div>
+
+        <div className="project-result-strip">
+          <span>当前结果</span>
+          <strong>{summary.visible}</strong>
+          <span>条</span>
+          {statusFilter && <Tag>{taskStatusLabel(statusFilter)}</Tag>}
+          {enabledFilter && <Tag>{enabledFilter === "enabled" ? "已启用" : "已禁用"}</Tag>}
+          {tagFilter && <Tag>标签：{tagFilter}</Tag>}
+          {runnerFilter && <Tag>执行节点：{runnerName(runnerFilter, runners)}</Tag>}
+          {focusedCheckId && (
+            <Tag
+              closable
+              onClose={(event) => {
+                event.preventDefault();
+                clearTaskFocus();
               }}
             >
-              <Button icon={<MoreHorizontal size={16} />} loading={busy === "batch"}>
-                启用/禁用
-              </Button>
-            </Dropdown>
-            <Button onClick={() => setSelectedCheckIds([])}>取消选择</Button>
-          </Space>
-        </section>
-      )}
+              任务 #{focusedCheckId}
+            </Tag>
+          )}
+          {query && <Tag>关键词：{query}</Tag>}
+        </div>
 
-      {isCompactList ? (
-        <CompactCheckList
-          busy={busy}
-          checks={filtered}
-          hasFilters={hasFilters}
-          loading={loading}
-          runners={runners}
-          type={type}
-          onCreate={openCreateDrawer}
-          onDelete={confirmRemove}
-          onDuplicate={duplicate}
-          onEdit={(check) => {
-            setEditing(check);
-            setDrawerOpen(true);
-          }}
-          onHistory={(check) => navigate(`/runs?check_id=${check.id}`)}
-          onOpenLastRun={(check) => check.last_run_id && setDetailRunId(check.last_run_id)}
-          onRun={runCheck}
-          onConfirmRecovery={confirmRecovery}
-          onToggle={toggle}
-          duplicatingId={duplicatingId}
-          selectedIds={selectedCheckIds}
-          onToggleSelection={(checkId, selected) =>
-            setSelectedCheckIds((current) => (selected ? Array.from(new Set([...current, checkId])) : current.filter((id) => id !== checkId)))
-          }
-        />
-      ) : (
-        <Table
-          rowKey="id"
-          columns={columns}
-          dataSource={filtered}
-          loading={loading}
-          rowSelection={{
-            selectedRowKeys: selectedCheckIds,
-            onChange: (keys) => setSelectedCheckIds(keys.map((key) => Number(key)).filter((key) => Number.isFinite(key)))
-          }}
-          pagination={{ pageSize: 10, showSizeChanger: false, itemRender: checkPaginationItemRender }}
-          locale={{
-            emptyText: (
-              <Empty description={hasFilters ? "没有符合筛选条件的任务" : "暂无任务"}>
-                {!hasFilters && <Button type="primary" icon={<Plus size={16} />} onClick={openCreateDrawer}>新增任务</Button>}
-              </Empty>
-            )
-          }}
-          className="checks-table"
-          scroll={{ x: type === "api" ? 1580 : 1480 }}
-        />
-      )}
+        {selectedCount > 0 && (
+          <div className="project-selection-strip" aria-label="已选任务操作">
+            <span>
+              已选择 <strong>{selectedCount}</strong> 条任务
+            </span>
+            <Space wrap>
+              <Button icon={<Play size={16} />} loading={busy === "batch"} disabled={readOnly || selectedEnabledIds.length === 0} onClick={() => requestBatchAction("run")}>
+                批量执行
+              </Button>
+              <Dropdown
+                trigger={["click"]}
+                placement="bottomRight"
+                menu={{
+                  items: selectedStateActionItems,
+                  onClick: ({ key }) => requestBatchAction(key as CheckBatchAction)
+                }}
+              >
+                <Button icon={<MoreHorizontal size={16} />} loading={busy === "batch"}>
+                  启用/禁用
+                </Button>
+              </Dropdown>
+              <Button onClick={() => setSelectedCheckIds([])}>取消选择</Button>
+            </Space>
+          </div>
+        )}
+
+        {isCompactList ? (
+          <CompactCheckList
+            busy={busy}
+            checks={filtered}
+            hasFilters={hasFilters}
+            loading={loading}
+            readOnly={readOnly}
+            runners={runners}
+            type={type}
+            onCreate={openCreateDrawer}
+            onDelete={confirmRemove}
+            onDuplicate={duplicate}
+            onEdit={(check) => {
+              setEditing(check);
+              setDrawerOpen(true);
+            }}
+            onHistory={(check) => navigate(`/runs?check_id=${check.id}`)}
+            onOpenLastRun={(check) => check.last_run_id && setDetailRunId(check.last_run_id)}
+            onRun={runCheck}
+            onConfirmRecovery={confirmRecovery}
+            onToggle={toggle}
+            duplicatingId={duplicatingId}
+            selectedIds={selectedCheckIds}
+            onToggleSelection={(checkId, selected) =>
+              setSelectedCheckIds((current) => (selected ? Array.from(new Set([...current, checkId])) : current.filter((id) => id !== checkId)))
+            }
+          />
+        ) : (
+          <Table
+            rowKey="id"
+            columns={columns}
+            dataSource={filtered}
+            loading={loading}
+            rowSelection={{
+              selectedRowKeys: selectedCheckIds,
+              onChange: (keys) => setSelectedCheckIds(keys.map((key) => Number(key)).filter((key) => Number.isFinite(key)))
+            }}
+            pagination={{ pageSize: 10, showSizeChanger: false, itemRender: checkPaginationItemRender }}
+            locale={{
+              emptyText: (
+                <Empty description={hasFilters ? "没有符合筛选条件的任务" : "暂无任务"}>
+                  {!hasFilters && <Button type="primary" icon={<Plus size={16} />} onClick={openCreateDrawer} disabled={readOnly}>新增任务</Button>}
+                </Empty>
+              )
+            }}
+            className="checks-table project-data-table"
+            scroll={{ x: type === "api" ? 1580 : 1480 }}
+          />
+        )}
+      </Card>
 
       {drawerOpen && (
         <Suspense fallback={null}>
@@ -644,7 +651,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
             runId={detailRunId}
             onClose={() => setDetailRunId(null)}
             returnTo={`${location.pathname}${location.search}`}
-            onRerun={async (run) => {
+            onRerun={readOnly ? undefined : async (run) => {
               const latest = await api.rerun(run.id);
               setDetailRunId(latest.id);
               await load();
@@ -662,6 +669,7 @@ interface CompactCheckListProps {
   duplicatingId: number | null;
   hasFilters: boolean;
   loading: boolean;
+  readOnly: boolean;
   runners: ProbeRunner[];
   type: CheckType;
   onCreate: () => void;
@@ -683,6 +691,7 @@ function CompactCheckList({
   duplicatingId,
   hasFilters,
   loading,
+  readOnly,
   runners,
   type,
   onCreate,
@@ -714,7 +723,7 @@ function CompactCheckList({
       <section className="check-card-empty">
         <Empty description={hasFilters ? "没有符合筛选条件的任务" : "暂无任务"}>
           {!hasFilters && (
-            <Button type="primary" icon={<Plus size={16} />} onClick={onCreate}>
+            <Button type="primary" icon={<Plus size={16} />} onClick={onCreate} disabled={readOnly}>
               新增任务
             </Button>
           )}
@@ -757,6 +766,7 @@ function CompactCheckList({
                     aria-label={`${check.name} 启用状态`}
                     checked={check.enabled}
                     loading={busy === check.id}
+                    disabled={readOnly}
                     onChange={() => onToggle(check)}
                   />
                 </label>
@@ -772,15 +782,15 @@ function CompactCheckList({
             </div>
 
             <Space className="check-card-actions">
-              <Button icon={<Play size={15} />} loading={busy === check.id} onClick={() => onRun(check)}>
+              <Button icon={<Play size={15} />} loading={busy === check.id} disabled={readOnly} onClick={() => onRun(check)}>
                 人工验证
               </Button>
               {["failing", "suspected_failing", "suspected_recovery", "stale", "unknown"].includes(status) && (
-                <Button icon={<RefreshCw size={15} />} loading={busy === check.id} onClick={() => onConfirmRecovery(check)}>
+                <Button icon={<RefreshCw size={15} />} loading={busy === check.id} disabled={readOnly} onClick={() => onConfirmRecovery(check)}>
                   确认恢复
                 </Button>
               )}
-              <Button icon={<Edit3 size={15} />} onClick={() => onEdit(check)}>
+              <Button icon={<Edit3 size={15} />} disabled={readOnly} onClick={() => onEdit(check)}>
                 编辑
               </Button>
               <Button icon={<History size={15} />} onClick={() => onHistory(check)}>
@@ -790,7 +800,7 @@ function CompactCheckList({
                 trigger={["click"]}
                 placement="bottomRight"
                 menu={{
-                  items: checkSecondaryActionItems(duplicatingId === check.id),
+                  items: checkSecondaryActionItems(duplicatingId === check.id, readOnly),
                   onClick: ({ key }) => {
                     if (key === "duplicate") onDuplicate(check);
                     if (key === "delete") onDelete(check);

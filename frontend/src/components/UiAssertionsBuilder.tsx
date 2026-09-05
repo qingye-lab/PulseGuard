@@ -1,7 +1,6 @@
 import { App, Button, Checkbox, Empty, Input, InputNumber, Modal, Select, Space, Spin, Switch, Table, Tag, Tooltip } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
-  CopyPlus,
   Eye,
   EyeOff,
   Hash,
@@ -18,9 +17,11 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent, ReactNode } from "react";
-import { api } from "../api";
+import { api, ApiError } from "../api";
+import { useProject } from "../ProjectContext";
+import { UiInspectionFeedback } from "./UiInspectionFeedback";
 import { Button as UiButton } from "./ui/button";
-import type { CheckPayload, UiAssertion, UiAssertionType, UiElementCandidate, UiInspectResult, UiRuleInspectItem, UiRuleInspectResult } from "../types";
+import type { CheckPayload, UiAssertion, UiAssertionType, UiElementCandidate, UiInspectResult, UiRuleInspectItem, UiRuleInspectResult, UiSelectorOption } from "../types";
 import { createUiAssertion, parseUiAssertions, serializeUiAssertions, UI_ASSERTION_LABELS } from "../uiAssertions";
 import { VIEWPORT_PRESETS } from "./ViewportModeControl";
 
@@ -28,11 +29,11 @@ type CandidateRuleType = "element_visible" | "element_not_empty" | "element_coun
 type CandidateRuleSelection = Partial<Record<CandidateRuleType, boolean>>;
 type CandidateSelectionSource = "candidate" | "preview" | "scan";
 
-const CANDIDATE_RULE_OPTIONS: Array<{ type: CandidateRuleType; label: string; icon: ReactNode; requiresText?: boolean }> = [
-  { type: "element_visible", label: "可见", icon: <Eye size={13} /> },
-  { type: "element_not_empty", label: "非空", icon: <MousePointer2 size={13} /> },
-  { type: "element_count", label: "数量", icon: <Hash size={13} /> },
-  { type: "text_present", label: "文本", icon: <CopyPlus size={13} />, requiresText: true }
+const CANDIDATE_RULE_OPTIONS: Array<{ type: CandidateRuleType; label: string; requiresText?: boolean }> = [
+  { type: "element_visible", label: "可见" },
+  { type: "element_not_empty", label: "非空" },
+  { type: "element_count", label: "数量" },
+  { type: "text_present", label: "文本", requiresText: true }
 ];
 
 const RULE_OPTIONS: Array<{ type: UiAssertionType; label: string; icon: ReactNode }> = [
@@ -57,14 +58,6 @@ const OPERATOR_OPTIONS = [
   { label: "<=", value: "lte" }
 ];
 
-const CANDIDATE_KIND_LABELS = {
-  interactive: "交互",
-  media: "媒体",
-  text: "文本",
-  component: "组件",
-  structure: "结构"
-} satisfies Record<NonNullable<UiElementCandidate["kind"]>, string>;
-
 interface Props {
   check: CheckPayload;
   value: string;
@@ -73,18 +66,23 @@ interface Props {
 
 export function UiAssertionsBuilder({ check, value, onChange }: Props) {
   const { message } = App.useApp();
+  const { currentProject } = useProject();
   const [modal, modalContextHolder] = Modal.useModal();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [inspectResult, setInspectResult] = useState<UiInspectResult | null>(null);
   const [selectedCandidate, setSelectedCandidate] = useState<UiElementCandidate | null>(null);
   const [candidateSelectionSource, setCandidateSelectionSource] = useState<CandidateSelectionSource>("scan");
   const [pickerSelections, setPickerSelections] = useState<Record<string, CandidateRuleSelection>>({});
+  const [pickerSelectorChoices, setPickerSelectorChoices] = useState<Record<string, string>>({});
   const [candidateQuery, setCandidateQuery] = useState("");
   const [inspecting, setInspecting] = useState(false);
-  const [inspectError, setInspectError] = useState<string | null>(null);
+  const [inspectError, setInspectError] = useState<Error | null>(null);
+  const [ruleInspectError, setRuleInspectError] = useState<Error | null>(null);
   const [ruleInspecting, setRuleInspecting] = useState(false);
   const [ruleInspectResult, setRuleInspectResult] = useState<UiRuleInspectResult | null>(null);
   const candidateItemRefs = useRef<Map<string, HTMLElement>>(new Map());
+  const inspectGenerationRef = useRef(0);
+  const ruleInspectGenerationRef = useRef(0);
   const previewScrollRef = useRef<HTMLDivElement | null>(null);
   const previewStageRef = useRef<HTMLDivElement | null>(null);
   const assertions = useMemo(() => parseUiAssertions(value), [value]);
@@ -99,7 +97,18 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     const query = candidateQuery.trim().toLowerCase();
     if (!query) return inspectResult.candidates;
     return inspectResult.candidates.filter((candidate) =>
-      [candidate.name || "", candidate.selector, candidate.text, candidate.tag, candidate.role, candidate.kind || "", candidate.selector_type || "", candidate.stability || ""].some(
+      [
+        candidate.semantic_label || "",
+        candidate.name || "",
+        candidate.selector,
+        candidate.text,
+        candidate.tag,
+        candidate.role,
+        candidate.kind || "",
+        candidate.selector_type || "",
+        candidate.stability || "",
+        ...(candidate.selector_options || []).flatMap((option) => [option.selector, option.selector_type])
+      ].some(
         (value) => value.toLowerCase().includes(query)
       )
     );
@@ -135,14 +144,23 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
   }, [candidateSelectionSource, filteredCandidates, inspectResult, pickerOpen, selectedCandidate]);
 
   useEffect(() => {
+    ruleInspectGenerationRef.current += 1;
+    setRuleInspecting(false);
+    setRuleInspectError(null);
+    setRuleInspectResult(null);
+    return () => { ruleInspectGenerationRef.current += 1; };
+  }, [check.entry_url, check.setup_script, check.timeout_ms, value, viewportMode, currentProject.id]);
+
+  useEffect(() => {
+    inspectGenerationRef.current += 1;
+    setInspecting(false);
+    setInspectError(null);
     setInspectResult(null);
     setSelectedCandidate(null);
     setPickerSelections({});
-  }, [viewportMode]);
-
-  useEffect(() => {
-    setRuleInspectResult(null);
-  }, [check.entry_url, check.setup_script, check.timeout_ms, value, viewportMode]);
+    setPickerSelectorChoices({});
+    return () => { inspectGenerationRef.current += 1; };
+  }, [check.entry_url, check.setup_script, check.timeout_ms, viewportMode, currentProject.id]);
 
   function commit(next: UiAssertion[]) {
     onChange(serializeUiAssertions(next));
@@ -155,6 +173,16 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
   function selectCandidate(candidate: UiElementCandidate, source: CandidateSelectionSource = "preview") {
     setCandidateSelectionSource(source);
     setSelectedCandidate(candidate);
+  }
+
+  function configuredCandidate(candidate: UiElementCandidate): UiElementCandidate {
+    return withCandidateSelector(candidate, pickerSelectorChoices[candidateKey(candidate)]);
+  }
+
+  function chooseCandidateSelector(candidate: UiElementCandidate, selector: string) {
+    const key = candidateKey(candidate);
+    setPickerSelectorChoices((current) => ({ ...current, [key]: selector }));
+    selectCandidate(candidate, "candidate");
   }
 
   function setCandidateItemRef(key: string, node: HTMLElement | null) {
@@ -195,18 +223,27 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     candidate: UiElementCandidate,
     type: CandidateRuleType
   ) {
+    const configured = configuredCandidate(candidate);
     const assertion = createUiAssertion(type);
     if (type === "text_present") {
-      assertion.expected_text = candidate.text || candidate.selector;
+      assertion.expected_text = configured.text || configured.selector;
+      assertion.selector = configured.selector;
     } else if (type === "element_count") {
-      assertion.selector = candidate.selector;
-      assertion.operator = "eq";
+      const selectedOption = candidateSelectorOptions(candidate)
+        .find((option) => option.selector === configured.selector);
+      assertion.selector = configured.selector;
+      assertion.operator = Number(selectedOption?.match_count || 0) > 1 ? "gte" : "eq";
       assertion.expected_count = 1;
     } else {
-      assertion.selector = candidate.selector;
+      assertion.selector = configured.selector;
     }
     if (assertion.selector) {
-      applyCandidateSelectorMetadata(assertion, candidate);
+      applyCandidateSelectorMetadata(assertion, configured);
+      if (type === "text_present") {
+        assertion.match_mode = "first";
+        assertion.scope_selector = undefined;
+        assertion.relative_selector = undefined;
+      }
     }
     return assertion;
   }
@@ -233,10 +270,11 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     Object.entries(pickerSelections).forEach(([key, selection]) => {
       const candidate = candidateMap.get(key);
       if (!candidate) return;
+      const configured = configuredCandidate(candidate);
       CANDIDATE_RULE_OPTIONS.forEach((option) => {
         if (!selection[option.type]) return;
-        if (candidate.stability === "low" && option.type !== "text_present") {
-          lowStabilityCandidates.set(key, candidate);
+        if (configured.stability === "low" && option.type !== "text_present") {
+          lowStabilityCandidates.set(key, configured);
         }
         nextAssertions.push(buildCandidateAssertion(candidate, option.type));
       });
@@ -245,6 +283,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     const persist = () => {
       commit([...assertions, ...nextAssertions]);
       setPickerSelections({});
+      setPickerSelectorChoices({});
       setPickerOpen(false);
     };
     if (lowStabilityCandidates.size) {
@@ -284,21 +323,34 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     setPickerOpen(true);
     setInspectError(null);
     setPickerSelections({});
+    setPickerSelectorChoices({});
     setCandidateQuery("");
     setInspectResult(null);
     setSelectedCandidate(null);
     void inspectPage();
   }
 
+  function closePicker() {
+    inspectGenerationRef.current += 1;
+    setPickerOpen(false);
+    setInspecting(false);
+  }
+
   async function inspectPage() {
     const entryUrl = check.entry_url.trim();
     if (!entryUrl) {
-      setInspectError("请先填写页面 URL");
+      setInspectError(new Error("请先填写页面 URL"));
       message.warning("请先填写页面 URL");
       return;
     }
+    const generation = inspectGenerationRef.current + 1;
+    inspectGenerationRef.current = generation;
     setInspecting(true);
     setInspectError(null);
+    setInspectResult(null);
+    setSelectedCandidate(null);
+    setPickerSelections({});
+    setPickerSelectorChoices({});
     try {
       const result = await api.inspectUi({
         type: "ui",
@@ -309,17 +361,18 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
         viewport_height: currentPreset.height,
         setup_script: check.setup_script || ""
       });
+      if (inspectGenerationRef.current !== generation) return;
       setInspectResult(result);
       setCandidateSelectionSource("scan");
       setSelectedCandidate(result.candidates[0] || null);
       setPickerSelections({});
+      setPickerSelectorChoices({});
       setCandidateQuery("");
     } catch (err) {
-      const nextError = (err as Error).message;
-      setInspectError(nextError);
-      message.error(nextError);
+      if (inspectGenerationRef.current !== generation) return;
+      setInspectError(err instanceof Error ? err : new Error(String(err)));
     } finally {
-      setInspecting(false);
+      if (inspectGenerationRef.current === generation) setInspecting(false);
     }
   }
 
@@ -333,7 +386,10 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
       message.warning("当前没有可检测的 selector 规则");
       return;
     }
+    const generation = ++ruleInspectGenerationRef.current;
     setRuleInspecting(true);
+    setRuleInspectError(null);
+    setRuleInspectResult(null);
     try {
       const result = await api.inspectUiRules({
         type: "ui",
@@ -345,6 +401,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
         setup_script: check.setup_script || "",
         assertions_json: serializeUiAssertions(assertions)
       });
+      if (ruleInspectGenerationRef.current !== generation) return;
       setRuleInspectResult(result);
       const abnormal = result.results.filter((item) => item.status !== "ok" && item.status !== "disabled");
       if (abnormal.length) {
@@ -353,10 +410,10 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
         message.success("检测完成，selector 匹配正常");
       }
     } catch (err) {
-      const nextError = (err as Error).message;
-      message.error(nextError);
+      if (ruleInspectGenerationRef.current !== generation) return;
+      setRuleInspectError(err instanceof Error ? err : new Error(String(err)));
     } finally {
-      setRuleInspecting(false);
+      if (ruleInspectGenerationRef.current === generation) setRuleInspecting(false);
     }
   }
 
@@ -439,6 +496,9 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
         ))}
       </div>
 
+      <UiInspectionFeedback error={ruleInspectError?.message}
+        diagnostics={ruleInspectError instanceof ApiError ? ruleInspectError.diagnostics : ruleInspectResult?.diagnostics}
+        onRetry={() => void inspectRules()} />
       {assertions.length === 0 ? (
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
       ) : (
@@ -461,15 +521,15 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
           <div className="ui-picker-footer">
             {pendingRuleCount ? <span>{`已选择 ${pendingElementCount} 个元素 / ${pendingRuleCount} 条规则`}</span> : <span />}
             <Space>
-              <Button onClick={() => setPickerOpen(false)}>取消</Button>
-              <Button icon={<Save size={15} />} disabled={!pendingRuleCount} onClick={savePickerSelections}>
+              <Button onClick={closePicker}>取消</Button>
+              <Button icon={<Save size={15} />} disabled={!pendingRuleCount || inspecting || !inspectResult} onClick={savePickerSelections}>
                 保存选择
               </Button>
             </Space>
           </div>
         }
         className="ui-picker-modal"
-        onCancel={() => setPickerOpen(false)}
+        onCancel={closePicker}
       >
         <div className="ui-picker-shell">
           <div className="ui-picker-toolbar">
@@ -489,7 +549,12 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
             <Button icon={<ScanSearch size={15} />} onClick={() => void inspectPage()} loading={inspecting}>
               {inspecting ? "正在扫描" : inspectResult ? "重新扫描" : "扫描页面"}
             </Button>
+            {inspectResult?.diagnostics && <UiInspectionFeedback diagnostics={inspectResult.diagnostics} />}
           </div>
+
+          {inspectError && <UiInspectionFeedback error={inspectError.message}
+            diagnostics={inspectError instanceof ApiError ? inspectError.diagnostics : undefined}
+            onRetry={() => void inspectPage()} />}
 
           <div className="ui-picker-layout">
             <section className="ui-picker-preview-card">
@@ -575,6 +640,8 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                   <div className="ui-candidate-list">
                     {filteredCandidates.slice(0, 120).map((candidate) => {
                       const key = candidateKey(candidate);
+                      const configured = configuredCandidate(candidate);
+                      const selectorOptions = candidateSelectorOptions(candidate);
                       const selection = pickerSelections[key] || {};
                       const checkedCount = CANDIDATE_RULE_OPTIONS.filter((option) => selection[option.type]).length;
                       return (
@@ -583,30 +650,35 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                         ref={(node) => setCandidateItemRef(key, node)}
                         className={[
                           "ui-candidate-item",
-                          selectedCandidate === candidate ? "selected" : "",
+                          selectedCandidate && candidateKey(selectedCandidate) === key ? "selected" : "",
                           checkedCount ? "checked" : ""
                         ]
                           .filter(Boolean)
                           .join(" ")}
                       >
-                        <UiButton
-                          className="ui-candidate-main"
-                          variant="ghost"
-                          onClick={() => selectCandidate(candidate, "candidate")}
-                          aria-label={`选择候选元素 ${candidateDisplayName(candidate)}`}
-                        >
-                          <span className="ui-candidate-meta">
-                            <Tag>{candidateKindLabel(candidate)}</Tag>
-                            <Tag>{candidate.role || candidate.tag}</Tag>
-                            {candidate.selector_type && <Tag>{candidate.selector_type}</Tag>}
-                            {candidate.stability && <Tag color={candidateStabilityColor(candidate.stability)}>{stabilityLabel(candidate.stability)}</Tag>}
-                          </span>
-                          <strong className="ui-candidate-name" title={candidateDisplayName(candidate)}>
-                            {candidateDisplayName(candidate)}
-                          </strong>
-                          <small title={candidate.selector}>{candidate.selector}</small>
-                          {candidate.text && <em title={candidate.text}>{candidate.text}</em>}
-                        </UiButton>
+                        <div className="ui-candidate-content">
+                          <UiButton
+                            className="ui-candidate-main"
+                            variant="ghost"
+                            onClick={() => selectCandidate(candidate, "candidate")}
+                            aria-label={`选择候选元素 ${candidateDisplayName(candidate)}`}
+                          >
+                            <strong className="ui-candidate-name" title={candidateDisplayName(candidate)}>
+                              {candidateDisplayName(candidate)}
+                            </strong>
+                          </UiButton>
+                          <Select
+                            className="ui-candidate-selector"
+                            size="small"
+                            value={configured.selector}
+                            title={configured.selector}
+                            options={selectorOptions.map((option) => ({
+                              value: option.selector,
+                              label: selectorOptionLabel(option)
+                            }))}
+                            onChange={(selector) => chooseCandidateSelector(candidate, selector)}
+                          />
+                        </div>
                         <div className="ui-candidate-rule-grid">
                           {CANDIDATE_RULE_OPTIONS.map((option) => (
                             <Checkbox
@@ -616,7 +688,6 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                               onChange={(event) => toggleCandidateRule(candidate, option.type, event.target.checked)}
                             >
                               <span className="ui-candidate-rule-label">
-                                {option.icon}
                                 {option.label}
                               </span>
                             </Checkbox>
@@ -645,9 +716,8 @@ function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Pa
         <Input
           value={assertion.selector}
           placeholder="CSS / text= / role= Playwright 选择器…"
-          onChange={(event) => update(assertion.id, { selector: event.target.value })}
+          onChange={(event) => update(assertion.id, editedSelectorPatch(event.target.value))}
         />
-        {renderSelectorMetadata(assertion)}
         {renderRuleInspection(ruleInspection)}
       </Space>
     );
@@ -655,6 +725,13 @@ function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Pa
   if (["text_present", "text_absent", "title_contains", "url_contains"].includes(assertion.type)) {
     return (
       <Space className="ui-assertion-rule" wrap>
+        {assertion.selector && (
+          <Input
+            value={assertion.selector}
+            placeholder="限定文本所在区域的 selector…"
+            onChange={(event) => update(assertion.id, editedSelectorPatch(event.target.value))}
+          />
+        )}
         <Input
           value={assertion.expected_text}
           placeholder={assertion.type.includes("text") ? "输入要匹配的文本" : "输入要包含的片段"}
@@ -669,9 +746,8 @@ function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Pa
         <Input
           value={assertion.selector}
           placeholder="CSS / text= / role= Playwright 选择器…"
-          onChange={(event) => update(assertion.id, { selector: event.target.value })}
+          onChange={(event) => update(assertion.id, editedSelectorPatch(event.target.value))}
         />
-        {renderSelectorMetadata(assertion)}
         {renderRuleInspection(ruleInspection)}
         <Select
           value={assertion.operator || "eq"}
@@ -711,32 +787,34 @@ function ruleInspectionMeta(result: UiRuleInspectItem): { label: string; color: 
   return { label: "检测失败", color: "error", tooltip: "规则检测失败" };
 }
 
-function renderSelectorMetadata(assertion: UiAssertion) {
-  if (!assertion.selector_type && !assertion.selector_stability && typeof assertion.selector_score !== "number") return null;
-  const stability = assertion.selector_stability;
-  const label = stability ? `稳定性${stabilityLabel(stability)}` : "扫描来源";
-  const score = typeof assertion.selector_score === "number" ? `，评分 ${Math.round(assertion.selector_score)}` : "";
-  return (
-    <Tooltip title={`来源 ${assertion.selector_type || "未知"}${score}`}>
-      <Tag color={candidateStabilityColor(stability)}>{label}</Tag>
-    </Tooltip>
-  );
-}
-
 function isSelectorAssertion(assertion: UiAssertion): boolean {
-  return ["element_visible", "element_hidden", "element_not_empty", "element_count"].includes(assertion.type);
+  return ["element_visible", "element_hidden", "element_not_empty", "element_count"].includes(assertion.type) ||
+    (["text_present", "text_absent"].includes(assertion.type) && Boolean(assertion.selector));
 }
 
 function applyCandidateSelectorMetadata(assertion: UiAssertion, candidate: UiElementCandidate) {
   if (candidate.selector_type) assertion.selector_type = candidate.selector_type;
   if (candidate.stability) assertion.selector_stability = candidate.stability;
   if (typeof candidate.score === "number") assertion.selector_score = candidate.score;
+  if (candidate.scope_selector) assertion.scope_selector = candidate.scope_selector;
+  if (candidate.relative_selector) assertion.relative_selector = candidate.relative_selector;
+  if (candidate.match_mode) assertion.match_mode = candidate.match_mode;
+  if (candidate.count_mode) assertion.count_mode = candidate.count_mode;
+  if (candidate.frame_path?.length) assertion.frame_path = [...candidate.frame_path];
 }
 
-function candidateStabilityColor(stability: UiElementCandidate["stability"]) {
-  if (stability === "high") return "success";
-  if (stability === "medium") return "warning";
-  return "default";
+function editedSelectorPatch(selector: string): Partial<UiAssertion> {
+  return {
+    selector,
+    selector_type: undefined,
+    selector_stability: undefined,
+    selector_score: undefined,
+    scope_selector: undefined,
+    relative_selector: undefined,
+    match_mode: undefined,
+    count_mode: undefined,
+    frame_path: undefined
+  };
 }
 
 function containsPoint(candidate: UiElementCandidate, x: number, y: number): boolean {
@@ -757,12 +835,15 @@ function candidateLabel(candidate: UiElementCandidate): string {
 }
 
 function candidateDisplayName(candidate: UiElementCandidate): string {
-  return candidate.name || candidate.text || candidate.selector || candidate.role || candidate.tag;
+  return candidate.semantic_label || candidate.name || candidate.text || candidate.selector || candidate.role || candidate.tag;
 }
 
 function candidateKey(candidate: UiElementCandidate): string {
+  if (candidate.candidate_id) return candidate.candidate_id;
   return [
-    candidate.selector,
+    candidate.tag,
+    candidate.kind || "",
+    candidate.semantic_label || candidate.name || "",
     Math.round(candidate.box.x),
     Math.round(candidate.box.y),
     Math.round(candidate.box.width),
@@ -770,14 +851,44 @@ function candidateKey(candidate: UiElementCandidate): string {
   ].join("|");
 }
 
-function stabilityLabel(stability: NonNullable<UiElementCandidate["stability"]>): string {
-  if (stability === "high") return "高";
-  if (stability === "medium") return "中";
-  return "低";
+function candidateSelectorOptions(candidate: UiElementCandidate): UiSelectorOption[] {
+  const options = candidate.selector_options?.filter((option) => option.selector) || [];
+  if (options.length) return options;
+  return [{
+    selector: candidate.selector,
+    selector_type: candidate.selector_type || "css",
+    stability: candidate.stability,
+    score: candidate.score,
+    scope_selector: candidate.scope_selector,
+    relative_selector: candidate.relative_selector,
+    match_mode: candidate.match_mode,
+    count_mode: candidate.count_mode,
+    family_id: candidate.family_id,
+    frame_path: candidate.frame_path
+  }];
 }
 
-function candidateKindLabel(candidate: UiElementCandidate): string {
-  return candidate.kind ? CANDIDATE_KIND_LABELS[candidate.kind] : candidate.role || candidate.tag;
+function withCandidateSelector(candidate: UiElementCandidate, selector?: string): UiElementCandidate {
+  if (!selector || selector === candidate.selector) return candidate;
+  const option = candidateSelectorOptions(candidate).find((item) => item.selector === selector);
+  if (!option) return candidate;
+  return {
+    ...candidate,
+    selector: option.selector,
+    selector_type: option.selector_type,
+    stability: option.stability,
+    score: option.score,
+    scope_selector: option.scope_selector,
+    relative_selector: option.relative_selector,
+    match_mode: option.match_mode,
+    count_mode: option.count_mode,
+    family_id: option.family_id,
+    frame_path: option.frame_path || candidate.frame_path
+  };
+}
+
+function selectorOptionLabel(option: UiSelectorOption): string {
+  return option.selector;
 }
 
 function markerStyle(candidate: UiElementCandidate, result: UiInspectResult, index: number): CSSProperties {

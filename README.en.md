@@ -12,6 +12,8 @@
 
 PulseGuard is a local-first **UI/API probing and lightweight monitoring console** for individuals, small teams, and internal environments.
 
+The console targets desktop and laptop browsers; phone viewport compatibility is explicitly out of scope. H5 page mode and mobile target viewports for UI probes remain supported.
+
 It combines scheduled checks, draft debugging, run history, failure evidence, health state, alerts, and distributed execution in a single-instance system. Typical targets include internal admin pages, login prerequisites, health endpoints, batch heartbeats, certificates, TCP/DNS, and basic network reachability.
 
 PulseGuard is not a public status-page service, a full E2E test-management platform, or an incident/on-call system. It solves a narrower problem:
@@ -70,11 +72,12 @@ Multi-runner and multi-browser runs share a run group and retain runner state, b
 
 ### Alerts and read-only outputs
 
-- Separate target-execution alerts from system-failure alerts;
-- Global, tag-level, and task-level alert policies;
+- Project isolation for checks, runs, trends, anomaly cycles, versions, audit, and execution alerts;
+- Project channels for execution alerts and global-only channels for system failures;
+- Project-default, tag-level, and task-level execution alert policies;
 - Cooldown and recovery notifications;
-- JSON, Prometheus, and token-protected read-only snapshots;
-- Config export, sanitized export, import preview, and version restoration.
+- Project-scoped JSON, Prometheus, and token-protected read-only snapshots;
+- Separate system and project bundles with sanitized export and import preview.
 
 ## Quick start
 

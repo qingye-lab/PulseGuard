@@ -1,10 +1,11 @@
-import { App, Button, Drawer, Empty, Select, Skeleton, Space, Table, Tabs, Tag, Tooltip, Typography } from "antd";
+import { App, Button, Card, Descriptions, Drawer, Empty, Select, Skeleton, Space, Table, Tabs, Tag, Tooltip, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Eye, RefreshCw, RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
+import { useProject } from "../ProjectContext";
 import { StructuredViewer } from "../components/StructuredViewer";
-import type { AuditEvent, Check, CheckVersion, ProbeRunner, RunArchive } from "../types";
+import type { AuditEvent, Check, CheckVersion, DatabaseHealth, ProbeRunner, RunArchive } from "../types";
 import { compactUrl, formatDate, formatDuration, runStatusLabel, runStatusTagColor } from "../utils";
 
 const { Text } = Typography;
@@ -13,10 +14,13 @@ type DetailDrawer = { title: string; value: unknown } | null;
 
 export function OperationsPage() {
   const { message, modal } = App.useApp();
+  const { currentProject } = useProject();
+  const readOnly = currentProject.status === "archived";
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [archives, setArchives] = useState<RunArchive[]>([]);
   const [runners, setRunners] = useState<ProbeRunner[]>([]);
   const [checks, setChecks] = useState<Check[]>([]);
+  const [databaseHealth, setDatabaseHealth] = useState<DatabaseHealth | null>(null);
   const [selectedCheckId, setSelectedCheckId] = useState<number | null>(null);
   const [versions, setVersions] = useState<CheckVersion[]>([]);
   const [loading, setLoading] = useState(true);
@@ -32,18 +36,20 @@ export function OperationsPage() {
   async function loadOperations() {
     setLoading(true);
     try {
-      const [events, nextArchives, nextRunners, uiChecks, apiChecks] = await Promise.all([
+      const [events, nextArchives, nextRunners, uiChecks, apiChecks, nextDatabaseHealth] = await Promise.all([
         api.auditEvents(),
         api.runArchives(),
         api.runners(),
         api.checks("ui"),
-        api.checks("api")
+        api.checks("api"),
+        api.databaseHealth()
       ]);
       const nextChecks = [...uiChecks, ...apiChecks].sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
       setAuditEvents(events);
       setArchives(nextArchives);
       setRunners(nextRunners);
       setChecks(nextChecks);
+      setDatabaseHealth(nextDatabaseHealth);
       setSelectedCheckId((current) => {
         if (current && nextChecks.some((check) => check.id === current)) return current;
         return nextChecks[0]?.id ?? null;
@@ -183,6 +189,7 @@ export function OperationsPage() {
             <Button
               icon={<RotateCcw size={16} />}
               loading={restoringId === version.id}
+              disabled={readOnly}
               onClick={() => restoreVersion(version)}
               aria-label={`恢复版本 ${version.id}`}
             />
@@ -322,18 +329,18 @@ export function OperationsPage() {
 
   return (
     <div className="page-content operations-page">
-      <section className="operations-command-bar">
-        <div>
-          <h2>运维审计</h2>
-        </div>
-        <Button icon={<RefreshCw size={16} />} onClick={loadOperations}>
-          刷新
-        </Button>
-      </section>
-
-      <Tabs
-        className="operations-tabs"
-        items={[
+      <Card
+        title="运行与审计"
+        className="project-tab-card operations-workspace-card"
+        extra={
+          <Button icon={<RefreshCw size={16} />} onClick={loadOperations}>
+            刷新
+          </Button>
+        }
+      >
+        <Tabs
+          className="operations-tabs"
+          items={[
           {
             key: "runners",
             label: "执行节点状态",
@@ -374,6 +381,63 @@ export function OperationsPage() {
               )
           },
           {
+            key: "database",
+            label: "数据库状态",
+            children: databaseHealth ? (
+              <div className="database-health-panel">
+                <Descriptions
+                  className="database-health-descriptions"
+                  bordered
+                  size="small"
+                  column={{ xs: 1, sm: 2, lg: 3 }}
+                  items={[
+                    {
+                      key: "status",
+                      label: "维护状态",
+                      children: (
+                        <Tag color={databaseHealth.maintenance_recommended ? "warning" : "success"}>
+                          {databaseHealth.maintenance_recommended ? "建议安排维护" : "状态正常"}
+                        </Tag>
+                      )
+                    },
+                    {
+                      key: "file-size",
+                      label: "数据库文件",
+                      children: formatStorageSize(databaseHealth.file_size_bytes)
+                    },
+                    {
+                      key: "used-size",
+                      label: "有效数据估算",
+                      children: formatStorageSize(databaseHealth.estimated_used_bytes)
+                    },
+                    {
+                      key: "reclaimable",
+                      label: "可回收空间",
+                      children: `${formatStorageSize(databaseHealth.reclaimable_bytes)} · ${(databaseHealth.reclaimable_ratio * 100).toFixed(1)}%`
+                    },
+                    {
+                      key: "wal-size",
+                      label: "WAL 日志",
+                      children: formatStorageSize(databaseHealth.wal_size_bytes)
+                    },
+                    {
+                      key: "journal-mode",
+                      label: "日志模式",
+                      children: databaseHealth.journal_mode.toUpperCase()
+                    }
+                  ]}
+                />
+                <Text type={databaseHealth.maintenance_recommended ? "warning" : "secondary"}>
+                  {databaseHealth.maintenance_recommended
+                    ? "空闲页占比较高。压缩前请先创建数据库备份，并在停止写入的维护窗口执行。"
+                    : "当前空闲页占比无需安排数据库压缩。"}
+                </Text>
+              </div>
+            ) : (
+              <Empty description="暂无数据库状态" />
+            )
+          },
+          {
             key: "versions",
             label: "任务版本",
             children: (
@@ -407,8 +471,9 @@ export function OperationsPage() {
               </div>
             )
           }
-        ]}
-      />
+          ]}
+        />
+      </Card>
 
       <Drawer title={drawer?.title} open={Boolean(drawer)} onClose={() => setDrawer(null)} size="large">
         <StructuredViewer value={drawer?.value} defaultMode="json" />
@@ -432,6 +497,18 @@ function auditActionLabel(value: string): string {
       update_interval: "批量改频"
     }[value] || "其他"
   );
+}
+
+function formatStorageSize(value: number): string {
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && size >= 1024; index += 1) {
+    size /= 1024;
+    unit = units[index];
+  }
+  return `${size.toFixed(size >= 100 ? 0 : size >= 10 ? 1 : 2)} ${unit}`;
 }
 
 function auditActionColor(value: string): string {

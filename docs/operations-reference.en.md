@@ -45,6 +45,8 @@ Key settings:
 
 Each prewarmed type keeps one Playwright browser process and an independent pool of empty contexts. A UI run leases a context/page exclusively, closes the context afterward, and lets the pool replenish it.
 
+Page inspection treats the outermost `cursor:pointer` hit area as an interactive candidate and limits repeated low-stability component families. Repeated card, name, city/mileage, price, and similar fields prefer a repeated-region plus relative-field selector. The candidate menu shows only selectable selector values; PulseGuard retains and validates their live match counts internally. Count rules created from repeated regions default to “at least 1” to avoid false failures when a dynamic list changes length. By default inspection analyzes only the DOM loaded naturally by the page; it does not scroll to trigger lazy loading or infinite lists. When post-scroll content is required, the task setup script must perform that scroll explicitly. Element-count assertions wait within the task timeout for their count condition to remain stable instead of sampling only once immediately after initial page load.
+
 Runner selection is resolved before browser-type selection. Multiple runners and browser types produce a runner × browser matrix of run records. Unsupported combinations are recorded as Runner failures rather than target failures.
 
 ## Runner model
@@ -156,8 +158,11 @@ If source access is unavailable, build and publish a worker image from another e
 ```bash
 export PULSEGUARD_WORKER_IMAGE="registry.example.com/pulseguard-worker:local"
 export PULSEGUARD_WORKER_UPDATE_IMAGE="registry.example.com/pulseguard-worker:local"
+export PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES="registry.example.com/pulseguard-worker"
 docker compose -f docker-compose.worker.yml up -d
 ```
+
+`PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES` is validated on repository boundaries rather than as a raw string prefix. A normal entry allows tags and digests only for that exact repository. Use an explicit namespace entry such as `registry.example.com/team/*` only when every repository below it is trusted; prefix lookalikes are rejected.
 
 ## Controlled worker updates
 
@@ -205,9 +210,9 @@ After rotating a direct-worker token, update the credential in the main console 
 
 ## Network requirements
 
-- direct mode: the main node must reach `/api/worker/health` and `/api/worker/run`;
+- direct mode: the main node must reach `/api/worker/health` and `/api/worker/run`; prefer HTTPS, while new or changed HTTP/bare-host runners require explicit insecure-transport acknowledgement and existing saved HTTP runners migrate as acknowledged;
 - Relay mode: only the public Relay TCP port is required;
-- worker APIs use `Authorization: Bearer <token>`;
+- worker APIs use `Authorization: Bearer <token>`; direct HTTP does not encrypt the token, task payload, or environment variables and is only suitable for an acknowledged trusted network;
 - direct workers do not need the main-node address;
 - Relay clients connect outbound;
 - screenshots, optional Trace files, and response bodies are returned as base64 JSON payloads;
@@ -264,14 +269,43 @@ async def setup(ctx):
 
 Custom Python scripts are trusted local capabilities, not a security sandbox.
 
+## Project isolation and one-time migration
+
+- Check, run, trend, status, metrics, project-alert, and project-bundle requests require `X-PulseGuard-Project-Id`. Missing scope returns 400 and an unknown project returns 404.
+- Archived projects remain readable, while writes, execution, reruns, imports, and version restores return 409. The scheduler loads checks from active projects only.
+- Read-only tokens must include at least one project and `/api/read-only/snapshot` validates both the token scope and project header.
+- `pulseguard.config` v4 contains global settings, runners, and members only. `pulseguard.project` v1 contains the selected project's checks and alert settings only.
+
+The application does not mutate a legacy database during startup. Run the read-only preflight first:
+
+```powershell
+uv run python scripts/migrate-projects.py
+```
+
+After an application-consistent backup and during the release write pause, apply explicitly:
+
+```powershell
+uv run python scripts/migrate-projects.py --apply
+```
+
+The script creates an online SQLite backup under `data/backups/`, checks its integrity, and reports table counts and SHA-256 values before and after migration. A failed migration rolls back as one transaction. Rollback requires both the previous application version and the pre-migration database backup; old and new versions must not share a database.
+
 ## Data boundaries
 
 - SQLite data lives under `data/`;
 - online backups live under `data/backups/`;
+- restoring pauses new admissions and scheduling, then waits up to 30 seconds for accepted work; timeout returns 409 without restoring. Safety backup, restore, initialization, and failure compensation share exclusive maintenance access; client cancellation does not release admission protection early;
+- audited queries use read-only SQLite snapshots while writes are serialized; retention archives and deletes terminal runs in bounded atomic batches, preserves unfinished runs, and can resume without double-counting;
+- restoration is main-node-only; failed compensation or runtime settings reload returns 503 and keeps run admissions paused until operator recovery/configuration repair and restart. API/UI inspection previews are diagnostics, not persisted run admissions;
+- **Operations → Database status** reports the database file, WAL, and reclaimable free pages without modifying data; compaction still requires a backup and a write-pause maintenance window;
 - trend rollups use the `trend_rollups` aggregation table;
 - screenshots, Trace, response bodies, and archived summaries live under `reports/`;
 - common secrets, authorization headers, cookies, and read-only tokens are redacted from public outputs;
 - historical trend backfill is disabled by default.
+
+The console does not support phone viewports; H5 probe capabilities are unchanged. The editor runtime and workers are local, on-demand resources without a public CDN dependency. See [performance scope and verification](performance-optimization.md).
+
+Before deployment, inspect the SQLite runtime with `uv run python -c "import sqlite3; print(sqlite3.sqlite_version)"`. Prefer an [official WAL-reset fix](https://sqlite.org/wal.html#walresetbug): 3.51.3+ or the documented 3.50.7 / 3.44.6 backports. Do not run external writable/checkpoint tools or multiple application processes against the active database.
 
 To backfill historical trends once:
 
@@ -286,9 +320,14 @@ Disable it again after the one-time startup.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/health` | Application health |
+| `GET /api/projects` / `POST /api/projects` | List and create projects |
+| `GET /api/database-health` | Read-only database capacity and free-page health |
 | `GET /api/metrics.json` | JSON metrics |
 | `GET /api/metrics` | Prometheus metrics |
 | `GET /api/read-only/snapshot` | Token-protected read-only snapshot |
+| `GET /api/project-alert-settings` / `PUT /api/project-alert-settings` | Current-project execution alerts |
+| `GET /api/config/export` | Export a `pulseguard.config` v4 system bundle |
+| `GET /api/project-config/export` | Export a `pulseguard.project` v1 project bundle |
 | `GET /api/runners` / `POST /api/runners` | Runner list and direct-runner creation |
 | `GET /api/relay/status` | Relay status, address, and fingerprint |
 | `POST /api/runners/provision` | Create a Relay runner and one-time deployment command |

@@ -4,9 +4,12 @@ import { useEffect, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { RunDetailContent } from "../components/RunDetailContent";
+import { useProject } from "../ProjectContext";
 import type { Run } from "../types";
 
 export function RunDetailPage() {
+  const { currentProject } = useProject();
+  const readOnly = currentProject.status === "archived";
   const { runId } = useParams();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -56,7 +59,7 @@ export function RunDetailPage() {
           <div>
             <h2>{run?.check_name || `运行记录 #${id}`}</h2>
           </div>
-          <Button icon={<RefreshCw size={16} />} onClick={rerun} loading={rerunning} disabled={!run || run.check_id <= 0}>
+          <Button icon={<RefreshCw size={16} />} onClick={rerun} loading={rerunning} disabled={readOnly || !run || run.check_id <= 0}>
             重新执行
           </Button>
         </div>

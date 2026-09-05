@@ -1,4 +1,4 @@
-import { Button, Collapse } from "antd";
+import { Button, Collapse, Tooltip } from "antd";
 import { uiScriptTemplate, uiSetupScriptTemplate } from "../defaults";
 import { LazyCodeEditorPanel as CodeEditorPanel } from "./LazyCodeEditorPanel";
 
@@ -25,7 +25,7 @@ export function UiScriptSections({
       items={[
         {
           key: "setup",
-          label: "前置脚本",
+          label: <Tooltip title="先执行脚本，再加载入口 URL。使用 ctx.vars.set('skuId', value) 生成临时变量，URL 中用 ${skuId} 引用。">前置脚本</Tooltip>,
           children: (
             <CodeEditorPanel
               title="前置 Python 脚本"

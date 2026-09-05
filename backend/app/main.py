@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
@@ -19,21 +19,21 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from .api_assertions import inspect_api_response
+from .ui_diagnostics import UiInspectionFailure
 from . import config_transfer, failure_summary, notifier, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
 from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_PRINT_TOKEN, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs, relay_control_token
 from .relay_cert import relay_fingerprint
-from .runner import CheckRunner
+from .runner import CheckRunner, MaintenanceBusyError, RuntimeSettingsReloadError
 from .scheduler import PulseScheduler
 from .browser_installation import browser_capabilities, schedule_browser_install
 from .browser_types import enabled_browser_types, normalize_browser_types
-from .schemas import ApiInspectRequest, BrowserInstallRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, RunnerProvisionRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
+from .schemas import ApiInspectRequest, BrowserInstallRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ProjectAlertSettingsUpdate, ProjectCreate, ProjectUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, RunnerProvisionRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
 from .variables import mask_data, mask_text
 
 
 HEARTBEAT_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$")
 APP_DISPLAY_NAME = "PulseGuard"
-APP_TEAM_NAME = "新零售测试团队"
 
 VALIDATION_FIELD_LABELS = {
     "name": "任务名称",
@@ -135,9 +135,100 @@ app.mount("/artifacts/responses", StaticFiles(directory=RESPONSES_DIR), name="re
 app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets", check_dir=False), name="frontend-assets")
 
 
+def _project_context(
+    x_pulseguard_project_id: str | None = Header(default=None, alias="X-PulseGuard-Project-Id"),
+) -> int:
+    if x_pulseguard_project_id is None or not str(x_pulseguard_project_id).strip():
+        raise HTTPException(status_code=400, detail="缺少 X-PulseGuard-Project-Id 请求头")
+    try:
+        project_id = int(str(x_pulseguard_project_id).strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="X-PulseGuard-Project-Id 必须是正整数") from exc
+    if project_id <= 0:
+        raise HTTPException(status_code=400, detail="X-PulseGuard-Project-Id 必须是正整数")
+    if not storage.get_project(project_id):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return project_id
+
+
+def _active_project_context(project_id: int = Depends(_project_context)) -> int:
+    project = storage.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if project.get("status") != "active":
+        raise HTTPException(status_code=409, detail="归档项目为只读状态")
+    return project_id
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "name": APP_DISPLAY_NAME, "team": APP_TEAM_NAME}
+    return {"status": "ok", "name": APP_DISPLAY_NAME, "team": ""}
+
+
+@app.get("/api/projects")
+def projects() -> list[dict[str, Any]]:
+    return storage.list_projects(include_archived=True)
+
+
+@app.post("/api/projects")
+def create_project(payload: ProjectCreate, request: Request) -> dict[str, Any]:
+    try:
+        project = storage.create_project(payload.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    request.app.state.scheduler.refresh_all()
+    storage.record_audit_event(
+        "created", "project", project["id"], project["name"], "创建项目", project_id=int(project["id"])
+    )
+    return project
+
+
+@app.put("/api/projects/{project_id}")
+def rename_project(project_id: int, payload: ProjectUpdate) -> dict[str, Any]:
+    try:
+        project = storage.rename_project(project_id, payload.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    storage.record_audit_event("renamed", "project", project_id, project["name"], "重命名项目", project_id=project_id)
+    return project
+
+
+@app.post("/api/projects/{project_id}/archive")
+def archive_project(project_id: int, request: Request) -> dict[str, Any]:
+    try:
+        project = storage.archive_project(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    request.app.state.scheduler.refresh_all()
+    storage.record_audit_event("archived", "project", project_id, project["name"], "归档项目", project_id=project_id)
+    return project
+
+
+@app.post("/api/projects/{project_id}/restore")
+def restore_project(project_id: int, request: Request) -> dict[str, Any]:
+    project = storage.restore_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    request.app.state.scheduler.refresh_all()
+    storage.record_audit_event("restored", "project", project_id, project["name"], "恢复项目", project_id=project_id)
+    return project
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: int, request: Request) -> dict[str, bool]:
+    try:
+        removed = storage.delete_empty_project(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not removed:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    request.app.state.scheduler.refresh_all()
+    storage.record_audit_event("deleted", "project", project_id, summary="删除空项目")
+    return {"ok": True}
 
 
 @app.get("/api/worker/health")
@@ -240,8 +331,8 @@ def heartbeat_detail(key: str) -> dict[str, Any]:
 
 
 @app.get("/api/overview")
-def overview() -> dict[str, Any]:
-    return storage.get_overview()
+def overview(project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    return storage.get_overview(project_id)
 
 
 @app.get("/api/runtime")
@@ -485,8 +576,8 @@ async def test_runner_connection(runner_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/status-page")
-def status_page() -> dict[str, Any]:
-    return _status_page_payload()
+def status_page(project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    return _status_page_payload(project_id)
 
 
 @app.get("/api/read-only/snapshot")
@@ -494,42 +585,60 @@ def read_only_snapshot(
     token: str = Query(default=""),
     x_pulseguard_read_only_token: str = Header(default=""),
     authorization: str = Header(default=""),
+    project_id: int = Depends(_project_context),
 ) -> dict[str, Any]:
-    _verify_read_only_token(_read_only_token_value(token, x_pulseguard_read_only_token, authorization))
+    _verify_read_only_token(
+        _read_only_token_value(token, x_pulseguard_read_only_token, authorization), project_id
+    )
     settings = storage.get_settings()
-    overview = storage.get_overview()
+    overview = storage.get_overview(project_id)
     return {
         "overview": _read_only_overview_payload(overview, settings),
-        "checks": [_read_only_check_payload(check, settings) for check in storage.list_checks(refresh_stale=False)],
-        "recent_runs": [_read_only_run_payload(run, settings) for run in storage.list_runs(limit=100, summary_only=True)],
+        "checks": [
+            _read_only_check_payload(check, settings)
+            for check in storage.list_checks(refresh_stale=False, project_id=project_id)
+        ],
+        "recent_runs": [
+            _read_only_run_payload(run, settings)
+            for run in storage.list_runs({"project_id": project_id}, limit=100, summary_only=True)
+        ],
     }
 
 
 @app.get("/api/metrics.json")
-def metrics_json() -> dict[str, Any]:
-    return _metrics_payload()
+def metrics_json(project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    return _metrics_payload(project_id)
 
 
 @app.get("/api/metrics")
-def prometheus_metrics() -> PlainTextResponse:
-    return PlainTextResponse(_prometheus_metrics(_metrics_payload()), media_type="text/plain; version=0.0.4")
+def prometheus_metrics(project_id: int = Depends(_project_context)) -> PlainTextResponse:
+    return PlainTextResponse(_prometheus_metrics(_metrics_payload(project_id)), media_type="text/plain; version=0.0.4")
 
 
 @app.get("/api/checks")
-def checks(type: str | None = Query(default=None)) -> list[dict[str, Any]]:
+def checks(
+    type: str | None = Query(default=None), project_id: int = Depends(_project_context)
+) -> list[dict[str, Any]]:
     if type and type not in {"ui", "api"}:
         raise HTTPException(status_code=400, detail="任务类型无效")
-    return storage.list_checks(type)
+    return storage.list_checks(type, project_id=project_id)
 
 
 @app.get("/api/audit-events")
-def audit_events(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, Any]]:
-    return mask_data(storage.list_audit_events(limit=limit), storage.get_settings())
+def audit_events(
+    limit: int = Query(default=100, ge=1, le=500), project_id: int = Depends(_project_context)
+) -> list[dict[str, Any]]:
+    return mask_data(
+        storage.list_audit_events(limit=limit, project_id=project_id, include_global=True),
+        storage.get_settings(),
+    )
 
 
 @app.get("/api/run-archives")
-def run_archives(limit: int = Query(default=90, ge=1, le=365)) -> list[dict[str, Any]]:
-    return storage.list_run_archives(limit=limit)
+def run_archives(
+    limit: int = Query(default=90, ge=1, le=365), project_id: int = Depends(_project_context)
+) -> list[dict[str, Any]]:
+    return storage.list_run_archives(limit=limit, project_id=project_id)
 
 
 @app.get("/api/monitoring-trends")
@@ -543,6 +652,7 @@ def monitoring_trends(
     page_size: int = Query(default=12, ge=1, le=50),
     hour_start: str | None = Query(default=None),
     hour_end: str | None = Query(default=None),
+    project_id: int = Depends(_project_context),
 ) -> dict[str, Any]:
     try:
         return storage.list_monitoring_trends(
@@ -555,6 +665,7 @@ def monitoring_trends(
             page_size=page_size,
             hour_start=hour_start,
             hour_end=hour_end,
+            project_id=project_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -564,15 +675,21 @@ def monitoring_trends(
 def anomaly_cycles(
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    project_id: int = Depends(_project_context),
 ) -> list[dict[str, Any]]:
     if status and status not in {"open", "resolved"}:
         raise HTTPException(status_code=400, detail="异常周期状态无效")
-    return storage.list_anomaly_cycles(limit=limit, status=status)
+    return storage.list_anomaly_cycles(limit=limit, status=status, project_id=project_id)
 
 
 @app.get("/api/database-backups")
 def database_backups() -> list[dict[str, Any]]:
     return storage.list_database_backups()
+
+
+@app.get("/api/database-health")
+def database_health() -> dict[str, Any]:
+    return storage.get_database_health()
 
 
 @app.post("/api/database-backups")
@@ -583,40 +700,94 @@ def create_database_backup() -> dict[str, Any]:
 
 
 @app.post("/api/database-backups/{filename}/restore")
-def restore_database_backup(filename: str, request: Request) -> dict[str, Any]:
+async def restore_database_backup(filename: str, request: Request) -> dict[str, Any]:
+    runner = request.app.state.runner
+    scheduler = request.app.state.scheduler
+    if scheduler is None:
+        raise HTTPException(status_code=409, detail="数据库恢复只支持在主节点执行")
     try:
-        result = storage.restore_database_backup(filename)
+        async with runner.maintenance_window():
+            was_paused = bool(_scheduler_runtime_status(scheduler).get("paused"))
+            scheduler.pause()
+            recovery_failed = False
+            try:
+                status = await runner.wait_for_idle(30)
+                if not status.get("idle"):
+                    raise HTTPException(status_code=409, detail="仍有任务正在执行或排队，未恢复数据库，请等待任务结束后重试")
+                async def restore_and_reload() -> dict[str, Any]:
+                    result = await asyncio.to_thread(storage.restore_database_backup, filename)
+                    try:
+                        await runner.reload_settings()
+                    except Exception as exc:
+                        raise RuntimeSettingsReloadError(
+                            "数据库已恢复，但运行时配置加载失败；已保持任务暂停，请检查配置并重启服务"
+                        ) from exc
+                    return result
+
+                # Even repeated cancellation must not reopen admissions before the
+                # database and its runtime settings have finished switching together.
+                restore_task = asyncio.create_task(restore_and_reload())
+                cancelled = False
+                while not restore_task.done():
+                    try:
+                        await asyncio.shield(restore_task)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                result = restore_task.result()
+                storage.record_audit_event("restored", "database_backup", entity_name=filename, summary="恢复数据库备份")
+                if cancelled:
+                    raise asyncio.CancelledError
+                return result
+            except (storage.DatabaseRestoreRecoveryError, RuntimeSettingsReloadError):
+                recovery_failed = True
+                raise
+            finally:
+                if recovery_failed:
+                    scheduler.pause()
+                elif was_paused or storage.is_deployment_window_active():
+                    scheduler.refresh_all()
+                else:
+                    scheduler.resume()
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    request.app.state.scheduler.refresh_all()
-    storage.record_audit_event("restored", "database_backup", entity_name=filename, summary="恢复数据库备份")
-    return result
+    except MaintenanceBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/checks")
-def create_check(payload: CheckCreate, request: Request) -> dict[str, Any]:
+def create_check(
+    payload: CheckCreate, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
     data = _validated_check_payload(payload)
-    check = storage.create_check(data)
+    check = storage.create_check(data, project_id=project_id)
     storage.record_check_version(check, "created")
-    storage.record_audit_event("created", "check", check["id"], check["name"], "创建任务", {"type": check["type"]})
+    storage.record_audit_event(
+        "created", "check", check["id"], check["name"], "创建任务", {"type": check["type"]}, project_id
+    )
     request.app.state.scheduler.sync_check(int(check["id"]))
     return check
 
 
 @app.post("/api/checks/run-all")
-async def run_all_checks(request: Request, type: str | None = Query(default=None)) -> dict[str, Any]:
+async def run_all_checks(
+    request: Request,
+    type: str | None = Query(default=None),
+    project_id: int = Depends(_active_project_context),
+) -> dict[str, Any]:
     if type and type not in {"ui", "api"}:
         raise HTTPException(status_code=400, detail="任务类型无效")
-    results = await _run_enabled_checks(request, "manual-batch", type)
+    results = await _run_enabled_checks(request, "manual-batch", type, project_id=project_id)
     return {"runs": results}
 
 
 @app.post("/api/checks/batch")
-async def batch_checks(payload: CheckBatchRequest, request: Request) -> dict[str, Any]:
-    storage.refresh_stale_statuses()
+async def batch_checks(
+    payload: CheckBatchRequest, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
+    storage.refresh_stale_statuses(project_id=project_id)
     checks_by_id: dict[int, dict[str, Any]] = {}
     for check_id in payload.ids:
-        check = storage.get_check(check_id, refresh_stale=False)
+        check = storage.get_check(check_id, refresh_stale=False, project_id=project_id)
         if check and check.get("type") == payload.type:
             checks_by_id[int(check["id"])] = check
 
@@ -630,16 +801,16 @@ async def batch_checks(payload: CheckBatchRequest, request: Request) -> dict[str
             raise HTTPException(status_code=409, detail="选中任务包含已禁用项，请刷新后重新选择")
         runs = await asyncio.gather(
             *[
-                request.app.state.runner.run_check(check_id, trigger="manual-batch")
+                request.app.state.runner.run_check(check_id, trigger="manual-batch", project_id=project_id)
                 for check_id in runnable_ids
             ]
         )
         return {"matched": len(runnable_ids), "changed": 0, "ids": runnable_ids, "runs": runs}
 
     if payload.action == "enable":
-        changed = storage.batch_set_check_enabled(ids, True)
+        changed = storage.batch_set_check_enabled(ids, True, project_id=project_id)
     else:
-        changed = storage.batch_set_check_enabled(ids, False)
+        changed = storage.batch_set_check_enabled(ids, False, project_id=project_id)
 
     for check_id in ids:
         request.app.state.scheduler.sync_check(check_id)
@@ -649,18 +820,24 @@ async def batch_checks(payload: CheckBatchRequest, request: Request) -> dict[str
         entity_name=payload.type,
         summary="批量操作任务",
         payload={"type": payload.type, "matched": len(ids), "changed": changed, "ids": ids},
+        project_id=project_id,
     )
     return {"matched": len(ids), "changed": changed, "ids": ids, "runs": []}
 
 
 @app.post("/api/checks/debug")
-async def debug_check(payload: CheckCreate, request: Request) -> dict[str, Any]:
-    return await request.app.state.runner.run_draft(_validated_check_payload(payload), trigger="draft-debug")
+async def debug_check(
+    payload: CheckCreate, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
+    data = {**_validated_check_payload(payload), "project_id": project_id}
+    return await request.app.state.runner.run_draft(data, trigger="draft-debug")
 
 
 @app.post("/api/checks/inspect-api")
-async def inspect_api_check(payload: ApiInspectRequest, request: Request) -> dict[str, Any]:
-    settings = storage.get_settings()
+async def inspect_api_check(
+    payload: ApiInspectRequest, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
+    settings = storage.settings_for_project(storage.get_settings(), project_id)
     runner = getattr(request.app.state, "runner", None)
     resources = getattr(runner, "resources", None)
     try:
@@ -673,10 +850,14 @@ async def inspect_api_check(payload: ApiInspectRequest, request: Request) -> dic
 
 
 @app.post("/api/checks/inspect-ui")
-async def inspect_ui_check(payload: UiInspectRequest, request: Request) -> dict[str, Any]:
+async def inspect_ui_check(
+    payload: UiInspectRequest, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
     settings = storage.get_settings()
     try:
-        return await request.app.state.runner.inspect_ui(payload.model_dump())
+        return await request.app.state.runner.inspect_ui({**payload.model_dump(), "project_id": project_id})
+    except UiInspectionFailure as exc:
+        return JSONResponse(status_code=400, content={"detail": f"页面扫描失败：{exc}", "diagnostics": exc.diagnostics})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=mask_text(str(exc), settings)) from exc
     except Exception as exc:
@@ -685,10 +866,14 @@ async def inspect_ui_check(payload: UiInspectRequest, request: Request) -> dict[
 
 
 @app.post("/api/checks/inspect-ui-rules")
-async def inspect_ui_rules(payload: UiInspectRulesRequest, request: Request) -> dict[str, Any]:
+async def inspect_ui_rules(
+    payload: UiInspectRulesRequest, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
     settings = storage.get_settings()
     try:
-        return await request.app.state.runner.inspect_ui_rules(payload.model_dump())
+        return await request.app.state.runner.inspect_ui_rules({**payload.model_dump(), "project_id": project_id})
+    except UiInspectionFailure as exc:
+        return JSONResponse(status_code=400, content={"detail": f"规则检测失败：{exc}", "diagnostics": exc.diagnostics})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=mask_text(str(exc), settings)) from exc
     except Exception as exc:
@@ -697,18 +882,24 @@ async def inspect_ui_rules(payload: UiInspectRulesRequest, request: Request) -> 
 
 
 @app.get("/api/checks/{check_id}")
-def check_detail(check_id: int) -> dict[str, Any]:
-    check = storage.get_check(check_id)
+def check_detail(check_id: int, project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    check = storage.get_check(check_id, project_id=project_id)
     if not check:
         raise HTTPException(status_code=404, detail="任务不存在")
     return check
 
 
 @app.get("/api/checks/{check_id}/versions")
-def check_versions(check_id: int, limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
-    if not storage.get_check(check_id):
+def check_versions(
+    check_id: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    project_id: int = Depends(_project_context),
+) -> list[dict[str, Any]]:
+    if not storage.get_check(check_id, project_id=project_id):
         raise HTTPException(status_code=404, detail="任务不存在")
-    return mask_data(storage.list_check_versions(check_id, limit=limit), storage.get_settings())
+    return mask_data(
+        storage.list_check_versions(check_id, limit=limit, project_id=project_id), storage.get_settings()
+    )
 
 
 @app.get("/api/checks/{check_id}/trend")
@@ -719,6 +910,7 @@ def check_trend(
     end: str | None = Query(default=None),
     hour_start: str | None = Query(default=None),
     hour_end: str | None = Query(default=None),
+    project_id: int = Depends(_project_context),
 ) -> dict[str, Any]:
     try:
         trend = storage.get_check_trend(
@@ -728,6 +920,7 @@ def check_trend(
             end=end,
             hour_start=hour_start,
             hour_end=hour_end,
+            project_id=project_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -737,86 +930,115 @@ def check_trend(
 
 
 @app.post("/api/check-versions/{version_id}/restore")
-def restore_check_version(version_id: int, request: Request) -> dict[str, Any]:
-    version = storage.get_check_version(version_id)
+def restore_check_version(
+    version_id: int, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
+    version = storage.get_check_version(version_id, project_id=project_id)
     if not version:
         raise HTTPException(status_code=404, detail="任务版本不存在")
     snapshot = dict(version["snapshot"])
     payload = _validated_check_data(CheckCreate.model_validate(snapshot).model_dump())
     check_id = int(version["check_id"])
-    current = storage.get_check(check_id)
+    current = storage.get_check(check_id, project_id=project_id)
     if current:
         storage.record_check_version(current, "restored-from")
-        restored = storage.update_check(check_id, payload)
+        restored = storage.update_check(check_id, payload, project_id=project_id)
     else:
-        restored = storage.create_check(payload)
+        restored = storage.create_check(payload, project_id=project_id)
         check_id = int(restored["id"])
     if not restored:
         raise HTTPException(status_code=404, detail="任务不存在")
-    storage.record_audit_event("restored", "check", check_id, restored["name"], "恢复任务版本", {"version_id": version_id})
+    storage.record_audit_event(
+        "restored", "check", check_id, restored["name"], "恢复任务版本", {"version_id": version_id}, project_id
+    )
     request.app.state.scheduler.sync_check(check_id)
     return restored
 
 
 @app.put("/api/checks/{check_id}")
-def update_check(check_id: int, payload: CheckUpdate, request: Request) -> dict[str, Any]:
-    previous = storage.get_check(check_id)
+def update_check(
+    check_id: int,
+    payload: CheckUpdate,
+    request: Request,
+    project_id: int = Depends(_active_project_context),
+) -> dict[str, Any]:
+    previous = storage.get_check(check_id, project_id=project_id)
     data = _validated_check_payload(payload)
-    check = storage.update_check(check_id, data)
+    check = storage.update_check(check_id, data, project_id=project_id)
     if not check:
         raise HTTPException(status_code=404, detail="任务不存在")
     if previous:
         storage.record_check_version(previous, "updated")
-    storage.record_audit_event("updated", "check", check_id, check["name"], "更新任务", {"type": check["type"]})
+    storage.record_audit_event(
+        "updated", "check", check_id, check["name"], "更新任务", {"type": check["type"]}, project_id
+    )
     request.app.state.scheduler.sync_check(check_id)
     return check
 
 
 @app.delete("/api/checks/{check_id}")
-def delete_check(check_id: int, request: Request) -> dict[str, bool]:
-    previous = storage.get_check(check_id)
-    removed = storage.delete_check(check_id)
+def delete_check(
+    check_id: int, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, bool]:
+    previous = storage.get_check(check_id, project_id=project_id)
+    removed = storage.delete_check(check_id, project_id=project_id)
     if not removed:
         raise HTTPException(status_code=404, detail="任务不存在")
     if previous:
         storage.record_check_version(previous, "deleted")
-        storage.record_audit_event("deleted", "check", check_id, previous["name"], "删除任务", {"type": previous["type"]})
+        storage.record_audit_event(
+            "deleted", "check", check_id, previous["name"], "删除任务", {"type": previous["type"]}, project_id
+        )
     request.app.state.scheduler.sync_check(check_id)
     return {"ok": True}
 
 
 @app.post("/api/checks/{check_id}/enable")
-def enable_check(check_id: int, request: Request) -> dict[str, Any]:
-    check = storage.set_check_enabled(check_id, True)
+def enable_check(
+    check_id: int, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
+    check = storage.set_check_enabled(check_id, True, project_id=project_id)
     if not check:
         raise HTTPException(status_code=404, detail="任务不存在")
-    storage.record_audit_event("enabled", "check", check_id, check["name"], "启用任务", {"type": check["type"]})
+    storage.record_audit_event(
+        "enabled", "check", check_id, check["name"], "启用任务", {"type": check["type"]}, project_id
+    )
     request.app.state.scheduler.sync_check(check_id)
     return check
 
 
 @app.post("/api/checks/{check_id}/disable")
-def disable_check(check_id: int, request: Request) -> dict[str, Any]:
-    check = storage.set_check_enabled(check_id, False)
+def disable_check(
+    check_id: int, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
+    check = storage.set_check_enabled(check_id, False, project_id=project_id)
     if not check:
         raise HTTPException(status_code=404, detail="任务不存在")
-    storage.record_audit_event("disabled", "check", check_id, check["name"], "禁用任务", {"type": check["type"]})
+    storage.record_audit_event(
+        "disabled", "check", check_id, check["name"], "禁用任务", {"type": check["type"]}, project_id
+    )
     request.app.state.scheduler.sync_check(check_id)
     return check
 
 
 @app.post("/api/checks/{check_id}/run")
-async def run_check(check_id: int, request: Request) -> dict[str, Any]:
+async def run_check(
+    check_id: int, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
     try:
-        return await request.app.state.runner.run_check(check_id, trigger="manual")
+        return await request.app.state.runner.run_check(check_id, trigger="manual", project_id=project_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/api/checks/{check_id}/confirm-recovery")
-async def confirm_recovery(check_id: int, request: Request) -> dict[str, Any]:
+async def confirm_recovery(
+    check_id: int, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
     try:
-        return await request.app.state.runner.run_check(check_id, trigger="confirm-recovery")
+        return await request.app.state.runner.run_check(
+            check_id, trigger="confirm-recovery", project_id=project_id
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -833,6 +1055,7 @@ def runs(
     start: str | None = Query(default=None),
     end: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    project_id: int = Depends(_project_context),
 ) -> list[dict[str, Any]]:
     if type and type not in {"ui", "api"}:
         raise HTTPException(status_code=400, detail="任务类型无效")
@@ -842,6 +1065,7 @@ def runs(
         raise HTTPException(status_code=400, detail="告警状态无效")
     return storage.list_runs(
         {
+            "project_id": project_id,
             "check_type": type,
             "status": status,
             "notification_status": notification_status,
@@ -871,6 +1095,7 @@ def runs_page(
     end: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    project_id: int = Depends(_project_context),
 ) -> dict[str, Any]:
     if type and type not in {"ui", "api"}:
         raise HTTPException(status_code=400, detail="任务类型无效")
@@ -880,6 +1105,7 @@ def runs_page(
         raise HTTPException(status_code=400, detail="运行来源类型无效")
     return storage.list_runs_page(
         {
+            "project_id": project_id,
             "check_type": type,
             "status": status,
             "notification_status": notification_status,
@@ -898,8 +1124,8 @@ def runs_page(
 
 
 @app.get("/api/runs/{run_id}")
-def run_detail(run_id: int) -> dict[str, Any]:
-    run = storage.get_run(run_id)
+def run_detail(run_id: int, project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    run = storage.get_run(run_id, project_id=project_id)
     if not run:
         raise HTTPException(status_code=404, detail="运行记录不存在")
     settings = storage.get_settings()
@@ -952,8 +1178,8 @@ def _object_value(value: Any) -> dict[str, Any]:
 
 
 @app.get("/api/runs/{run_id}/failure-summary")
-def run_failure_summary(run_id: int) -> dict[str, Any]:
-    run = storage.get_run(run_id)
+def run_failure_summary(run_id: int, project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    run = storage.get_run(run_id, project_id=project_id)
     if not run:
         raise HTTPException(status_code=404, detail="运行记录不存在")
     baseline = storage.get_previous_successful_run(run)
@@ -961,7 +1187,9 @@ def run_failure_summary(run_id: int) -> dict[str, Any]:
 
 
 @app.get("/api/runs/{run_id}/compare-success")
-def run_success_comparison(run_id: int) -> dict[str, Any]:
+def run_success_comparison(run_id: int, project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    if not storage.get_run(run_id, project_id=project_id):
+        raise HTTPException(status_code=404, detail="运行记录不存在")
     try:
         return run_comparison.compare_with_previous_success(run_id)
     except ValueError as exc:
@@ -969,14 +1197,18 @@ def run_success_comparison(run_id: int) -> dict[str, Any]:
 
 
 @app.post("/api/runs/{run_id}/rerun")
-async def rerun(run_id: int, request: Request) -> dict[str, Any]:
-    run = storage.get_run(run_id)
+async def rerun(
+    run_id: int, request: Request, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
+    run = storage.get_run(run_id, project_id=project_id)
     if not run:
         raise HTTPException(status_code=404, detail="运行记录不存在")
     if int(run["check_id"]) <= 0:
         raise HTTPException(status_code=400, detail="临时运行记录不能重新执行")
     try:
-        return await request.app.state.runner.run_check(int(run["check_id"]), trigger=f"rerun:{run_id}")
+        return await request.app.state.runner.run_check(
+            int(run["check_id"]), trigger=f"rerun:{run_id}", project_id=project_id
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1003,7 +1235,7 @@ async def update_settings(payload: SettingsUpdate, request: Request) -> dict[str
 @app.post("/api/read-only-tokens")
 def create_read_only_token(payload: ReadOnlyTokenCreate) -> dict[str, Any]:
     try:
-        token = storage.create_read_only_token(payload.read_only_token_name)
+        token = storage.create_read_only_token(payload.read_only_token_name, payload.project_ids)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     storage.record_audit_event(
@@ -1033,8 +1265,10 @@ def delete_read_only_token(token_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/settings/test-alert")
-async def test_alert(payload: SettingsUpdate) -> dict[str, Any]:
-    settings = _settings_with_overrides(payload)
+async def test_alert(
+    payload: SettingsUpdate, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
+    settings = _project_alert_settings_with_overrides(payload, project_id)
     try:
         await notifier.send_test_alert(settings)
     except notifier.AlertDeliveryError as exc:
@@ -1043,8 +1277,78 @@ async def test_alert(payload: SettingsUpdate) -> dict[str, Any]:
 
 
 @app.post("/api/settings/alert-preview")
-def alert_preview(payload: SettingsUpdate) -> dict[str, Any]:
-    return notifier.build_test_alert_preview(_settings_with_overrides(payload))
+def alert_preview(
+    payload: SettingsUpdate, project_id: int = Depends(_project_context)
+) -> dict[str, Any]:
+    return notifier.build_test_alert_preview(_project_alert_settings_with_overrides(payload, project_id))
+
+
+@app.post("/api/settings/test-system-alert")
+async def test_system_alert(payload: SettingsUpdate) -> dict[str, Any]:
+    settings = _settings_with_overrides(payload)
+    effective = {
+        **settings,
+        "notification_channels": settings.get("system_notification_channels") or [],
+        "notification_channel_ids": settings.get("system_notification_channel_ids") or [],
+    }
+    try:
+        await notifier.send_test_alert(effective)
+    except notifier.AlertDeliveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "message": "系统告警测试已发送"}
+
+
+@app.post("/api/settings/system-alert-preview")
+def system_alert_preview(payload: SettingsUpdate) -> dict[str, Any]:
+    settings = _settings_with_overrides(payload)
+    effective = {
+        **settings,
+        "notification_channels": settings.get("system_notification_channels") or [],
+        "notification_channel_ids": settings.get("system_notification_channel_ids") or [],
+    }
+    return notifier.build_test_alert_preview(effective)
+
+
+@app.get("/api/project-alert-settings")
+def project_alert_settings(project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    return storage.get_project_alert_settings(project_id, public=True)
+
+
+@app.get("/api/project-variables")
+def project_variables(project_id: int = Depends(_project_context)) -> list[dict[str, Any]]:
+    return storage.get_project_variables(project_id, public=True)
+
+
+@app.put("/api/project-variables")
+def update_project_variables(
+    payload: list[dict[str, Any]], project_id: int = Depends(_active_project_context)
+) -> list[dict[str, Any]]:
+    try:
+        result = storage.update_project_variables(project_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    storage.record_audit_event("updated", "project_variables", project_id, summary="更新项目变量", project_id=project_id)
+    return result
+
+
+@app.put("/api/project-alert-settings")
+def update_project_alert_settings(
+    payload: ProjectAlertSettingsUpdate,
+    project_id: int = Depends(_active_project_context),
+) -> dict[str, Any]:
+    try:
+        settings = storage.update_project_alert_settings(project_id, payload.values)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    storage.record_audit_event(
+        "updated",
+        "project_alert_settings",
+        project_id,
+        summary="更新项目告警设置",
+        payload={"fields": sorted(payload.values)},
+        project_id=project_id,
+    )
+    return settings
 
 
 @app.get("/api/config/export")
@@ -1068,6 +1372,39 @@ async def import_config(payload: ConfigImportRequest, request: Request) -> dict[
     return result
 
 
+@app.get("/api/project-config/export")
+def export_project_config(
+    redact: bool = Query(default=True), project_id: int = Depends(_project_context)
+) -> dict[str, Any]:
+    return config_transfer.export_project(project_id, redact=redact)
+
+
+@app.post("/api/project-config/import-preview")
+def import_project_config_preview(
+    payload: ConfigImportRequest, project_id: int = Depends(_active_project_context)
+) -> dict[str, Any]:
+    return config_transfer.preview_project_import(payload.bundle, project_id)
+
+
+@app.post("/api/project-config/import")
+def import_project_config(
+    payload: ConfigImportRequest,
+    request: Request,
+    project_id: int = Depends(_active_project_context),
+) -> dict[str, Any]:
+    try:
+        result = config_transfer.apply_project_import(
+            payload.bundle, project_id, replace_existing=payload.replace_existing
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    request.app.state.scheduler.refresh_all()
+    storage.record_audit_event(
+        "imported", "project_config", project_id, summary="导入项目配置", payload=result, project_id=project_id
+    )
+    return result
+
+
 def _settings_with_overrides(payload: SettingsUpdate) -> dict[str, Any]:
     settings = storage.get_settings()
     unknown = sorted(set(payload.values) - set(DEFAULT_SETTINGS))
@@ -1080,6 +1417,16 @@ def _settings_with_overrides(payload: SettingsUpdate) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return settings
+
+
+def _project_alert_settings_with_overrides(payload: SettingsUpdate, project_id: int) -> dict[str, Any]:
+    global_settings = storage.get_settings()
+    project_settings = storage.get_project_alert_settings(project_id)
+    try:
+        normalized = storage.normalize_project_alert_settings_values(dict(payload.values))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**global_settings, **project_settings, **normalized}
 
 
 def _validated_check_payload(payload: CheckCreate | CheckUpdate) -> dict[str, Any]:
@@ -1097,19 +1444,9 @@ def _validated_check_data(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _verify_read_only_token(token: str) -> None:
-    settings = storage.get_settings()
-    expected_tokens = [str(settings.get("read_only_token") or "").strip()]
-    expected_tokens.extend(
-        str(item.get("token") or "").strip()
-        for item in settings.get("read_only_tokens", [])
-        if isinstance(item, dict)
-    )
-    expected_tokens = [expected for expected in expected_tokens if expected]
-    if not expected_tokens:
-        raise HTTPException(status_code=403, detail="只读访问令牌未配置")
-    if not any(secrets.compare_digest(token, expected) for expected in expected_tokens):
-        raise HTTPException(status_code=403, detail="只读访问令牌无效")
+def _verify_read_only_token(token: str, project_id: int) -> None:
+    if not storage.validate_read_only_token(token, project_id):
+        raise HTTPException(status_code=403, detail="只读访问令牌无效或无权访问当前项目")
 
 
 def _read_only_token_value(query_token: str, header_token: str, authorization: str) -> str:
@@ -1187,16 +1524,28 @@ async def _run_enabled_checks(
     trigger: str,
     check_type: str | None = None,
     concurrent: bool = True,
+    project_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    checks_to_run = [check for check in storage.list_checks(check_type, enabled_only=True)]
+    checks_to_run = storage.list_checks(
+        check_type,
+        enabled_only=True,
+        project_id=project_id,
+        active_projects_only=project_id is None,
+    )
     if not concurrent:
         results: list[dict[str, Any]] = []
         for check in checks_to_run:
-            results.append(await request.app.state.runner.run_check(int(check["id"]), trigger=trigger))
+            results.append(
+                await request.app.state.runner.run_check(
+                    int(check["id"]), trigger=trigger, project_id=int(check["project_id"])
+                )
+            )
         return results
     return await asyncio.gather(
         *[
-            request.app.state.runner.run_check(int(check["id"]), trigger=trigger)
+            request.app.state.runner.run_check(
+                int(check["id"]), trigger=trigger, project_id=int(check["project_id"])
+            )
             for check in checks_to_run
         ]
     )
@@ -1349,6 +1698,10 @@ async def _worker_request(
     timeout: float = 10,
 ) -> dict[str, Any]:
     runner_id = str(runner.get("runner_id") or "")
+    try:
+        storage.ensure_probe_runner_transport_allowed(runner)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     token = storage.get_probe_runner_token(runner_id)
     address = str(runner.get("address") or "").strip().rstrip("/")
     if not address or not token:
@@ -1530,13 +1883,16 @@ def _read_only_run_payload(run: dict[str, Any] | None, settings: dict[str, Any])
     }
 
 
-def _status_page_payload() -> dict[str, Any]:
+def _status_page_payload(project_id: int) -> dict[str, Any]:
     settings = storage.get_settings()
-    overview = storage.get_overview()
-    checks = [_status_check_payload(check, settings) for check in storage.list_checks(refresh_stale=False)]
+    overview = storage.get_overview(project_id)
+    checks = [
+        _status_check_payload(check, settings)
+        for check in storage.list_checks(refresh_stale=False, project_id=project_id)
+    ]
     incidents = [
         _status_incident_payload(run, settings)
-        for run in storage.list_recent_business_incidents(limit=20)
+        for run in storage.list_recent_business_incidents(limit=20, project_id=project_id)
     ]
     return {
         "generated_at": storage.now_iso(),
@@ -1615,9 +1971,9 @@ def _run_failure_summary_payload(run: dict[str, Any], baseline: dict[str, Any] |
     return failure_summary.build_failure_summary(run, settings, baseline)
 
 
-def _metrics_payload() -> dict[str, Any]:
-    overview = storage.get_overview()
-    checks = storage.list_checks(refresh_stale=False)
+def _metrics_payload(project_id: int) -> dict[str, Any]:
+    overview = storage.get_overview(project_id)
+    checks = storage.list_checks(refresh_stale=False, project_id=project_id)
     runs_24h = next((item for item in overview.get("trends", []) if item.get("key") == "24h"), {})
     trend_totals_24h = _trend_totals(runs_24h)
     return {
@@ -1682,6 +2038,12 @@ async def request_validation_exception_handler(_: Request, exc: RequestValidatio
 @app.exception_handler(ValidationError)
 async def validation_exception_handler(_: Request, exc: ValidationError) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": _format_validation_errors(exc.errors())})
+
+
+@app.exception_handler(storage.DatabaseRestoreRecoveryError)
+@app.exception_handler(RuntimeSettingsReloadError)
+async def database_recovery_required_handler(_: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(sqlite3.OperationalError)

@@ -12,6 +12,10 @@ from backend.app import storage
 from backend.app.main import app
 
 
+def project_headers() -> dict[str, str]:
+    return {"X-PulseGuard-Project-Id": "1"}
+
+
 class RunComparisonRouteTests(unittest.TestCase):
     def test_failed_api_run_compares_with_recent_success_for_same_check(self) -> None:
         with isolated_storage():
@@ -67,7 +71,7 @@ class RunComparisonRouteTests(unittest.TestCase):
                 ),
             )
 
-            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success")
+            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success", headers=project_headers())
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -123,7 +127,7 @@ class RunComparisonRouteTests(unittest.TestCase):
                 ),
             )
 
-            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success")
+            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success", headers=project_headers())
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -194,7 +198,7 @@ class RunComparisonRouteTests(unittest.TestCase):
                 ),
             )
 
-            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success")
+            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success", headers=project_headers())
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -240,7 +244,7 @@ class RunComparisonRouteTests(unittest.TestCase):
                 ),
             )
 
-            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success")
+            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success", headers=project_headers())
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -275,7 +279,7 @@ class RunComparisonRouteTests(unittest.TestCase):
                 ),
             )
 
-            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success")
+            response = TestClient(app).get(f"/api/runs/{current['id']}/compare-success", headers=project_headers())
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
