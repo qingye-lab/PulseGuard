@@ -35,6 +35,8 @@ PULSEGUARD_RELAY_PUBLIC_PORT=9443
   -RelayPort 9443
 ```
 
+脚本会保留 `data/`、`reports/` 和 relay 密钥，先在数据库副本上预演迁移；停服后再备份最新数据库并完成项目隔离切换。回滚必须配套恢复部署前源码包和 `pulseguard-before-cutover-*.db`。
+
 ## 本地子节点
 
 本地 relay worker 目录通常是：

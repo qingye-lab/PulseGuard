@@ -21,7 +21,9 @@ class FakeConcurrentRunner:
         self.running = 0
         self.max_running = 0
 
-    async def run_check(self, check_id: int, trigger: str = "manual") -> dict[str, object]:
+    async def run_check(
+        self, check_id: int, trigger: str = "manual", project_id: int | None = None
+    ) -> dict[str, object]:
         self.running += 1
         self.max_running = max(self.max_running, self.running)
         try:
@@ -83,12 +85,27 @@ class FakeDeploymentRunner:
         self.waits.append(timeout_seconds)
         return {"idle": True, "queued": 0, "running": 0, "active_checks": 0}
 
-    async def run_check(self, check_id: int, trigger: str = "manual") -> dict[str, object]:
+    async def run_check(
+        self, check_id: int, trigger: str = "manual", project_id: int | None = None
+    ) -> dict[str, object]:
         self.runs.append((check_id, trigger))
         return {"id": check_id, "check_id": check_id, "trigger": trigger}
 
     def runtime_status(self) -> dict[str, object]:
         return {"queue": {"queued": 0}, "workers": {"running": 0}, "active_checks": 0}
+
+
+class ProjectScopedRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        app.dependency_overrides[main_module._project_context] = lambda: 1
+        app.dependency_overrides[main_module._active_project_context] = lambda: 1
+        self._refresh_stale_patch = patch("backend.app.main.storage.refresh_stale_statuses")
+        self._refresh_stale_patch.start()
+
+    def tearDown(self) -> None:
+        self._refresh_stale_patch.stop()
+        app.dependency_overrides.pop(main_module._project_context, None)
+        app.dependency_overrides.pop(main_module._active_project_context, None)
 
 
 class FrontendRouteTests(unittest.TestCase):
@@ -97,6 +114,26 @@ class FrontendRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok", "name": "PulseGuard", "team": "新零售测试团队"})
+
+    def test_database_health_route_returns_storage_capacity_signals(self) -> None:
+        payload = {
+            "status": "normal",
+            "file_size_bytes": 4096,
+            "wal_size_bytes": 0,
+            "page_size_bytes": 4096,
+            "page_count": 1,
+            "freelist_pages": 0,
+            "estimated_used_bytes": 4096,
+            "reclaimable_bytes": 0,
+            "reclaimable_ratio": 0.0,
+            "journal_mode": "wal",
+            "maintenance_recommended": False,
+        }
+        with patch("backend.app.main.storage.get_database_health", return_value=payload):
+            response = TestClient(app).get("/api/database-health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
 
     def test_frontend_root_static_file_is_served_before_spa_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -119,15 +156,15 @@ class FrontendRouteTests(unittest.TestCase):
         self.assertIn('id="root"', fallback.text)
 
 
-class RunAllRouteTests(unittest.TestCase):
+class RunAllRouteTests(ProjectScopedRouteTests):
     def test_run_all_submits_enabled_checks_concurrently(self) -> None:
         runner = FakeConcurrentRunner()
 
         with patch.object(app.state, "runner", runner, create=True), patch(
             "backend.app.main.storage.list_checks",
             return_value=[
-                {"id": 1, "name": "API 1", "type": "api"},
-                {"id": 2, "name": "API 2", "type": "api"},
+                {"id": 1, "name": "API 1", "type": "api", "project_id": 1},
+                {"id": 2, "name": "API 2", "type": "api", "project_id": 1},
             ],
         ) as list_checks:
             response = TestClient(app).post("/api/checks/run-all?type=api")
@@ -135,7 +172,7 @@ class RunAllRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([run["check_id"] for run in response.json()["runs"]], [1, 2])
         self.assertGreaterEqual(runner.max_running, 2)
-        list_checks.assert_called_once_with("api", enabled_only=True)
+        list_checks.assert_called_once_with("api", enabled_only=True, project_id=1, active_projects_only=False)
 
     def test_batch_enable_route_uses_selected_ids_and_syncs_matches(self) -> None:
         scheduler = FakeScheduler()
@@ -164,7 +201,7 @@ class RunAllRouteTests(unittest.TestCase):
         self.assertEqual(response.json(), {"matched": 2, "changed": 2, "ids": [1, 2], "runs": []})
         self.assertEqual(get_check.call_count, 2)
         select_checks.assert_not_called()
-        batch_set_enabled.assert_called_once_with([1, 2], True)
+        batch_set_enabled.assert_called_once_with([1, 2], True, project_id=1)
         record_audit_event.assert_called_once()
         self.assertEqual(scheduler.synced, [1, 2])
 
@@ -190,9 +227,9 @@ class RunAllRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"matched": 1, "changed": 1, "ids": [5], "runs": []})
-        get_check.assert_called_once_with(5, refresh_stale=False)
+        get_check.assert_called_once_with(5, refresh_stale=False, project_id=1)
         select_checks.assert_not_called()
-        batch_set_enabled.assert_called_once_with([5], False)
+        batch_set_enabled.assert_called_once_with([5], False, project_id=1)
         record_audit_event.assert_called_once()
         self.assertEqual(scheduler.synced, [5])
 
@@ -340,8 +377,8 @@ class DeploymentRouteTests(unittest.TestCase):
             ), patch(
                 "backend.app.main.storage.list_checks",
                 return_value=[
-                    {"id": 10, "name": "API 10", "type": "api", "enabled": True},
-                    {"id": 11, "name": "API 11", "type": "api", "enabled": True},
+                    {"id": 10, "name": "API 10", "type": "api", "enabled": True, "project_id": 1},
+                    {"id": 11, "name": "API 11", "type": "api", "enabled": True, "project_id": 1},
                 ],
             ) as list_checks:
                 response = TestClient(app).post("/api/deployment/complete")
@@ -352,7 +389,7 @@ class DeploymentRouteTests(unittest.TestCase):
         self.assertEqual(runner.runs, [(10, "post-deploy"), (11, "post-deploy")])
         self.assertEqual(runner.waits, [300])
         self.assertEqual(body["discarded_incomplete_runs"], 0)
-        list_checks.assert_called_once_with(None, enabled_only=True)
+        list_checks.assert_called_once_with(None, enabled_only=True, project_id=None, active_projects_only=True)
         self.assertEqual(scheduler.refresh_count, 1)
         self.assertEqual(scheduler.resume_count, 1)
 
@@ -1065,7 +1102,7 @@ class RunnerRouteTests(unittest.TestCase):
         list_probe_runners.assert_called_once_with(limit=10)
 
 
-class RunRouteTests(unittest.TestCase):
+class RunRouteTests(ProjectScopedRouteTests):
     def test_run_detail_uses_ui_snapshot_request_info_without_loading_current_check(self) -> None:
         run = {
             "id": 41,
@@ -1168,6 +1205,7 @@ class RunRouteTests(unittest.TestCase):
             page_size=12,
             hour_start=None,
             hour_end=None,
+            project_id=1,
         )
 
     def test_check_trend_route_returns_404_for_missing_check(self) -> None:
@@ -1197,7 +1235,7 @@ class RunRouteTests(unittest.TestCase):
         self.assertEqual(filters["run_group_id"], "rg-test")
 
 
-class OperationsRouteTests(unittest.TestCase):
+class OperationsRouteTests(ProjectScopedRouteTests):
     def test_status_page_returns_sanitized_internal_snapshot(self) -> None:
         settings = {
             "maintenance_enabled": True,
@@ -1285,12 +1323,12 @@ class OperationsRouteTests(unittest.TestCase):
         self.assertEqual(response.json()["recent_incidents"], [])
 
     def test_read_only_snapshot_requires_configured_token(self) -> None:
-        with patch("backend.app.main.storage.get_settings", return_value={"read_only_token": ""}):
+        with patch("backend.app.main.storage.validate_read_only_token", return_value=False):
             unconfigured = TestClient(app).get("/api/read-only/snapshot")
 
         self.assertEqual(unconfigured.status_code, 403)
 
-        with patch("backend.app.main.storage.get_settings", return_value={"read_only_token": "secret"}):
+        with patch("backend.app.main.storage.validate_read_only_token", return_value=False):
             denied = TestClient(app).get("/api/read-only/snapshot?token=wrong")
 
         self.assertEqual(denied.status_code, 403)
@@ -1326,7 +1364,9 @@ class OperationsRouteTests(unittest.TestCase):
                 }
             ],
         }
-        with patch("backend.app.main.storage.get_settings", return_value=settings), patch(
+        with patch("backend.app.main.storage.validate_read_only_token", return_value=True), patch(
+            "backend.app.main.storage.get_settings", return_value=settings
+        ), patch(
             "backend.app.main.storage.get_overview", return_value=overview
         ), patch("backend.app.main.storage.list_checks", return_value=checks), patch("backend.app.main.storage.list_runs", return_value=runs):
             allowed = TestClient(app).get("/api/read-only/snapshot?token=secret")
@@ -1343,7 +1383,9 @@ class OperationsRouteTests(unittest.TestCase):
         self.assertNotIn("logs", payload_text)
 
     def test_read_only_snapshot_accepts_bearer_token(self) -> None:
-        with patch("backend.app.main.storage.get_settings", return_value={"read_only_token": "secret"}), patch(
+        with patch("backend.app.main.storage.validate_read_only_token", return_value=True), patch(
+            "backend.app.main.storage.get_settings", return_value={"read_only_token": "secret"}
+        ), patch(
             "backend.app.main.storage.get_overview", return_value={"today_runs": 1}
         ), patch("backend.app.main.storage.list_checks", return_value=[]), patch("backend.app.main.storage.list_runs", return_value=[]):
             response = TestClient(app).get("/api/read-only/snapshot", headers={"Authorization": "Bearer secret"})
@@ -1548,7 +1590,7 @@ class OperationsRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [archive])
-        list_run_archives.assert_called_once_with(limit=30)
+        list_run_archives.assert_called_once_with(limit=30, project_id=1)
 
     def test_restore_check_version_updates_existing_check_and_syncs_scheduler(self) -> None:
         scheduler = FakeScheduler()

@@ -93,10 +93,23 @@ UI_SCAN_SCRIPT = r"""
     "mall",
     "subsidy",
     "detail",
-    "swiper",
     "goods",
     "product",
     "card",
+    "collect",
+    "name",
+    "year",
+    "mileage",
+    "city",
+    "location",
+    "address",
+    "tag",
+    "tags",
+    "badge",
+    "meta",
+    "info",
+    "amount",
+    "reduction",
     "panel",
     "section"
   ]);
@@ -120,7 +133,13 @@ UI_SCAN_SCRIPT = r"""
     "main"
   ]);
 
-  const attrSelector = (name, value) => `[${name}=${JSON.stringify(String(value))}]`;
+  const cssString = (value) => `"${String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, "\\d ")
+    .replace(/\n/g, "\\a ")
+    .replace(/\f/g, "\\c ")}"`;
+  const attrSelector = (name, value) => `[${name}=${cssString(value)}]`;
   const normalizeText = (value) =>
     String(value || "")
       .normalize("NFKC")
@@ -168,9 +187,44 @@ UI_SCAN_SCRIPT = r"""
     return "textbox";
   }
 
+  let queryRootsCache = null;
+
+  function queryRoots() {
+    if (queryRootsCache) return queryRootsCache;
+    const roots = [document];
+    for (let index = 0; index < roots.length; index += 1) {
+      const root = roots[index];
+      for (const el of Array.from(root.querySelectorAll ? root.querySelectorAll("*") : [])) {
+        if (el.shadowRoot && !roots.includes(el.shadowRoot)) roots.push(el.shadowRoot);
+      }
+    }
+    queryRootsCache = roots;
+    return roots;
+  }
+
+  function deepQueryAll(selector) {
+    const output = [];
+    const seen = new Set();
+    for (const root of queryRoots()) {
+      let nodes = [];
+      try {
+        nodes = Array.from(root.querySelectorAll(selector));
+      } catch {
+        return [];
+      }
+      for (const node of nodes) {
+        if (!seen.has(node)) {
+          seen.add(node);
+          output.push(node);
+        }
+      }
+    }
+    return output;
+  }
+
   function cssCount(selector) {
     try {
-      return document.querySelectorAll(selector).length;
+      return deepQueryAll(selector).length;
     } catch {
       return 0;
     }
@@ -179,12 +233,14 @@ UI_SCAN_SCRIPT = r"""
   function exactVisibleTextCount(text) {
     if (!text) return 0;
     let count = 0;
-    const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_ELEMENT);
-    let node = walker.currentNode;
-    while (node) {
-      if (visibleText(node) === text) count += 1;
-      if (count > 1) return count;
-      node = walker.nextNode();
+    for (const root of queryRoots()) {
+      const walker = document.createTreeWalker(root === document ? (document.body || document.documentElement) : root, NodeFilter.SHOW_ELEMENT);
+      let node = walker.nextNode();
+      while (node) {
+        if (visibleText(node) === text) count += 1;
+        if (count > 1) return count;
+        node = walker.nextNode();
+      }
     }
     return count;
   }
@@ -201,6 +257,12 @@ UI_SCAN_SCRIPT = r"""
     if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
     const style = getComputedStyle(el);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+    let parent = el.parentElement;
+    while (parent) {
+      const parentStyle = getComputedStyle(parent);
+      if (parentStyle.display === "none" || parentStyle.visibility === "hidden" || Number(parentStyle.opacity) === 0) return false;
+      parent = parent.parentElement;
+    }
     const rect = el.getBoundingClientRect();
     return rect.width >= 8 && rect.height >= 8;
   }
@@ -208,7 +270,7 @@ UI_SCAN_SCRIPT = r"""
   function isDynamicToken(token) {
     const value = String(token || "");
     if (!value) return true;
-    if (/^(react|mui|ember|ng|jss|css|ant|rc|ruyi|icon)-/i.test(value)) return true;
+    if (/^(react|mui|ember|ng|jss|css|ant|rc|ruyi|icon|swiper|slick|splide)-/i.test(value)) return true;
     if (/^[a-f0-9]{8,}$/i.test(value)) return true;
     if (/^[A-Za-z0-9_-]{12,}$/.test(value) && /[A-Z]/.test(value) && /\d/.test(value)) return true;
     if (/\d{4,}/.test(value)) return true;
@@ -246,12 +308,81 @@ UI_SCAN_SCRIPT = r"""
     return semanticTokens(el).some((token) => semanticWords.has(token));
   }
 
+  function semanticClassFragments(el) {
+    const fragments = [];
+    for (const className of Array.from(el.classList || [])) {
+      const rawClassName = String(className);
+      if (/^(?:css|jss|mui|ant|rc|ruyi|ember|ng|swiper|slick|splide)-/i.test(rawClassName) || /^[a-f0-9]{8,}$/i.test(rawClassName)) continue;
+      // Strip only the CSS-module build suffix. BEM block/element names are
+      // indivisible roles: splitting on underscores merges cards and fields.
+      const normalizedClassName = rawClassName.replace(/^_+/, "")
+        .replace(/_[A-Za-z0-9]+_\d+$/, "").split(/--/)[0];
+      const segments = [normalizedClassName];
+      for (const segment of segments) {
+        const normalizedSegment = segment.toLowerCase();
+        const tokens = rawTokens(segment).map((item) => item.toLowerCase());
+        const meaningful = tokens.filter((token) => !weakNoiseWords.has(token) && !["styles", "style", "module", "css", "scoped"].includes(token));
+        if (!meaningful.length) continue;
+        if (/^(?:[a-z]*\d+){2,}[a-z]*$/i.test(normalizedSegment) || /^[a-f0-9]{6,}$/i.test(normalizedSegment)) continue;
+        const hasKnownSemanticWord = meaningful.some((token) => semanticWords.has(token));
+        if (!hasKnownSemanticWord && meaningful.length < 2 && normalizedSegment.length < 6) continue;
+        if (!hasKnownSemanticWord && meaningful.length < 2 && normalizedSegment.length < 8) continue;
+        if (!fragments.some((item) => item.value === segment)) {
+          fragments.push({ value: segment, score: (hasKnownSemanticWord ? 10 : 0) + meaningful.length * 2 + Math.min(normalizedSegment.length, 20) / 20 });
+        }
+      }
+    }
+    return fragments.sort((left, right) => right.score - left.score).slice(0, 3).map((item) => item.value);
+  }
+
+  function semanticClassSelector(el, fragment) {
+    const tag = el.tagName.toLowerCase();
+    if (el.classList.contains(fragment)) return `${tag}.${CSS.escape(fragment)}`;
+    for (const className of Array.from(el.classList || [])) {
+      const module = String(className).match(/^(_*)(.+?)_[A-Za-z0-9]+_\d+$/);
+      if (module && module[2].split(/--/)[0] === fragment) {
+        const prefix = `${module[1]}${fragment}_`;
+        // Match a class token prefix, never a substring of a different role.
+        return `${tag}:is([class^=${cssString(prefix)}],[class*=${cssString(` ${prefix}`)}])` +
+          `:not([class*=${cssString(`${prefix}_`)}])`;
+      }
+    }
+    return "";
+  }
+
+  function semanticLabel(el, kind) {
+    const words = new Set(rawTokens(classIdText(el)).map((item) => item.toLowerCase()));
+    const has = (...items) => items.some((item) => words.has(item));
+    if (has("title", "name") && has("card", "product", "goods")) return "名称区域";
+    if (has("tag", "tags", "badge")) return "标签区域";
+    if (has("reduction", "subsidy")) return "优惠区域";
+    if (has("price", "amount")) return "价格区域";
+    if (has("detail", "meta", "info")) return "详情区域";
+    if (has("city", "location", "address")) return "位置区域";
+    if (has("filter", "sort")) return "筛选区域";
+    if (has("year", "mileage")) {
+      const segments = visibleText(el).split(/[\/|·•]/).map(normalizeText).filter(Boolean);
+      const hasAdministrativeRegion = segments.some((segment) => /[\u4e00-\u9fff]{2,}(?:省|市|区|县|州|盟|旗)$/.test(segment));
+      return hasAdministrativeRegion ? "城市 / 里程区域" : "里程区域";
+    }
+    if (kind === "media" || has("image", "img")) return "图片区域";
+    if (has("collect", "card", "product", "goods") && !has("wrapper", "container")) return "卡片区域";
+    if (has("title", "name")) return "名称区域";
+    return "";
+  }
+
   function isButtonLike(el) {
     if (!["DIV", "SPAN"].includes(el.tagName)) return false;
     const role = roleOf(el);
     if (role === "button") return true;
     const tokens = semanticTokens(el);
     return tokens.includes("button") || tokens.includes("btn") || (tokens.includes("filter") && tokens.includes("button"));
+  }
+
+  function isPointerSurface(el) {
+    if (getComputedStyle(el).cursor !== "pointer") return false;
+    const parent = el.parentElement;
+    return !parent || getComputedStyle(parent).cursor !== "pointer";
   }
 
   function isNativeInteractive(el) {
@@ -288,14 +419,20 @@ UI_SCAN_SCRIPT = r"""
   }
 
   function isIndependentInteractive(el) {
-    return isNativeInteractive(el) || isButtonLike(el) || Boolean(el.onclick || el.getAttribute("onclick")) || roleInteractive.has(roleOf(el));
+    return (
+      isNativeInteractive(el) ||
+      isButtonLike(el) ||
+      isPointerSurface(el) ||
+      Boolean(el.onclick || el.getAttribute("onclick")) ||
+      roleInteractive.has(roleOf(el))
+    );
   }
 
   function hasInteractiveAncestor(el) {
-    let parent = el.parentElement;
+    let parent = parentElementOrHost(el);
     while (parent && parent !== document.body && parent !== document.documentElement) {
-      if ((isNativeInteractive(parent) || isButtonLike(parent)) && !isIndependentInteractive(el)) return true;
-      parent = parent.parentElement;
+      if ((isNativeInteractive(parent) || isButtonLike(parent) || isPointerSurface(parent)) && !isIndependentInteractive(el)) return true;
+      parent = parentElementOrHost(parent);
     }
     return false;
   }
@@ -304,7 +441,7 @@ UI_SCAN_SCRIPT = r"""
     const classes = Array.from(el.classList || []).filter((item) => {
       const lower = item.toLowerCase();
       if (isDynamicToken(lower)) return false;
-      if (/^(ant|css|rc)-/.test(lower)) return false;
+      if (/^(ant|css|rc|jss|mui|ruyi|ember|ng|swiper|slick|splide)-/.test(lower)) return false;
       return rawTokens(lower).some((token) => semanticWords.has(token.toLowerCase())) || lower.length <= 24;
     });
     return classes.slice(0, 2).map((item) => `.${CSS.escape(item)}`).join("");
@@ -324,7 +461,12 @@ UI_SCAN_SCRIPT = r"""
           break;
         }
       }
-      part += stableClassSelector(current);
+      const stableClasses = stableClassSelector(current);
+      part += stableClasses;
+      if (stableClasses && cssCount(part) === 1) {
+        parts.unshift(part);
+        return parts.join(" > ");
+      }
       const parent = current.parentElement;
       if (parent) {
         const same = Array.from(parent.children).filter((child) => child.tagName === current.tagName);
@@ -360,6 +502,23 @@ UI_SCAN_SCRIPT = r"""
     return visibleText(el);
   }
 
+  let roleNameCountCache = null;
+
+  function roleNameCount(role, name) {
+    if (!roleNameCountCache) {
+      roleNameCountCache = new Map();
+      for (const item of deepQueryAll("*")) {
+        const itemRole = roleOf(item);
+        if (!itemRole || !roleInteractive.has(itemRole)) continue;
+        const itemName = accessibleName(item);
+        if (!itemName || itemName.length > 60) continue;
+        const key = `${itemRole}\u0000${itemName}`;
+        roleNameCountCache.set(key, (roleNameCountCache.get(key) || 0) + 1);
+      }
+    }
+    return roleNameCountCache.get(`${role}\u0000${name}`) || 0;
+  }
+
   function locatorScore(type, selector, unique) {
     let score = 36;
     const value = String(selector || "");
@@ -367,8 +526,9 @@ UI_SCAN_SCRIPT = r"""
     if (type === "name") score += 38;
     if (type === "id") score += 36;
     if (type === "label" || type === "role" || type === "aria" || type === "title") score += 31;
+    if (type === "class") score += 28;
     if (type === "css") score += 20;
-    if (type === "text") score += 10;
+    if (type === "text") score += 2;
     if (unique) score += 14;
     if (/nth-(child|of-type)|\[\d+\]/.test(value)) score -= 16;
     if ((value.match(/>/g) || []).length > 2) score -= 12;
@@ -378,15 +538,66 @@ UI_SCAN_SCRIPT = r"""
     return Math.max(1, Math.min(100, Math.round(score)));
   }
 
-  function addLocator(list, type, selector, unique) {
+  function addLocator(list, type, selector, unique, explicitMatchCount = undefined) {
     if (!selector || list.some((item) => item.selector === selector)) return;
     if (/^xpath=\/(?:html|body)/.test(selector)) return;
     const score = locatorScore(type, selector, unique);
-    list.push({ type, selector, unique, score, displayScore: score + typePreference(type) });
+    const matchCount = typeof explicitMatchCount === "number"
+      ? explicitMatchCount
+      : (["role", "text", "label"].includes(type) ? (unique ? 1 : null) : cssCount(selector));
+    if (matchCount === 0) return;
+    list.push({ type, selector, unique, matchCount, score, displayScore: score + typePreference(type) });
   }
 
   function typePreference(type) {
-    return { role: 6, testid: 6, name: 5, label: 4, id: 4, css: 4, data: 4, dt: 4, aria: 3, title: 3, placeholder: 2, text: 1 }[type] || 0;
+    return { scoped: 8, role: 6, testid: 6, name: 5, label: 4, id: 4, class: 4, css: 4, data: 4, dt: 4, aria: 3, title: 3, placeholder: 2, text: 1 }[type] || 0;
+  }
+
+  function parentElementOrHost(el) {
+    if (el.parentElement) return el.parentElement;
+    const rootNode = el.getRootNode ? el.getRootNode() : null;
+    return rootNode && rootNode.host ? rootNode.host : null;
+  }
+
+  function repeatedClassOption(el) {
+    let best = null;
+    for (const fragment of semanticClassFragments(el)) {
+      const selector = semanticClassSelector(el, fragment);
+      if (!selector) continue;
+      const count = cssCount(selector);
+      if (count < 2 || count > 240) continue;
+      const semantic = rawTokens(fragment).some((token) => semanticWords.has(token.toLowerCase()));
+      const candidate = { selector, count, fragment, score: (semantic ? 20 : 0) + Math.min(20, fragment.length) };
+      if (!best || candidate.score > best.score) best = candidate;
+    }
+    return best;
+  }
+
+  function repeatedScopeFor(el) {
+    let parent = parentElementOrHost(el);
+    let fallback = null;
+    for (let depth = 0; parent && depth < 8; depth += 1) {
+      const option = repeatedClassOption(parent);
+      if (option) {
+        const words = new Set(rawTokens(classIdText(parent)).map((item) => item.toLowerCase()));
+        const cardLike = ["card", "item", "product", "goods", "record", "row"].some((word) => words.has(word));
+        const scope = { el: parent, selector: option.selector, count: option.count, familyId: `${parent.tagName.toLowerCase()}:${option.fragment}` };
+        if (cardLike) return scope;
+        if (!fallback) fallback = scope;
+      }
+      parent = parentElementOrHost(parent);
+    }
+    return fallback;
+  }
+
+  function relativeSelectorFor(el) {
+    const repeated = repeatedClassOption(el);
+    if (repeated) return repeated.selector;
+    for (const fragment of semanticClassFragments(el)) {
+      const selector = semanticClassSelector(el, fragment);
+      if (selector && cssCount(selector) > 0) return selector;
+    }
+    return "";
   }
 
   function generateLocators(el, kind) {
@@ -433,7 +644,8 @@ UI_SCAN_SCRIPT = r"""
     const role = roleOf(el);
     const acc = accessibleName(el);
     if (role && acc && acc.length <= 60 && roleInteractive.has(role)) {
-      addLocator(list, "role", `role=${role}[name=${JSON.stringify(acc)}]`, true);
+      const roleCount = roleNameCount(role, acc);
+      addLocator(list, "role", `role=${role}[name=${JSON.stringify(acc)}]`, roleCount === 1, roleCount);
     }
     const alt = el.getAttribute("alt");
     if (alt && isStableValue(alt)) {
@@ -444,6 +656,10 @@ UI_SCAN_SCRIPT = r"""
     if (title && isStableValue(title)) {
       const selector = `${el.tagName.toLowerCase()}${attrSelector("title", title)}`;
       addLocator(list, "title", selector, cssCount(selector) === 1);
+    }
+    for (const fragment of semanticClassFragments(el)) {
+      const selector = semanticClassSelector(el, fragment);
+      if (selector) addLocator(list, "class", selector, cssCount(selector) === 1);
     }
     const text = visibleText(el);
     if (text && text.length <= 60 && kind !== "component" && exactVisibleTextCount(text) === 1) {
@@ -457,34 +673,63 @@ UI_SCAN_SCRIPT = r"""
       const existing = byType.get(item.type);
       if (!existing || item.displayScore > existing.displayScore) byType.set(item.type, item);
     }
-    const best = Array.from(byType.values()).sort((left, right) => right.displayScore - left.displayScore)[0];
-    return best || { type: "css", selector: css, unique: false, score: 35, displayScore: 35 };
-  }
-
-  function suffixFor(el, kind) {
-    if (isButtonLike(el)) return "button";
-    const role = roleOf(el);
-    const tag = el.tagName.toLowerCase();
-    const type = String(el.getAttribute("type") || "").toLowerCase();
-    if (["button", "submit"].includes(role) || ["button", "submit", "reset"].includes(type)) return "button";
-    if (["checkbox", "radio"].includes(role) || ["checkbox", "radio"].includes(type)) return role || type;
-    if (role === "link" || tag === "a") return "link";
-    if (role === "tab") return "tab";
-    if (role === "menuitem") return "menuitem";
-    if (role === "option") return "option";
-    if (role === "listitem" || tag === "li") return "li";
-    if (tag === "textarea") return "textarea";
-    if (tag === "select") return "select";
-    if (tag === "input") return type === "password" ? "password" : "input";
-    if (tag === "img") return "img";
-    if (role === "navigation" || tag === "nav") return "nav";
-    if (role === "banner" || tag === "header") return "header";
-    if (role === "contentinfo" || tag === "footer") return "footer";
-    if (role === "main" || tag === "main") return "main";
-    if (role === "complementary" || tag === "aside") return "aside";
-    if (role === "region" || tag === "section") return "section";
-    if (kind === "media") return tag;
-    return tag === "div" || tag === "span" ? "div" : tag;
+    const ranked = Array.from(byType.values()).sort((left, right) => right.displayScore - left.displayScore);
+    const scope = repeatedScopeFor(el);
+    const relativeSelector = scope ? relativeSelectorFor(el) : "";
+    if (scope && relativeSelector) {
+      const scopedSelector = `${scope.selector} ${relativeSelector}`;
+      const scopedCount = cssCount(scopedSelector);
+      const scopes = deepQueryAll(scope.selector);
+      const peerScopes = scopes.every((node) => !scopes.some((other) => other !== node && other.contains(node)));
+      const exactFields = scopes.every((node) => node.querySelectorAll(relativeSelector).length === 1);
+      if (scopedCount === scopes.length && peerScopes && exactFields &&
+          scope.el.querySelector(relativeSelector) === el) {
+        ranked.unshift({
+          type: "scoped",
+          selector: scopedSelector,
+          unique: scopedCount === 1,
+          matchCount: scopedCount,
+          score: 82,
+          displayScore: 90,
+          scopeSelector: scope.selector,
+          relativeSelector,
+          matchMode: "every_scope",
+          familyId: scope.familyId
+        });
+      }
+    }
+    ranked.sort((left, right) => right.displayScore - left.displayScore);
+    const repeatedStructural = ranked.find((item) => ["scoped", "class"].includes(item.type) && Number(item.matchCount || 0) >= 2);
+    const semanticRegion = Boolean(semanticLabel(el, kind));
+    const best = (semanticRegion && repeatedStructural) || (kind === "interactive"
+      ? ranked.find((item) => item.unique && item.type !== "class") || ranked[0]
+      : ranked[0]);
+    const fallback = { type: "css", selector: css, unique: false, matchCount: cssCount(css), score: 35, displayScore: 35 };
+    const ordered = best ? [best, ...ranked.filter((item) => item.selector !== best.selector)] : ranked;
+    const options = ordered
+      .map((item) => ({
+        selector: item.selector,
+        selector_type: item.type,
+        stability: stability(item.score),
+        score: item.score,
+        unique: item.unique,
+        match_count: item.matchCount,
+        scope_selector: item.scopeSelector,
+        relative_selector: item.relativeSelector,
+        match_mode: item.matchMode || (Number(item.matchCount || 0) > 1 ? "all" : "first"),
+        count_mode: "visible",
+        family_id: item.familyId
+      }));
+    return { best: best || fallback, options: options.length ? options : [{
+      selector: fallback.selector,
+      selector_type: fallback.type,
+      stability: stability(fallback.score),
+      score: fallback.score,
+      unique: fallback.unique,
+      match_count: fallback.matchCount,
+      match_mode: Number(fallback.matchCount || 0) > 1 ? "all" : "first",
+      count_mode: "visible"
+    }] };
   }
 
   function cleanBase(value) {
@@ -516,26 +761,23 @@ UI_SCAN_SCRIPT = r"""
     } else if (category === "interactive") {
       candidates.push(acc, el.getAttribute("title"), el.value, el.getAttribute("placeholder"), visibleText(el), el.getAttribute("name"), semanticTokens(el).join("_"));
     } else {
-      candidates.push(semanticTokens(el).join("_"), roleOf(el), directText(el), visibleText(el));
+      candidates.push(directText(el), visibleText(el), roleOf(el), semanticTokens(el).join("_"));
     }
     const chinese = candidates.map(cleanBase).find((item) => /[\u4e00-\u9fff]/.test(item));
     return chinese || candidates.map(cleanBase).find(Boolean) || "element";
   }
 
   function buildName(el, kind) {
+    const label = semanticLabel(el, kind);
     const category = isButtonLike(el) ? "buttonlike" : isNativeInteractive(el) ? "interactive" : "container";
-    const suffix = suffixFor(el, kind);
-    const base = baseFor(el, category) || "element";
-    const max = 35;
-    const full = `${base}_${suffix}`;
-    if (full.length <= max) return full;
-    const available = Math.max(6, max - suffix.length - 1);
-    return `${base.slice(0, available)}_${suffix}`;
+    const fallback = kind === "media" ? "图片区域" : kind === "interactive" ? "操作元素" : kind === "text" ? "文本" : "内容区域";
+    const base = cleanBase(label) || baseFor(el, category) || fallback;
+    return (base === "element" ? fallback : base).slice(0, 35);
   }
 
   function kindOf(el) {
     if (mediaTags.has(el.tagName)) return "media";
-    if (isNativeInteractive(el) || isButtonLike(el)) return "interactive";
+    if (isNativeInteractive(el) || isButtonLike(el) || isPointerSurface(el)) return "interactive";
     const own = directText(el);
     if (headingTags.has(el.tagName) || (own && own.length <= 60 && el.children.length <= 1)) return "text";
     if (structureTags.has(el.tagName) || landmarkRoles.has(roleOf(el)) || hasStableAttribute(el) || hasSemanticClass(el)) return "component";
@@ -544,6 +786,7 @@ UI_SCAN_SCRIPT = r"""
 
   function elementScore(el, kind, locator, rect) {
     let score = locator.displayScore;
+    if (locator.type === "class" && Number(locator.matchCount || 0) >= 2) score += 14;
     if (kind === "interactive") score += 30;
     if (kind === "media") score += 22;
     if (kind === "component") score += 10;
@@ -580,6 +823,7 @@ UI_SCAN_SCRIPT = r"""
       "cancel",
       "search",
       "filter",
+      "price",
       "sort",
       "toggle",
       "select",
@@ -590,10 +834,20 @@ UI_SCAN_SCRIPT = r"""
       "mall",
       "subsidy",
       "detail",
-      "swiper",
       "goods",
       "product",
       "card",
+      "name",
+      "year",
+      "mileage",
+      "city",
+      "location",
+      "tag",
+      "tags",
+      "badge",
+      "meta",
+      "info",
+      "amount",
       "panel",
       "section"
     ];
@@ -666,15 +920,63 @@ UI_SCAN_SCRIPT = r"""
     ].join(",");
   }
 
-  const rawNodes = Array.from(document.body ? document.body.querySelectorAll(selectorCollector()) : document.querySelectorAll(selectorCollector()));
-  const visibleNodes = [];
+  const collectedNodes = deepQueryAll(selectorCollector());
+  const repeatedSelectorNodes = new Map();
+  const repeatedClassNodes = [];
+  for (const el of deepQueryAll("[class]").slice(0, 4000)) {
+    const text = visibleText(el);
+    if (!text || text.length > 240) continue;
+    for (const fragment of semanticClassFragments(el)) {
+      const selector = semanticClassSelector(el, fragment);
+      if (!selector) continue;
+      const nodes = repeatedSelectorNodes.get(selector) || [];
+      nodes.push(el);
+      repeatedSelectorNodes.set(selector, nodes);
+    }
+  }
+  for (const nodes of repeatedSelectorNodes.values()) {
+    if (nodes.length < 2 || nodes.length > 240) continue;
+    repeatedClassNodes.push(...nodes);
+    if (repeatedClassNodes.length >= 520) break;
+  }
+  const rawNodes = [];
+  for (const el of [...collectedNodes, ...repeatedClassNodes]) {
+    rawNodes.push(el);
+    let parent = parentElementOrHost(el);
+    while (parent && parent !== document.body && parent !== document.documentElement) {
+      if (isPointerSurface(parent)) rawNodes.push(parent);
+      parent = parentElementOrHost(parent);
+    }
+  }
+  const eligibleNodes = [];
   const seenNodes = new Set();
   for (const el of rawNodes) {
     if (seenNodes.has(el) || !isVisible(el) || !isKeyNode(el) || hasInteractiveAncestor(el)) continue;
     seenNodes.add(el);
-    visibleNodes.push(el);
-    if (visibleNodes.length >= MAX_WORK_ITEMS) break;
+    const kind = kindOf(el);
+    const semantic = hasSemanticClass(el) || kind === "media" || headingTags.has(el.tagName);
+    const preferred = preferredDataAttrs.some((attr) => Boolean(el.getAttribute(attr))) || Boolean(el.id && isStableValue(el.id) && !isDynamicToken(el.id));
+    const interactive = kind === "interactive";
+    const priority = (preferred ? 120 : 0) + (semantic ? 90 : 0) + (interactive ? 60 : 0) + (hasStableAttribute(el) ? 30 : 0);
+    eligibleNodes.push({ el, semantic, preferred, interactive, priority });
   }
+
+  const selectedNodes = [];
+  const selectedSet = new Set();
+  const takePool = (pool, limit) => {
+    for (const item of pool.sort((left, right) => right.priority - left.priority).slice(0, limit)) {
+      if (!selectedSet.has(item.el)) {
+        selectedSet.add(item.el);
+        selectedNodes.push(item.el);
+      }
+    }
+  };
+  takePool(eligibleNodes.filter((item) => item.semantic), 220);
+  takePool(eligibleNodes.filter((item) => item.preferred), 100);
+  takePool(eligibleNodes.filter((item) => item.interactive), 160);
+  takePool(eligibleNodes.filter((item) => !item.semantic && !item.preferred && !item.interactive), 40);
+  if (selectedNodes.length < MAX_WORK_ITEMS) takePool(eligibleNodes, MAX_WORK_ITEMS - selectedNodes.length);
+  const visibleNodes = selectedNodes.slice(0, MAX_WORK_ITEMS);
 
   const initial = [];
   for (const el of visibleNodes) {
@@ -683,15 +985,24 @@ UI_SCAN_SCRIPT = r"""
     const y = Math.max(0, rect.top + window.scrollY);
     if (x > pageWidth || y > pageHeight) continue;
     const kind = kindOf(el);
-    const locator = generateLocators(el, kind);
+    const locators = generateLocators(el, kind);
+    const locator = locators.best;
     const score = elementScore(el, kind, locator, rect);
     initial.push({
       el,
       selector: locator.selector,
       selector_type: locator.type,
       stability: stability(locator.score),
-      score,
+      rank_score: score,
+      score: locator.score,
       name: buildName(el, kind),
+      semantic_label: semanticLabel(el, kind),
+      selector_options: locators.options,
+      scope_selector: locator.scopeSelector,
+      relative_selector: locator.relativeSelector,
+      match_mode: locator.matchMode || (Number(locator.matchCount || 0) > 1 ? "all" : "first"),
+      count_mode: "visible",
+      family_id: locator.familyId,
       text: visibleText(el).slice(0, 160),
       tag: el.tagName.toLowerCase(),
       role: roleOf(el),
@@ -706,6 +1017,7 @@ UI_SCAN_SCRIPT = r"""
   }
 
   const pruned = initial.filter((item) => {
+    if (item.semantic_label && (hasSemanticClass(item.el) || item.kind === "media" || headingTags.has(item.el.tagName))) return true;
     return !initial.some((other) => {
       if (item === other) return false;
       if (!item.el.contains(other.el)) return false;
@@ -716,18 +1028,34 @@ UI_SCAN_SCRIPT = r"""
   });
 
   const bySelector = new Map();
-  for (const item of pruned.sort((left, right) => right.score - left.score)) {
+  for (const item of pruned.sort((left, right) => right.rank_score - left.rank_score)) {
     if (!bySelector.has(item.selector)) bySelector.set(item.selector, item);
   }
 
+  function candidateFamily(item) {
+    const classSelector = stableClassSelector(item.el);
+    if (classSelector) return `${item.kind}:${item.el.tagName.toLowerCase()}${classSelector}`;
+    return `${item.kind}:${item.selector.replace(/:nth-(?:child|of-type)\(\d+\)/g, ":nth(*)")}`;
+  }
+
+  const familyCounts = new Map();
+  const familyLimited = [];
+  for (const item of Array.from(bySelector.values()).sort((left, right) => right.rank_score - left.rank_score)) {
+    const family = candidateFamily(item);
+    const count = familyCounts.get(family) || 0;
+    const limit = item.stability === "low" ? (item.kind === "interactive" ? 8 : 3) : MAX_RESULTS;
+    if (count >= limit) continue;
+    familyCounts.set(family, count + 1);
+    familyLimited.push(item);
+  }
+
   const nameCounts = new Map();
-  const output = Array.from(bySelector.values())
-    .sort((left, right) => right.score - left.score)
+  const output = familyLimited
     .slice(0, MAX_RESULTS)
-    .map(({ el, score, ...item }) => {
+    .map(({ el, rank_score, ...item }, index) => {
       const count = (nameCounts.get(item.name) || 0) + 1;
       nameCounts.set(item.name, count);
-      return { ...item, name: count === 1 ? item.name : `${item.name}_${count}`, score };
+      return { ...item, _rank_score: rank_score, candidate_id: `candidate-${index + 1}`, name: count === 1 ? item.name : `${item.name} ${count}` };
     });
 
   return {

@@ -294,6 +294,9 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true, 
     { key: "overview", label: "执行信息", children: overviewPanel },
     ...comparisonTab,
     ...assertionTab,
+    ...(!hasGroupResults && requestSnapshot !== null ? [{
+      key: "request", label: "请求", children: <StructuredViewer title="本次请求" value={requestSnapshot} defaultMode="json" />
+    }] : []),
     ...(!hasGroupResults ? [{ key: "evidence", label: "页面证据", children: <EvidencePanel run={run} diagnosticsEnabled={showDiagnostics} onOpenResponse={() => setActiveTab("response")} /> }] : []),
     ...(showDiagnostics ? [{ key: "logs", label: "日志", children: <StructuredViewer title="日志" value={run.logs} defaultMode="text" /> }] : []),
     ...errorTab

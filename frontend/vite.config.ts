@@ -3,27 +3,22 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { bundleBudget } from "./scripts/bundle-budget.mjs";
 
 const devApiTarget = process.env.VITE_DEV_API_TARGET || "http://127.0.0.1:8787";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), bundleBudget()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src")
     }
   },
   build: {
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          react: ["react", "react-dom", "react-router-dom"],
-          antd: ["antd"],
-          monaco: ["@monaco-editor/react", "monaco-editor"]
-        }
-      }
-    }
+    // Let Rollup retain route-level AntD boundaries. A package-wide manual
+    // chunk forces date pickers, tables and editors onto every initial route.
+    manifest: true
   },
   server: {
     proxy: {

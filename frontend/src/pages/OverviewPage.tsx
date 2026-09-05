@@ -1,60 +1,93 @@
-import { Alert, Button, Card, Empty, Space, Statistic, Table, Tag } from "antd";
+import { Alert, Button, Card, Descriptions, Empty, Space, Table, Tag, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import {
-  AlertTriangle,
-  BellRing,
-  Clock3,
-  History,
-  Play,
-  RotateCcw,
-  Settings2,
-  ShieldCheck,
-  Zap
-} from "lucide-react";
+import { History, Play, Settings2 } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
+import { useProject } from "../ProjectContext";
 import type { CheckType, Overview, OverviewTrend, OverviewTrendSeries, Run, RuntimeStatus, SettingsValues } from "../types";
 import { checkListPath, formatDate, formatDuration, runStatusLabel, runStatusTagColor } from "../utils";
 
 const RunDetailDrawer = lazy(() => import("../components/RunDetailDrawer").then((module) => ({ default: module.RunDetailDrawer })));
+const { Text } = Typography;
 
 export function OverviewPage() {
+  const { currentProject } = useProject();
+  const readOnly = currentProject.status === "archived";
   const location = useLocation();
   const [overview, setOverview] = useState<Overview | null>(null);
   const [settings, setSettings] = useState<SettingsValues | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [detailRunId, setDetailRunId] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [dynamicError, setDynamicError] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [runningId, setRunningId] = useState<number | null>(null);
   const navigate = useNavigate();
+  const error = actionError || dynamicError || settingsError;
 
-  async function load() {
+  async function loadDynamic() {
     try {
-      const [nextOverview, nextSettings, nextRuntime] = await Promise.all([api.overview(), api.settings(), api.runtime()]);
+      const [nextOverview, nextRuntime] = await Promise.all([api.overview(), api.runtime()]);
       setOverview(nextOverview);
-      setSettings(nextSettings);
       setRuntime(nextRuntime);
-      setError(null);
+      setDynamicError(null);
     } catch (err) {
-      setError((err as Error).message);
+      setDynamicError((err as Error).message);
+    }
+  }
+
+  async function loadSettings() {
+    try {
+      setSettings(await api.settings());
+      setSettingsError(null);
+    } catch (err) {
+      setSettingsError((err as Error).message);
     }
   }
 
   useEffect(() => {
-    load();
-    const timer = window.setInterval(load, 15000);
-    return () => window.clearInterval(timer);
+    let disposed = false;
+    let refreshing = false;
+    let timer: number | undefined;
+
+    const refreshAndSchedule = async () => {
+      if (disposed || refreshing || document.visibilityState !== "visible") return;
+      refreshing = true;
+      await loadDynamic();
+      refreshing = false;
+      if (!disposed && document.visibilityState === "visible") {
+        timer = window.setTimeout(refreshAndSchedule, 15000);
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+      if (document.visibilityState === "visible") void refreshAndSchedule();
+    };
+
+    void loadSettings();
+    void refreshAndSchedule();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, []);
 
   async function runNow(run: Run) {
     setRunningId(run.check_id);
+    setActionError(null);
     try {
       const latest = await api.runCheck(run.check_id);
       setDetailRunId(latest.id);
-      await load();
+      await loadDynamic();
     } catch (err) {
-      setError((err as Error).message);
+      setActionError((err as Error).message);
     } finally {
       setRunningId(null);
     }
@@ -93,7 +126,7 @@ export function OverviewPage() {
       render: (_, run) => (
         <Space>
           <Button size="small" title="查看详情" aria-label="查看详情" icon={<History size={15} />} onClick={() => setDetailRunId(run.id)} />
-          <Button size="small" title="立即执行" aria-label="立即执行" icon={<Play size={15} />} loading={runningId === run.check_id} onClick={() => runNow(run)} />
+          <Button size="small" title="立即执行" aria-label="立即执行" icon={<Play size={15} />} loading={runningId === run.check_id} disabled={readOnly} onClick={() => runNow(run)} />
         </Space>
       )
     }
@@ -103,78 +136,75 @@ export function OverviewPage() {
     <div className="page-content">
       {error && <Alert type="error" title={error} showIcon />}
 
-      <section className={`overview-command ${hasIncident ? "overview-command-danger" : ""}`}>
-        <div>
-          <h2>{hasIncident ? "存在需要处理的监控异常" : "当前监控面健康"}</h2>
-          <p>
-            {hasIncident
-              ? `故障 ${overview?.failing_count || 0}，疑似故障 ${overview?.suspected_failing_count || 0}，疑似恢复 ${overview?.suspected_recovery_count || 0}，无有效观测或过期 ${staleOrUnknownCount}。`
-              : `页面和接口监控正常，今日完成 ${overview?.today_runs ?? 0} 次定时观测。`}
-          </p>
-        </div>
-        <Button icon={<Settings2 size={16} />} onClick={() => navigate("/settings")}>
-          告警设置
-        </Button>
-      </section>
+      <div className="project-primary-grid overview-primary-grid">
+        <Card
+          title="项目状态"
+          extra={<Tag color={hasIncident ? "error" : "success"}>{hasIncident ? "需要处理" : "健康"}</Tag>}
+        >
+          <Descriptions
+            className="project-state-descriptions"
+            bordered
+            size="small"
+            column={2}
+            items={[
+              { key: "ui", label: "页面监控", children: overview?.ui_count ?? 0 },
+              { key: "api", label: "接口监控", children: overview?.api_count ?? 0 },
+              { key: "failing", label: "当前故障", children: <Text type={overview?.failing_count ? "danger" : undefined}>{overview?.failing_count ?? 0}</Text> },
+              { key: "confirming", label: "确认中", children: confirmingCount },
+              { key: "stale", label: "待观测/过期", children: staleOrUnknownCount },
+              { key: "today", label: "今日定时观测", children: overview?.today_runs ?? 0 },
+              { key: "latest", label: "最近执行", children: overview?.latest_run ? formatDate(overview.latest_run.started_at) : "未执行" },
+              {
+                key: "recovered",
+                label: "最近恢复",
+                children: overview?.latest_recovered ? `${overview.latest_recovered.name} · ${formatDate(overview.latest_recovered.last_success_at)}` : "暂无恢复"
+              }
+            ]}
+          />
+        </Card>
 
-      <section className="overview-status-grid">
-        <Card className={`metric-card metric-compact ${settings ? alertChannelMetricClass(settings) : ""}`}>
-          <span className="metric-icon"><BellRing size={17} /></span>
-          <Statistic title="告警通道" value={settings ? alertChannel(settings) : "-"} />
-          <div className="metric-detail">{settings ? alertChannelDetail(settings) : "-"}</div>
+        <Card
+          title="运行状态"
+          extra={
+            <Button icon={<Settings2 size={16} />} onClick={() => navigate("/projects/alerts")}>
+              项目告警
+            </Button>
+          }
+        >
+          <Descriptions
+            className="project-state-descriptions"
+            bordered
+            size="small"
+            column={1}
+            items={[
+              {
+                key: "alerts",
+                label: "告警渠道",
+                children: settings ? (
+                  <Space size={6} wrap>
+                    <Text>{alertChannel(settings)}</Text>
+                    <Text type="secondary">{alertChannelDetail(settings)}</Text>
+                  </Space>
+                ) : "-"
+              },
+              {
+                key: "scheduler",
+                label: "调度器",
+                children: runtime ? `${runtime.scheduler.running ? "运行中" : "未运行"} · ${runtime.scheduler.scheduled_checks} 个任务 · 逾期 ${runtime.scheduler.overdue_jobs}` : "-"
+              },
+              {
+                key: "workers",
+                label: "执行器",
+                children: runtime ? `${runtime.workers.running}/${runtime.workers.limit} · 排队 ${runtime.queue.queued} · 浏览器 ${runtime.browser.running}/${runtime.browser.limit}` : "-"
+              }
+            ]}
+          />
         </Card>
-        <Card className="metric-card metric-compact metric-info">
-          <span className="metric-icon"><Zap size={17} /></span>
-          <Statistic title="调度器" value={runtime?.scheduler.running ? "运行中" : "未运行"} />
-          <div className="metric-detail">
-            {runtime ? `${runtime.scheduler.scheduled_checks} 个定时任务，逾期 ${runtime.scheduler.overdue_jobs}` : "-"}
-          </div>
-        </Card>
-        <Card className="metric-card metric-compact">
-          <span className="metric-icon"><Zap size={17} /></span>
-          <Statistic title="执行器" value={runtime ? `${runtime.workers.running}/${runtime.workers.limit}` : "-"} />
-          <div className="metric-detail">{runtime ? `排队 ${runtime.queue.queued}，浏览器 ${runtime.browser.running}/${runtime.browser.limit}` : "-"}</div>
-        </Card>
-        <Card className="metric-card metric-compact">
-          <span className="metric-icon"><AlertTriangle size={17} /></span>
-          <Statistic title="无有效观测/过期" value={staleOrUnknownCount} />
-          <div className="metric-detail">无有效观测：尚未形成健康结论；过期：超过设定周期未更新</div>
-        </Card>
-      </section>
-
-      <section className="metric-grid">
-        <Card className="metric-card metric-info">
-          <span className="metric-icon"><ShieldCheck size={19} /></span>
-          <Statistic title="页面监控" value={overview?.ui_count ?? 0} />
-        </Card>
-        <Card className="metric-card metric-info">
-          <span className="metric-icon"><ShieldCheck size={19} /></span>
-          <Statistic title="接口监控" value={overview?.api_count ?? 0} />
-        </Card>
-        <Card className={`metric-card ${hasIncident ? "metric-danger" : "metric-success"}`}>
-          <span className="metric-icon"><AlertTriangle size={19} /></span>
-          <Statistic title="当前故障" value={overview?.failing_count ?? 0} />
-        </Card>
-        <Card className="metric-card">
-          <span className="metric-icon"><History size={19} /></span>
-          <Statistic title="今日定时观测" value={overview?.today_runs ?? 0} />
-        </Card>
-        <Card className="metric-card metric-wide">
-          <span className="metric-icon"><Clock3 size={19} /></span>
-          <Statistic title="最近执行" value={overview?.latest_run ? formatDate(overview.latest_run.started_at) : "未执行"} />
-        </Card>
-        <Card className="metric-card metric-wide">
-          <span className="metric-icon"><RotateCcw size={19} /></span>
-          <Statistic title="最近恢复" value={overview?.latest_recovered?.name || "暂无恢复"} />
-          {overview?.latest_recovered && <div className="metric-detail">{formatDate(overview.latest_recovered.last_success_at)}</div>}
-        </Card>
-      </section>
+      </div>
 
       {trends.length > 0 && (
-        <section className="trend-grid">
-          {trends.map((trend) => (
-            <TrendCard key={trend.key} trend={trend} />
-          ))}
+        <section className="trend-grid" aria-label="运行趋势">
+          {trends.map((trend) => <TrendCard key={trend.key} trend={trend} />)}
         </section>
       )}
 
@@ -204,10 +234,10 @@ export function OverviewPage() {
             runId={detailRunId}
             onClose={() => setDetailRunId(null)}
             returnTo={`${location.pathname}${location.search}`}
-            onRerun={async (run) => {
+            onRerun={readOnly ? undefined : async (run) => {
               const latest = await api.rerun(run.id);
               setDetailRunId(latest.id);
-              await load();
+              await loadDynamic();
             }}
           />
         </Suspense>
@@ -234,9 +264,7 @@ function TrendCard({ trend }: { trend: OverviewTrend }) {
             <span>P50</span>
             <span>P95</span>
           </div>
-          {trend.series.map((item) => (
-            <TrendSeriesRow key={item.check_type} item={item} />
-          ))}
+          {trend.series.map((item) => <TrendSeriesRow key={item.check_type} item={item} />)}
         </div>
       </div>
     </Card>
@@ -299,11 +327,6 @@ function alertChannelDetail(settings: SettingsValues): string {
   if (total === 0) return "暂无通知渠道";
   if (ready === 0) return "缺少启用且填写 URL 的渠道";
   return `${ready}/${total} 个渠道可发送`;
-}
-
-function alertChannelMetricClass(settings: SettingsValues): string {
-  if (!settings.alerts_enabled) return "";
-  return readyNotificationChannels(settings).length > 0 ? "metric-success" : "metric-warning";
 }
 
 function readyNotificationChannels(settings: SettingsValues) {

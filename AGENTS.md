@@ -52,6 +52,7 @@ npm run build
 - This is an operations console, not a marketing page. Avoid hero sections, decorative eyebrow labels, ornamental gradients, invented badges, and filler copy.
 - Inputs, buttons, menus, and clickable rows must have stable focus states and accessible labels or visible text.
 - Treat `PRODUCT.md` and `DESIGN.md` as the UI source of truth before changing product surfaces.
+- The console targets desktop/laptop browsers; phone viewport compatibility, phone-specific navigation, and phone visual acceptance are out of scope. This does not restrict UI probes' H5 page mode or mobile target viewports.
 - Do not use Inter as the default or only UI font. Use the functional UI, heading, numeric, and code font stacks from `frontend/src/styles.css`.
 - Do not use bounce or elastic easing. In particular, do not introduce `cubic-bezier(0.12, 0.4, 0.29, 1.46)`.
 - Do not animate layout properties such as `width`, `height`, `left`, or `right` for routine UI state. Prefer opacity, transform, color, and border-color.

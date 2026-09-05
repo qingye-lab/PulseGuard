@@ -27,7 +27,17 @@ WEBHOOK_TYPES = {"feishu", "wecom", "dingtalk"}
 
 
 async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: dict[str, Any]) -> None:
-    settings = storage.get_settings()
+    global_settings = storage.get_settings()
+    project_id = int(check.get("project_id") or run.get("project_id") or 0)
+    if project_id <= 0:
+        settings = global_settings
+    else:
+        project = storage.get_project(project_id)
+        if not project or project.get("status") != "active":
+            _record_notification(run, "disabled")
+            return
+        project_settings = storage.get_project_alert_settings(project_id)
+        settings = {**global_settings, **project_settings, "members": global_settings.get("members") or []}
     if not settings.get("alerts_enabled"):
         _record_notification(run, "disabled")
         return
@@ -330,6 +340,7 @@ def _system_notification_channels(settings: dict[str, Any]) -> list[dict[str, An
     if not isinstance(system_channel_ids, list) or not system_channel_ids:
         return []
     effective = dict(settings)
+    effective["notification_channels"] = settings.get("system_notification_channels") or []
     effective["notification_channel_ids"] = system_channel_ids
     return _notification_channels(effective, enabled_only=True, require_webhook=True)
 
@@ -575,7 +586,11 @@ def _run_detail_url(check: dict[str, Any], run: dict[str, Any], settings: dict[s
     check_id = check.get("id")
     if not base_url or run_id is None or check_id is None:
         return ""
-    query = urlencode({"from": f"/runs?check_id={check_id}"})
+    project_id = run.get("project_id") or check.get("project_id")
+    query_values: dict[str, Any] = {"from": f"/runs?check_id={check_id}"}
+    if project_id is not None:
+        query_values["project_id"] = int(project_id)
+    query = urlencode(query_values)
     return f"{base_url}/runs/{run_id}?{query}"
 
 

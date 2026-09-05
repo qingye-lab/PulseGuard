@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import subprocess
+from contextlib import closing
 from pathlib import Path
 
 from .config import DB_PATH, RELAY_CERT_FILE, RELAY_KEY_FILE
@@ -49,7 +50,7 @@ def _has_existing_relay_runners() -> bool:
     if not DB_PATH.exists():
         return False
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with closing(sqlite3.connect(f"{DB_PATH.resolve().as_uri()}?mode=ro", uri=True)) as conn:
             table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'probe_runners'"
             ).fetchone()

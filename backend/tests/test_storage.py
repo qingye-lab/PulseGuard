@@ -12,6 +12,50 @@ from backend.app import artifacts, storage
 
 
 class OverviewStorageTests(unittest.TestCase):
+    def test_database_health_reports_reclaimable_space_without_mutating_database(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            before = Path(storage.DB_PATH).read_bytes()
+
+            health = storage.get_database_health()
+
+            after = Path(storage.DB_PATH).read_bytes()
+
+        self.assertEqual(health["status"], "normal")
+        self.assertEqual(health["journal_mode"], "wal")
+        self.assertGreater(health["page_size_bytes"], 0)
+        self.assertGreater(health["page_count"], 0)
+        self.assertGreaterEqual(health["freelist_pages"], 0)
+        self.assertGreaterEqual(health["estimated_used_bytes"], 0)
+        self.assertGreaterEqual(health["reclaimable_bytes"], 0)
+        self.assertFalse(health["maintenance_recommended"])
+        self.assertEqual(after, before)
+
+    def test_database_health_recommends_maintenance_only_when_both_thresholds_are_met(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            with storage._connect() as conn:
+                conn.execute("CREATE TABLE maintenance_pressure(payload BLOB)")
+                conn.executemany(
+                    "INSERT INTO maintenance_pressure(payload) VALUES (zeroblob(8192))",
+                    [() for _ in range(32)],
+                )
+                conn.execute("DROP TABLE maintenance_pressure")
+
+            with patch.object(storage, "DATABASE_MAINTENANCE_MIN_RECLAIMABLE_BYTES", 1), patch.object(
+                storage, "DATABASE_MAINTENANCE_MIN_RECLAIMABLE_RATIO", 0.0
+            ):
+                health = storage.get_database_health()
+
+        self.assertGreater(health["reclaimable_bytes"], 0)
+        self.assertGreater(health["reclaimable_ratio"], 0)
+        self.assertTrue(health["maintenance_recommended"])
+        self.assertEqual(health["status"], "attention")
+
     def test_overview_excludes_draft_runs_from_task_level_metrics(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
@@ -330,7 +374,7 @@ class CheckAlertPolicyStorageTests(unittest.TestCase):
         self.assertEqual(loaded["browser_selection_mode"], "round_robin_all")
         self.assertEqual(loaded["browser_types"], ["firefox", "chromium"])
 
-    def test_legacy_check_rows_receive_empty_alert_policy_json_on_migration(self) -> None:
+    def test_legacy_check_rows_require_explicit_project_migration(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
         ):
@@ -387,11 +431,10 @@ class CheckAlertPolicyStorageTests(unittest.TestCase):
                     ),
                 )
 
-            storage.init_db()
-            loaded = storage.get_check(1)
+            with self.assertRaisesRegex(RuntimeError, "migrate-projects.py --apply"):
+                storage.init_db()
 
-        self.assertIsNotNone(loaded)
-        self.assertEqual(loaded["alert_policy_json"], "{}")
+        self.assertTrue(db_path.exists())
 
     def test_member_settings_support_multiple_channels_and_prune_deleted_task_references(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
@@ -1865,14 +1908,17 @@ def insert_trend_run(
     timestamp = started_at.isoformat(timespec="seconds")
     finished_at = None if status in {"pending", "running"} else timestamp
     with storage._connect() as conn:
+        project_row = conn.execute("SELECT project_id FROM checks WHERE id = ?", (check_id,)).fetchone()
+        project_id = int(project_row["project_id"]) if project_row else storage.default_project_id()
         conn.execute(
             """
             INSERT INTO runs (
-                check_id, check_name, check_type, status, started_at, finished_at,
+                project_id, check_id, check_name, check_type, status, started_at, finished_at,
                 duration_ms, failure_kind, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                project_id,
                 check_id,
                 "Trend UI" if check_type == "ui" else "Trend API",
                 check_type,

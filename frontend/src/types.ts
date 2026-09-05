@@ -20,6 +20,15 @@ export type ObservationKind = "observation" | "verification" | "draft";
 export type WebhookType = "feishu" | "wecom" | "dingtalk";
 export type ConfigBundle = Record<string, unknown>;
 export type CheckBatchAction = "enable" | "disable" | "run";
+
+export interface Project {
+  id: number;
+  name: string;
+  status: "active" | "archived";
+  archived: boolean;
+  created_at: string;
+  updated_at: string;
+}
 export interface AlertPolicy {
   alert_cooldown_minutes?: number;
   recovery_notification?: boolean;
@@ -46,6 +55,8 @@ export type ApiAssertionType =
 export type ApiJsonValueType = "string" | "number" | "boolean" | "object" | "array" | "null";
 export type ApiLengthOperator = "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
 export type SelectorStability = "high" | "medium" | "low";
+export type UiSelectorMatchMode = "first" | "all" | "every_scope";
+export type UiSelectorCountMode = "attached" | "visible";
 export type UiAssertionType =
   | "element_visible"
   | "element_hidden"
@@ -80,6 +91,11 @@ export interface UiAssertion {
   selector_type?: string;
   selector_stability?: SelectorStability;
   selector_score?: number;
+  scope_selector?: string;
+  relative_selector?: string;
+  match_mode?: UiSelectorMatchMode;
+  count_mode?: UiSelectorCountMode;
+  frame_path?: number[];
   expected_text?: string;
   operator?: UiCountOperator;
   expected_count?: number;
@@ -136,6 +152,7 @@ export interface UiRuleInspectItem {
 }
 
 export interface UiRuleInspectResult {
+  diagnostics?: UiInspectionDiagnostics;
   title: string;
   url: string;
   results: UiRuleInspectItem[];
@@ -143,11 +160,20 @@ export interface UiRuleInspectResult {
 }
 
 export interface UiElementCandidate {
+  candidate_id?: string;
   name?: string;
+  semantic_label?: string;
   selector: string;
   selector_type?: string;
   stability?: SelectorStability;
   score?: number;
+  selector_options?: UiSelectorOption[];
+  scope_selector?: string;
+  relative_selector?: string;
+  match_mode?: UiSelectorMatchMode;
+  count_mode?: UiSelectorCountMode;
+  family_id?: string;
+  frame_path?: number[];
   text: string;
   tag: string;
   role: string;
@@ -160,7 +186,23 @@ export interface UiElementCandidate {
   };
 }
 
+export interface UiSelectorOption {
+  selector: string;
+  selector_type: string;
+  stability?: SelectorStability;
+  score?: number;
+  unique?: boolean;
+  match_count?: number | null;
+  scope_selector?: string;
+  relative_selector?: string;
+  match_mode?: UiSelectorMatchMode;
+  count_mode?: UiSelectorCountMode;
+  family_id?: string;
+  frame_path?: number[];
+}
+
 export interface UiInspectResult {
+  diagnostics?: UiInspectionDiagnostics;
   title: string;
   url: string;
   viewport: {
@@ -175,7 +217,21 @@ export interface UiInspectResult {
   screenshot: string;
 }
 
+export interface UiInspectionDiagnostics {
+  stage: string;
+  status: "ok" | "failed";
+  message?: string | null;
+  error_type?: string | null;
+  url_variables: Record<string, "available" | "missing">;
+  variables: Record<string, string>;
+  request: unknown;
+  http_requests: unknown[];
+  logs: string;
+  cleanup_error?: string;
+}
+
 export interface Check {
+  project_id: number;
   id: number;
   name: string;
   type: CheckType;
@@ -485,6 +541,7 @@ export interface StatusPageIncident {
 
 export interface Run {
   id: number;
+  project_id: number;
   check_id: number;
   check_name: string;
   check_type: CheckType;
@@ -623,6 +680,7 @@ export interface SettingsValues {
   system_alerts_enabled: boolean;
   alert_detail_base_url: string;
   notification_channels: NotificationChannel[];
+  system_notification_channels: NotificationChannel[];
   execution_notification_channel_ids: string[];
   system_notification_channel_ids: string[];
   members: Member[];
@@ -706,10 +764,25 @@ export interface DatabaseBackup {
   created_at: string;
 }
 
+export interface DatabaseHealth {
+  status: "normal" | "attention";
+  file_size_bytes: number;
+  wal_size_bytes: number;
+  page_size_bytes: number;
+  page_count: number;
+  freelist_pages: number;
+  estimated_used_bytes: number;
+  reclaimable_bytes: number;
+  reclaimable_ratio: number;
+  journal_mode: string;
+  maintenance_recommended: boolean;
+}
+
 export interface ReadOnlyToken {
   id: string;
   name: string;
   created_at: string;
+  project_ids: number[];
 }
 
 export interface CreatedReadOnlyToken extends ReadOnlyToken {
@@ -725,6 +798,17 @@ export interface NotificationChannel {
   dingtalk_secret?: string;
   dingtalk_secret_set?: boolean;
   dingtalk_secret_clear?: boolean;
+}
+
+export interface ProjectAlertSettings {
+  project_id: number;
+  alerts_enabled: boolean;
+  notification_channels: NotificationChannel[];
+  execution_notification_channel_ids: string[];
+  alert_tag_policies: AlertTagPolicy[];
+  alert_cooldown_minutes: number;
+  recovery_notification: boolean;
+  updated_at: string;
 }
 
 export interface Member {
@@ -811,6 +895,7 @@ export interface ConfigImportSummary {
 export type CheckPayload = Omit<
   Check,
   | "id"
+  | "project_id"
   | "created_at"
   | "updated_at"
   | "current_status"

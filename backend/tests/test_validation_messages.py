@@ -6,11 +6,20 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 
+from backend.app import main as main_module
 from backend.app.main import _format_validation_errors, app
 from backend.app.schemas import CheckCreate, normalize_settings_values
 
 
 class ValidationMessageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        app.dependency_overrides[main_module._project_context] = lambda: 1
+        app.dependency_overrides[main_module._active_project_context] = lambda: 1
+
+    def tearDown(self) -> None:
+        app.dependency_overrides.pop(main_module._project_context, None)
+        app.dependency_overrides.pop(main_module._active_project_context, None)
+
     def test_format_validation_errors_uses_user_facing_field_labels(self) -> None:
         message = _format_validation_errors(
             [

@@ -9,12 +9,13 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from . import storage
-from .defaults import DEFAULT_SETTINGS
-from .schemas import CheckCreate
+from .defaults import DEFAULT_PROJECT_ALERT_SETTINGS, DEFAULT_SETTINGS
+from .schemas import CheckCreate, normalize_project_alert_settings_values, normalize_settings_values
 from .variables import is_sensitive_variable_name, mask_data
 
 
-EXPORT_SCHEMA_VERSION = 3
+EXPORT_SCHEMA_VERSION = 4
+PROJECT_EXPORT_SCHEMA_VERSION = 1
 CHECK_EXPORT_FIELDS = (
     "name",
     "type",
@@ -41,7 +42,6 @@ CHECK_EXPORT_FIELDS = (
 def export_config(redact: bool = True) -> dict[str, Any]:
     settings = storage.get_settings()
     export_settings = _export_settings(settings, redact=redact)
-    export_checks = [_export_check(check, settings, redact=redact) for check in storage.list_checks()]
     export_runners = [_export_runner(runner, redact=redact) for runner in storage.list_probe_runners()]
     return {
         "schema": "pulseguard.config",
@@ -50,7 +50,6 @@ def export_config(redact: bool = True) -> dict[str, Any]:
         "redacted": redact,
         "settings": export_settings,
         "runners": export_runners,
-        "checks": export_checks,
     }
 
 
@@ -58,20 +57,14 @@ def preview_import(bundle: dict[str, Any]) -> dict[str, Any]:
     parsed = _parse_bundle(bundle)
     issues = parsed["issues"]
     warnings = parsed["warnings"]
-    existing_names = {str(check.get("name") or "") for check in storage.list_checks()}
-    conflicts = [check["name"] for check in parsed["checks"] if check["name"] in existing_names]
-    for name in conflicts:
-        warnings.append(f"任务名称已存在，导入时将自动改名：{name}")
 
     return {
         "valid": not issues,
         "issues": issues,
         "warnings": warnings,
         "counts": {
-            "checks": len(parsed["checks"]),
             "runners": len(parsed.get("runners", [])),
             "settings": len(parsed["settings"]),
-            "conflicts": len(conflicts),
         },
         "summary": {
             "schema": parsed["schema"],
@@ -104,33 +97,123 @@ def apply_import(bundle: dict[str, Any], *, replace_existing: bool = False) -> d
             storage.create_probe_runner(runner_payload, generate_token=not bool(runner.get("_missing_token")))
         imported_runners += 1
 
-    existing = {str(check.get("name") or ""): check for check in storage.list_checks()}
-    created = 0
-    updated = 0
-    renamed = 0
-    imported_checks: list[dict[str, Any]] = []
-    used_names = set(existing)
+    return {
+        "ok": True,
+        "settings_updated": updated_settings,
+        "runners_imported": imported_runners,
+    }
 
+
+def export_project(project_id: int, redact: bool = True) -> dict[str, Any]:
+    project = storage.get_project(project_id)
+    if not project:
+        raise ValueError("项目不存在")
+    settings = storage.settings_for_project(storage.get_settings(), project_id)
+    alerts = storage.get_project_alert_settings(project_id)
+    export_alerts = deepcopy(
+        {key: alerts.get(key, default) for key, default in DEFAULT_PROJECT_ALERT_SETTINGS.items()}
+    )
+    if redact:
+        export_alerts["notification_channels"] = [
+            _redact_channel(channel) for channel in export_alerts.get("notification_channels") or []
+        ]
+        export_alerts["alert_tag_policies"] = [
+            {key: value for key, value in policy.items() if key != "member_ids"}
+            for policy in export_alerts.get("alert_tag_policies") or []
+            if isinstance(policy, dict)
+        ]
+    return {
+        "schema": "pulseguard.project",
+        "version": PROJECT_EXPORT_SCHEMA_VERSION,
+        "exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "redacted": redact,
+        "project": {"name": project["name"]},
+        "alerts": export_alerts,
+        "variables": [
+            _redact_variable(item) if redact else item
+            for item in storage.get_project_variables(project_id)
+        ],
+        "checks": [
+            _export_check(check, settings, redact=redact)
+            for check in storage.list_checks(project_id=project_id)
+        ],
+    }
+
+
+def preview_project_import(bundle: dict[str, Any], project_id: int) -> dict[str, Any]:
+    parsed = _parse_project_bundle(bundle)
+    issues = parsed["issues"]
+    warnings = parsed["warnings"]
+    existing_names = {
+        str(check.get("name") or "") for check in storage.list_checks(project_id=project_id)
+    }
+    conflicts = [check["name"] for check in parsed["checks"] if check["name"] in existing_names]
+    for name in conflicts:
+        warnings.append(f"当前项目已存在同名任务，导入时将自动改名：{name}")
+    _validate_project_references(parsed, issues)
+    return {
+        "valid": not issues,
+        "issues": issues,
+        "warnings": warnings,
+        "counts": {
+            "checks": len(parsed["checks"]),
+            "settings": len(parsed["alerts"]),
+            "conflicts": len(conflicts),
+        },
+        "summary": {
+            "schema": parsed["schema"],
+            "version": parsed["version"],
+            "redacted": bool(bundle.get("redacted", False)) if isinstance(bundle, dict) else False,
+        },
+    }
+
+
+def apply_project_import(
+    bundle: dict[str, Any], project_id: int, *, replace_existing: bool = False
+) -> dict[str, Any]:
+    with storage.write_transaction():
+        return _apply_project_import(bundle, project_id, replace_existing=replace_existing)
+
+
+def _apply_project_import(
+    bundle: dict[str, Any], project_id: int, *, replace_existing: bool
+) -> dict[str, Any]:
+    preview = preview_project_import(bundle, project_id)
+    if not preview["valid"]:
+        raise ValueError("导入预检失败：" + "；".join(preview["issues"]))
+    parsed = _parse_project_bundle(bundle)
+    existing = {
+        str(check.get("name") or ""): check for check in storage.list_checks(project_id=project_id)
+    }
+    used_names = set(existing)
+    created = updated = renamed = 0
+    imported_checks: list[dict[str, Any]] = []
     for check in parsed["checks"]:
         payload = dict(check)
         existing_check = existing.get(payload["name"])
         if replace_existing and existing_check is not None:
-            saved = storage.update_check(int(existing_check["id"]), payload)
+            saved = storage.update_check(int(existing_check["id"]), payload, project_id=project_id)
             updated += 1
         else:
             if payload["name"] in used_names:
                 payload["name"] = _unique_import_name(payload["name"], used_names)
                 renamed += 1
-            saved = storage.create_check(payload)
+            saved = storage.create_check(payload, project_id=project_id)
             created += 1
         used_names.add(payload["name"])
-        if saved is not None:
-            imported_checks.append({"id": saved.get("id"), "name": saved.get("name"), "type": saved.get("type")})
-
+        if saved:
+            storage.record_check_version(saved, "imported")
+            imported_checks.append({"id": saved["id"], "name": saved["name"], "type": saved["type"]})
+    # Validate channels against the final task set, including untouched tasks.
+    # Any failure rolls tasks, versions, variables and alerts back together.
+    if "variables" in bundle:
+        storage.update_project_variables(project_id, parsed["variables"])
+    if parsed["alerts"]:
+        storage.update_project_alert_settings(project_id, parsed["alerts"])
     return {
         "ok": True,
-        "settings_updated": updated_settings,
-        "runners_imported": imported_runners,
+        "project_id": project_id,
+        "alerts_updated": bool(parsed["alerts"]),
         "checks_created": created,
         "checks_updated": updated,
         "checks_renamed": renamed,
@@ -143,7 +226,9 @@ def _export_settings(settings: dict[str, Any], *, redact: bool) -> dict[str, Any
     if not redact:
         return exported
 
-    exported["notification_channels"] = [_redact_channel(channel) for channel in exported.get("notification_channels") or []]
+    exported["system_notification_channels"] = [
+        _redact_channel(channel) for channel in exported.get("system_notification_channels") or []
+    ]
     exported["members"] = []
     exported["environment_variables"] = [_redact_variable(variable) for variable in exported.get("environment_variables") or []]
     exported["read_only_token"] = ""
@@ -214,14 +299,16 @@ def _parse_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     issues: list[str] = []
     warnings: list[str] = []
     if not isinstance(bundle, dict):
-        return {"schema": "", "version": None, "settings": {}, "runners": [], "checks": [], "issues": ["导入内容必须是 JSON Object"], "warnings": warnings}
+        return {"schema": "", "version": None, "settings": {}, "runners": [], "issues": ["导入内容必须是 JSON Object"], "warnings": warnings}
 
     schema = str(bundle.get("schema") or "")
-    if schema and schema != "pulseguard.config":
-        warnings.append(f"导入文件 schema 不是 pulseguard.config：{schema}")
+    if schema != "pulseguard.config":
+        issues.append("系统配置包 schema 必须是 pulseguard.config")
     version = bundle.get("version")
-    if version not in {None, EXPORT_SCHEMA_VERSION}:
-        warnings.append(f"导入文件版本为 {version}，当前按兼容模式处理")
+    if version != EXPORT_SCHEMA_VERSION:
+        issues.append(
+            f"系统配置包版本必须是 v{EXPORT_SCHEMA_VERSION}；旧 v3 总包请在迁移后重新导出系统包和项目包"
+        )
 
     raw_settings = bundle.get("settings") or {}
     settings: dict[str, Any] = {}
@@ -238,28 +325,8 @@ def _parse_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
             except ValueError as exc:
                 issues.append(str(exc))
 
-    raw_checks = bundle.get("checks") or []
-    checks: list[dict[str, Any]] = []
-    if raw_checks:
-        if not isinstance(raw_checks, list):
-            issues.append("checks 必须是 JSON Array")
-        else:
-            seen_names: set[str] = set()
-            for index, raw_check in enumerate(raw_checks, start=1):
-                if not isinstance(raw_check, dict):
-                    issues.append(f"第 {index} 个任务格式不正确")
-                    continue
-                payload = _check_payload(raw_check)
-                try:
-                    normalized = CheckCreate.model_validate(payload).model_dump()
-                except ValidationError as exc:
-                    detail = "; ".join(str(item.get("msg") or "") for item in exc.errors())
-                    issues.append(f"第 {index} 个任务无效：{detail}")
-                    continue
-                if normalized["name"] in seen_names:
-                    warnings.append(f"导入文件内任务名称重复，导入时将自动改名：{normalized['name']}")
-                seen_names.add(normalized["name"])
-                checks.append(normalized)
+    if "checks" in bundle or "alerts" in bundle or "project" in bundle:
+        issues.append("系统配置包不能包含项目任务或项目告警")
 
     return {
         "schema": schema or "pulseguard.config",
@@ -269,13 +336,109 @@ def _parse_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
             bundle.get("runners") or [],
             issues,
             warnings,
-            allow_legacy_insecure_http=version is None
-            or (isinstance(version, int) and not isinstance(version, bool) and version < EXPORT_SCHEMA_VERSION),
+            allow_legacy_insecure_http=False,
         ),
+        "issues": issues,
+        "warnings": warnings,
+    }
+
+
+def _parse_project_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    issues: list[str] = []
+    warnings: list[str] = []
+    if not isinstance(bundle, dict):
+        return {
+            "schema": "",
+            "version": None,
+            "alerts": {},
+            "checks": [],
+            "issues": ["导入内容必须是 JSON Object"],
+            "warnings": warnings,
+        }
+    schema = str(bundle.get("schema") or "")
+    version = bundle.get("version")
+    if schema != "pulseguard.project":
+        issues.append("项目配置包 schema 必须是 pulseguard.project")
+    if version != PROJECT_EXPORT_SCHEMA_VERSION:
+        issues.append(f"项目配置包版本必须是 v{PROJECT_EXPORT_SCHEMA_VERSION}")
+    if "settings" in bundle or "runners" in bundle:
+        issues.append("项目配置包不能包含全局设置或 Runner")
+
+    raw_alerts = bundle.get("alerts") or {}
+    alerts: dict[str, Any] = {}
+    if not isinstance(raw_alerts, dict):
+        issues.append("alerts 必须是 JSON Object")
+    else:
+        try:
+            alerts = normalize_project_alert_settings_values(raw_alerts)
+        except ValueError as exc:
+            issues.append(str(exc))
+
+    variables: list[dict[str, Any]] = []
+    try:
+        variables = normalize_settings_values({"environment_variables": bundle.get("variables", [])})["environment_variables"]
+    except ValueError as exc:
+        issues.append(str(exc))
+    checks: list[dict[str, Any]] = []
+    raw_checks = bundle.get("checks") or []
+    if not isinstance(raw_checks, list):
+        issues.append("checks 必须是 JSON Array")
+    else:
+        seen_names: set[str] = set()
+        for index, raw_check in enumerate(raw_checks, start=1):
+            if not isinstance(raw_check, dict):
+                issues.append(f"第 {index} 个任务格式不正确")
+                continue
+            payload = _check_payload(raw_check)
+            try:
+                normalized = CheckCreate.model_validate(payload).model_dump()
+            except ValidationError as exc:
+                detail = "; ".join(str(item.get("msg") or "") for item in exc.errors())
+                issues.append(f"第 {index} 个任务无效：{detail}")
+                continue
+            if normalized["name"] in seen_names:
+                warnings.append(f"导入文件内任务名称重复，导入时将自动改名：{normalized['name']}")
+            seen_names.add(normalized["name"])
+            checks.append(normalized)
+    return {
+        "schema": schema,
+        "version": version,
+        "alerts": alerts,
+        "variables": variables,
         "checks": checks,
         "issues": issues,
         "warnings": warnings,
     }
+
+
+def _validate_project_references(parsed: dict[str, Any], issues: list[str]) -> None:
+    member_ids = {
+        str(member.get("id") or "")
+        for member in storage.get_settings().get("members", [])
+        if isinstance(member, dict) and member.get("id")
+    }
+    channel_ids = {
+        str(channel.get("id") or "")
+        for channel in parsed.get("alerts", {}).get("notification_channels", [])
+        if isinstance(channel, dict) and channel.get("id")
+    }
+    missing_members: set[str] = set()
+    missing_channels: set[str] = set()
+    for check in parsed.get("checks", []):
+        try:
+            policy = json.loads(str(check.get("alert_policy_json") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(policy, dict):
+            continue
+        missing_members.update(str(item) for item in policy.get("member_ids", []) if str(item) not in member_ids)
+        missing_channels.update(
+            str(item) for item in policy.get("notification_channel_ids", []) if str(item) not in channel_ids
+        )
+    if missing_members:
+        issues.append("项目包引用了全局通讯录中不存在的成员：" + "、".join(sorted(missing_members)))
+    if missing_channels:
+        issues.append("项目包引用了不存在的项目通知渠道：" + "、".join(sorted(missing_channels)))
 
 
 def _parse_runners(

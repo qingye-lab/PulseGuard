@@ -8,7 +8,8 @@ param(
     [string]$UvVersion = "0.9.30",
     [switch]$SkipTests,
     [switch]$SkipFrontendBuild,
-    [switch]$SkipBrowserInstall
+    [switch]$SkipBrowserInstall,
+    [switch]$PreflightOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,9 +67,32 @@ $payload = Join-Path $tempRoot "pulseguard-source.tar.gz"
 $remoteDeployId = [guid]::NewGuid().ToString("N")
 $remotePayload = "/tmp/pulseguard-source-$remoteDeployId.tar.gz"
 $remoteScript = "/tmp/apply-china-systemd-deploy-$remoteDeployId.sh"
+$originalProcessEnvironment = @{}
+foreach ($name in @("DISPLAY", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "PULSEGUARD_SSH_PASSWORD")) {
+    $originalProcessEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+}
 
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+if (-not [string]::IsNullOrWhiteSpace($remote.password)) {
+    $askPassPath = Join-Path $tempRoot "ssh-askpass.cmd"
+    $askPassBody = "@echo off`r`npowershell.exe -NoProfile -NonInteractive -Command `"[Console]::Out.Write(`$env:PULSEGUARD_SSH_PASSWORD)`"`r`n"
+    [IO.File]::WriteAllText($askPassPath, $askPassBody, [Text.Encoding]::ASCII)
+    $env:DISPLAY = "pulseguard-ssh-askpass"
+    $env:SSH_ASKPASS = $askPassPath
+    $env:SSH_ASKPASS_REQUIRE = "force"
+    $env:PULSEGUARD_SSH_PASSWORD = $remote.password
+}
 try {
+    Write-Host "Checking remote host capacity, services, listeners, images, and recent logs."
+    Invoke-Native -File "ssh" -Arguments @(
+        "-o", "ConnectTimeout=12",
+        "-o", "NumberOfPasswordPrompts=1",
+        $target,
+        "hostname; uname -sr; df -h / /tmp /opt; systemctl is-active pulseguard.service pulseguard-relay.service; ss -ltnp | grep -E ':(8787|9443) ' || true; docker image inspect node:22-bookworm ghcr.io/astral-sh/uv:0.9.30 mcr.microsoft.com/playwright/python:v1.49.1-noble python:3.12-alpine --format '{{.RepoTags}} {{.Id}}' 2>/dev/null || true; /opt/pulseguard/.venv/bin/python -m playwright --version 2>/dev/null || true; find /root/.cache/ms-playwright -maxdepth 1 -type d -name 'chromium-*' -printf '%f`n' 2>/dev/null | tail -n 5; journalctl -u pulseguard.service -u pulseguard-relay.service --since=-3min --reverse --no-pager -n 80"
+    )
+    if ($PreflightOnly) {
+        return
+    }
     Push-Location $repoRoot
     try {
         if (-not $SkipTests) {
@@ -186,6 +210,7 @@ PY
     "`${remote_root}/.venv/bin/python" - <<'PY'
 from app import storage
 
+storage.migrate_projects(apply=True)
 storage.init_db()
 print("database migration preflight passed")
 PY
@@ -199,7 +224,57 @@ if [ "`${browser_install}" = "1" ]; then
 fi
 
 systemctl stop pulseguard.service pulseguard-relay.service 2>/dev/null || true
-tar -czf "/opt/pulseguard-backups/source-before-deploy-`${stamp}.tar.gz" -C "`${remote_root}" --exclude=data --exclude=reports --exclude=.venv . 2>/dev/null || true
+source_backup="/opt/pulseguard-backups/source-before-deploy-`${stamp}.tar.gz"
+cutover_backup_db="/opt/pulseguard-backups/pulseguard-before-cutover-`${stamp}.db"
+cutover_db="`${work}/pulseguard-cutover.db"
+tar -czf "`${source_backup}" -C "`${remote_root}" --exclude=data --exclude=reports --exclude=.venv . 2>/dev/null || true
+echo "source backup ready: `${source_backup}"
+if [ -f "`${active_db}" ]; then
+  "`${remote_root}/.venv/bin/python" - "`${active_db}" "`${cutover_backup_db}" "`${cutover_db}" <<'PY'
+import hashlib
+import shutil
+import sqlite3
+import sys
+from pathlib import Path
+
+source_path, backup_path, cutover_path = map(Path, sys.argv[1:4])
+with sqlite3.connect(source_path, timeout=30) as source, sqlite3.connect(backup_path) as backup:
+    source.execute("PRAGMA busy_timeout=30000")
+    source.backup(backup)
+shutil.copy2(backup_path, cutover_path)
+with backup_path.open("rb") as backup_file:
+    digest = hashlib.file_digest(backup_file, "sha256").hexdigest()
+print(f"cutover database backup ready: {backup_path} sha256={digest}")
+PY
+  set +e
+  PULSEGUARD_DB_PATH="`${cutover_db}" \
+  PULSEGUARD_DATA_DIR="`${work}/cutover-data" \
+  PULSEGUARD_REPORTS_DIR="`${work}/cutover-reports" \
+  PULSEGUARD_BACKUPS_DIR="`${work}/cutover-backups" \
+  PULSEGUARD_RUNNER_TOKEN_KEY_FILE="`${remote_root}/data/runner-token.key" \
+  PYTHONPATH="`${work}/backend" \
+    "`${remote_root}/.venv/bin/python" - <<'PY'
+import sqlite3
+
+from app import storage
+
+result = storage.migrate_projects(apply=True)
+storage.init_db()
+with sqlite3.connect(storage.DB_PATH, timeout=30) as conn:
+    checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+print(f"database cutover checkpoint passed: {checkpoint}")
+print(f"database cutover migration passed: state={result['state']} applied={result['applied']}")
+PY
+  migration_status=`$?
+  set -e
+  if [ "`${migration_status}" -ne 0 ]; then
+    echo "database cutover migration failed; active database was not replaced" >&2
+    systemctl start pulseguard.service pulseguard-relay.service 2>/dev/null || true
+    exit "`${migration_status}"
+  fi
+  rm -f "`${active_db}-wal" "`${active_db}-shm" "`${cutover_db}-wal" "`${cutover_db}-shm"
+  mv "`${cutover_db}" "`${active_db}"
+fi
 find "`${remote_root}" -mindepth 1 -maxdepth 1 ! -name data ! -name reports ! -name .venv -exec rm -rf {} +
 tar -xzf "`${payload}" -C "`${remote_root}"
 cat > "`${remote_root}/.env" <<EOF_ENV
@@ -288,5 +363,14 @@ rm -rf "`${work}" "`${payload}" "`${remote_script}"
     throw "PulseGuard did not become healthy within 120 seconds: $remoteUrl"
 }
 finally {
+    foreach ($name in $originalProcessEnvironment.Keys) {
+        $value = $originalProcessEnvironment[$name]
+        if ($null -eq $value) {
+            [Environment]::SetEnvironmentVariable($name, $null, "Process")
+        }
+        else {
+            [Environment]::SetEnvironmentVariable($name, $value, "Process")
+        }
+    }
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

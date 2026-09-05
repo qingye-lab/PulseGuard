@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -24,11 +23,7 @@ class FakeRunner:
 
 class FakeScheduler:
     def __init__(self) -> None:
-        self.synced_check_ids: list[int] = []
         self.refresh_count = 0
-
-    def sync_check(self, check_id: int) -> None:
-        self.synced_check_ids.append(check_id)
 
     def refresh_all(self) -> None:
         self.refresh_count += 1
@@ -40,6 +35,8 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.db_patch = patch.object(storage, "DB_PATH", Path(self.temp_dir.name) / "pulseguard.db")
         self.db_patch.start()
         storage.init_db()
+        self.project_id = storage.default_project_id()
+        self.headers = {"X-PulseGuard-Project-Id": str(self.project_id)}
 
         self.runner = FakeRunner()
         self.scheduler = FakeScheduler()
@@ -55,333 +52,250 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.db_patch.stop()
         self.temp_dir.cleanup()
 
-    def test_export_contains_transfer_envelope_and_redacts_secret_values_by_default(self) -> None:
-        task_policy = {
-            "alert_cooldown_minutes": 15,
-            "recovery_notification": False,
-            "notification_channel_ids": ["ding"],
-            "member_ids": ["alice"],
-        }
-        tag_policy = {
-            "id": "critical-api",
-            "name": "Critical API",
-            "tag": "critical",
-            "enabled": True,
-            "alert_cooldown_minutes": 10,
-            "recovery_notification": False,
-            "notification_channel_ids": ["ding"],
-        }
+    def test_system_export_v4_contains_only_global_settings_and_runners(self) -> None:
         storage.update_settings(
             {
-                "alerts_enabled": True,
-                "notification_channels": [
+                "members": [{"id": "alice", "name": "Alice", "feishu_open_id": "ou-secret"}],
+                "environment_variables": [
+                    {"id": "secret", "name": "SERVICE_TOKEN", "value": "token-secret", "secret": True}
+                ],
+                "system_notification_channels": [
                     {
-                        "id": "ding",
-                        "name": "DingTalk",
+                        "id": "system",
+                        "name": "System",
                         "type": "dingtalk",
                         "enabled": True,
-                        "webhook_url": "${DING_WEBHOOK}",
-                        "dingtalk_secret": "SEC-dingtalk-signing-secret",
+                        "webhook_url": "https://example.test/system",
+                        "dingtalk_secret": "SEC-sign-secret",
                     }
                 ],
-                "members": [
-                    {
-                        "id": "alice",
-                        "name": "Alice",
-                        "feishu_open_id": "ou_alice_private",
-                        "wecom_user_id": "alice.private",
-                        "wecom_mobile": "13800000001",
-                        "dingtalk_user_id": "",
-                        "dingtalk_mobile": "",
-                    }
-                ],
-                "alert_tag_policies": [
-                    {
-                        **tag_policy,
-                        "webhook_url": "https://tag-policy-webhook.example/hook",
-                        "dingtalk_secret": "SEC-tag-policy-secret",
-                    }
-                ],
-                "environment_variables": [
-                    {"id": "host", "name": "API_HOST", "value": "https://api.internal.example", "secret": False},
-                    {"id": "explicit", "name": "SESSION_ID", "value": "session-secret-123", "secret": True},
-                    {"id": "named", "name": "SERVICE_TOKEN", "value": "token-secret-456", "secret": False},
-                ],
-                "read_only_token": "read-token-secret-999",
             }
         )
-        storage.create_check(
-            api_check_payload(
-                "Secret-bearing API",
-                entry_url="${API_HOST}/health",
-                alert_policy_json=json.dumps(task_policy, ensure_ascii=False),
-            )
-        )
+        storage.create_check(api_check_payload("Project task"), project_id=self.project_id)
         storage.create_probe_runner(
             {
                 "runner_id": "edge-secret",
                 "name": "Edge Runner",
                 "address": "http://10.0.0.8:8787",
                 "network_region": "edge",
-                "token": "runner-secret-export",
+                "token": "runner-secret",
                 "allow_insecure_http": True,
             }
         )
 
-        with patch.dict("os.environ", {"PROCESS_PASSWORD": "process-secret-789"}, clear=False):
-            response = self.client.get("/api/config/export")
+        response = self.client.get("/api/config/export")
 
         self.assertEqual(response.status_code, 200)
         exported = response.json()
-        self.assertLessEqual({"version", "exported_at", "settings", "checks"}, set(exported))
-        self.assertIsInstance(exported["checks"], list)
-        self.assertTrue(exported["version"])
-        datetime.fromisoformat(str(exported["exported_at"]).replace("Z", "+00:00"))
-
-        exported_text = json.dumps(exported, ensure_ascii=False)
-        self.assertIn("Secret-bearing API", exported_text)
-        self.assertIn("https://api.internal.example", exported_text)
-        self.assertNotIn("SEC-dingtalk-signing-secret", exported_text)
-        self.assertNotIn("SEC-tag-policy-secret", exported_text)
-        self.assertNotIn("https://tag-policy-webhook.example/hook", exported_text)
-        self.assertNotIn("session-secret-123", exported_text)
-        self.assertNotIn("token-secret-456", exported_text)
-        self.assertNotIn("read-token-secret-999", exported_text)
-        self.assertNotIn("process-secret-789", exported_text)
-        self.assertNotIn("ou_alice_private", exported_text)
-        self.assertNotIn("alice.private", exported_text)
-        self.assertNotIn("13800000001", exported_text)
-        self.assertNotIn("runner-secret-export", exported_text)
-        self.assertEqual(exported["settings"]["read_only_token"], "")
+        self.assertEqual(exported["schema"], "pulseguard.config")
+        self.assertEqual(exported["version"], 4)
+        self.assertNotIn("checks", exported)
+        self.assertNotIn("project", exported)
+        self.assertNotIn("alerts", exported)
         self.assertEqual(exported["settings"]["members"], [])
-        self.assertIn("runners", exported)
-        exported_runner = next(runner for runner in exported["runners"] if runner["runner_id"] == "edge-secret")
-        self.assertEqual(exported_runner["role"], "child")
-        self.assertTrue(exported_runner["allow_insecure_http"])
-        self.assertNotIn("token", exported_runner)
-        self.assertNotIn("token_value", exported_runner)
+        exported_text = json.dumps(exported, ensure_ascii=False)
+        self.assertNotIn("Project task", exported_text)
+        self.assertNotIn("ou-secret", exported_text)
+        self.assertNotIn("token-secret", exported_text)
+        self.assertNotIn("sign-secret", exported_text)
+        self.assertNotIn("runner-secret", exported_text)
 
-        exported_check = next(check for check in exported["checks"] if check["name"] == "Secret-bearing API")
-        self.assertEqual(
-            json.loads(exported_check["alert_policy_json"]),
-            {key: value for key, value in task_policy.items() if key != "member_ids"},
-        )
-
-        tag_policies = exported["settings"]["alert_tag_policies"]
-        self.assertEqual(tag_policies, [tag_policy])
-        tag_policy_text = json.dumps(tag_policies, ensure_ascii=False)
-        self.assertNotIn("webhook", tag_policy_text.lower())
-        self.assertNotIn("secret", tag_policy_text.lower())
-
-        variables = {item["id"]: item for item in exported["settings"]["environment_variables"]}
-        self.assertFalse(variables["host"]["secret"])
-        self.assertEqual(variables["host"]["value"], "https://api.internal.example")
-        self.assertTrue(variables["explicit"]["secret"])
-        self.assertNotEqual(variables["explicit"].get("value"), "session-secret-123")
-        self.assertTrue(variables["named"]["secret"])
-        self.assertNotEqual(variables["named"].get("value"), "token-secret-456")
-
-        full_response = self.client.get("/api/config/export?redact=false")
-        self.assertEqual(full_response.status_code, 200)
-        full_export = full_response.json()
-        self.assertEqual(full_export["settings"]["members"][0]["id"], "alice")
-        full_check = next(check for check in full_export["checks"] if check["name"] == "Secret-bearing API")
-        self.assertEqual(json.loads(full_check["alert_policy_json"])["member_ids"], ["alice"])
-        full_runner = next(runner for runner in full_export["runners"] if runner["runner_id"] == "edge-secret")
-        self.assertTrue(full_runner["token_set"])
-        self.assertNotIn("token", full_runner)
-        self.assertNotIn("runner-secret-export", json.dumps(full_export, ensure_ascii=False))
-
-    def test_import_preview_reports_counts_and_does_not_persist_changes(self) -> None:
-        before_check_count = len(storage.list_checks())
-        before_settings = storage.get_settings()
-        payload = {
-            "bundle": transfer_config(
-                settings={"default_interval_seconds": 77, "browser_viewport": "1280x720"},
-                checks=[api_check_payload("Preview API")],
-            ),
-            "replace_existing": False,
-        }
-
-        response = self.client.post("/api/config/import-preview", json=payload)
-
-        self.assertEqual(response.status_code, 200)
-        preview = response.json()
-        self.assertLessEqual({"counts", "issues", "warnings", "summary"}, set(preview))
-        self.assertIsInstance(preview["issues"], list)
-        self.assertIsInstance(preview["warnings"], list)
-        self.assertTrue(preview["summary"])
-        self.assertEqual(preview["counts"].get("checks"), 1)
-        self.assertEqual(preview["counts"].get("settings"), 2)
-
-        self.assertEqual(len(storage.list_checks()), before_check_count)
-        self.assertIsNone(find_check_by_name("Preview API"))
-        self.assertEqual(storage.get_settings()["default_interval_seconds"], before_settings["default_interval_seconds"])
-        self.assertEqual(storage.get_settings()["browser_viewport"], before_settings["browser_viewport"])
-
-    def test_import_apply_creates_checks_and_updates_settings(self) -> None:
-        task_policy = {
-            "alert_cooldown_minutes": 25,
-            "recovery_notification": False,
-            "notification_channel_ids": ["ops"],
-        }
-        tag_policy = {
-            "id": "tag-ops",
-            "name": "Ops Tag",
-            "tag": "ops",
-            "enabled": True,
-            "alert_cooldown_minutes": 20,
-            "recovery_notification": True,
-            "notification_channel_ids": ["ops"],
-        }
-        payload = {
-            "bundle": transfer_config(
-                settings={
-                    "default_interval_seconds": 42,
-                    "browser_viewport": "1365x768",
-                    "alert_tag_policies": [
-                        {
-                            **tag_policy,
-                            "webhook_url": "https://imported-tag-policy.example/hook",
-                            "dingtalk_secret": "SEC-imported-tag-secret",
-                        }
-                    ],
-                },
-                checks=[
-                    api_check_payload(
-                        "Imported API",
-                        entry_url="https://import.example.com/health",
-                        alert_policy_json=json.dumps(task_policy, ensure_ascii=False),
-                    ),
-                    ui_check_payload("Imported UI", entry_url="https://import.example.com/dashboard"),
-                ],
-            ),
-            "replace_existing": True,
-        }
-
-        response = self.client.post("/api/config/import", json=payload)
-
-        self.assertEqual(response.status_code, 200)
-        imported_api = find_check_by_name("Imported API")
-        imported_ui = find_check_by_name("Imported UI")
-        self.assertIsNotNone(imported_api)
-        self.assertIsNotNone(imported_ui)
-        self.assertEqual(imported_api["type"], "api")
-        self.assertEqual(imported_api["entry_url"], "https://import.example.com/health")
-        self.assertEqual(json.loads(imported_api["alert_policy_json"]), task_policy)
-        self.assertEqual(imported_ui["type"], "ui")
-        self.assertEqual(imported_ui["viewport_mode"], "h5")
-
-        settings = storage.get_settings()
-        self.assertEqual(settings["default_interval_seconds"], 42)
-        self.assertEqual(settings["browser_viewport"], "1365x768")
-        self.assertEqual(settings["alert_tag_policies"], [tag_policy])
-        tag_policy_text = json.dumps(settings["alert_tag_policies"], ensure_ascii=False)
-        self.assertNotIn("webhook", tag_policy_text.lower())
-        self.assertNotIn("secret", tag_policy_text.lower())
-
-    def test_import_apply_creates_runners_and_preserves_check_runner_strategy(self) -> None:
-        check_payload = api_check_payload("Imported Runner API", entry_url="https://import.example.com/runner")
-        check_payload.update({"runner_selection_mode": "selected_parallel", "runner_ids": ["edge-import"]})
-        payload = {
-            "bundle": transfer_config(
-                settings={},
-                runners=[
+    def test_project_export_v1_contains_only_selected_project_data(self) -> None:
+        other = storage.create_project("Other")
+        storage.create_check(api_check_payload("Shared name"), project_id=self.project_id)
+        storage.create_check(api_check_payload("Other only"), project_id=int(other["id"]))
+        storage.update_project_alert_settings(
+            self.project_id,
+            {
+                "alerts_enabled": True,
+                "notification_channels": [
                     {
-                        "runner_id": "edge-import",
-                        "name": "Imported Edge Runner",
-                        "address": "http://10.0.0.12:8787",
-                        "network_region": "edge",
+                        "id": "ops",
+                        "name": "Ops",
+                        "type": "feishu",
                         "enabled": True,
+                        "webhook_url": "https://example.test/project",
                     }
                 ],
-                checks=[check_payload],
-            ),
-            "replace_existing": True,
-        }
+                "execution_notification_channel_ids": ["ops"],
+            },
+        )
 
-        preview = self.client.post("/api/config/import-preview", json=payload)
-        response = self.client.post("/api/config/import", json=payload)
+        response = self.client.get("/api/project-config/export", headers=self.headers)
 
-        self.assertEqual(preview.status_code, 200)
-        self.assertEqual(preview.json()["counts"].get("runners"), 1)
-        self.assertIn("未包含认证信息", "；".join(preview.json()["warnings"]))
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["runners_imported"], 1)
+        exported = response.json()
+        self.assertEqual(exported["schema"], "pulseguard.project")
+        self.assertEqual(exported["version"], 1)
+        self.assertIn("Shared name", [check["name"] for check in exported["checks"]])
+        self.assertNotIn("settings", exported)
+        self.assertNotIn("runners", exported)
+        self.assertNotIn("Other only", json.dumps(exported, ensure_ascii=False))
+        self.assertNotIn("https://example.test/project", json.dumps(exported, ensure_ascii=False))
 
-        runner = storage.get_probe_runner("edge-import")
-        imported_check = find_check_by_name("Imported Runner API")
-        self.assertIsNotNone(runner)
-        self.assertEqual(runner["address"], "http://10.0.0.12:8787")
-        self.assertFalse(runner["enabled"])
-        self.assertFalse(runner["token_set"])
-        self.assertTrue(runner["allow_insecure_http"])
-        self.assertNotIn("token", runner)
-        self.assertIsNotNone(imported_check)
-        self.assertEqual(imported_check["runner_selection_mode"], "selected_parallel")
-        self.assertEqual(imported_check["runner_ids"], ["edge-import"])
+    def test_project_import_conflicts_are_computed_only_in_target_project(self) -> None:
+        other = storage.create_project("Other")
+        storage.create_check(api_check_payload("Duplicate"), project_id=int(other["id"]))
+        bundle = project_config(checks=[api_check_payload("Duplicate")])
 
-    def test_current_config_requires_explicit_manual_http_confirmation(self) -> None:
-        for confirmation in (None, False):
-            with self.subTest(confirmation=confirmation):
-                runner = {
-                    "runner_id": "edge-current-http",
-                    "name": "Current HTTP Runner",
-                    "address": "http://10.0.0.13:8787",
+        first_preview = self.client.post(
+            "/api/project-config/import-preview", json={"bundle": bundle}, headers=self.headers
+        )
+        applied = self.client.post(
+            "/api/project-config/import", json={"bundle": bundle}, headers=self.headers
+        )
+        second_preview = self.client.post(
+            "/api/project-config/import-preview", json={"bundle": bundle}, headers=self.headers
+        )
+
+        self.assertEqual(first_preview.status_code, 200)
+        self.assertEqual(first_preview.json()["counts"]["conflicts"], 0)
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(applied.json()["checks_created"], 1)
+        self.assertEqual(second_preview.json()["counts"]["conflicts"], 1)
+        self.assertIsNotNone(find_check_by_name("Duplicate", self.project_id))
+        self.assertEqual(self.scheduler.refresh_count, 1)
+
+    def test_project_import_blocks_missing_member_and_channel_references(self) -> None:
+        check = api_check_payload(
+            "Invalid references",
+            alert_policy_json=json.dumps(
+                {"member_ids": ["missing-member"], "notification_channel_ids": ["missing-channel"]}
+            ),
+        )
+        bundle = project_config(checks=[check])
+
+        response = self.client.post(
+            "/api/project-config/import-preview", json={"bundle": bundle}, headers=self.headers
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["valid"])
+        issues = "；".join(response.json()["issues"])
+        self.assertIn("missing-member", issues)
+        self.assertIn("missing-channel", issues)
+        self.assertIsNone(find_check_by_name("Invalid references", self.project_id))
+
+    def replacement_bundle(self) -> dict[str, Any]:
+        def channel(name: str) -> dict[str, Any]:
+            return {"id": name, "name": name, "type": "dingtalk", "enabled": False,
+                    "webhook_url": f"https://example.test/{name}"}
+        storage.update_project_alert_settings(self.project_id, {"notification_channels": [channel("old")]})
+        storage.create_check(api_check_payload("Replace", alert_policy_json=json.dumps(
+            {"notification_channel_ids": ["old"]})), project_id=self.project_id)
+        bundle = project_config([api_check_payload("Replace", alert_policy_json=json.dumps(
+            {"notification_channel_ids": ["new"]}))], {"notification_channels": [channel("new")]})
+        bundle["variables"] = [{"id": "v", "name": "VALUE", "value": "new", "secret": False}]
+        return bundle
+
+    def test_replacement_validates_final_channel_references(self) -> None:
+        bundle = self.replacement_bundle()
+        self.assertTrue(config_transfer.preview_project_import(bundle, self.project_id)["valid"])
+        response = self.client.post("/api/project-config/import", headers=self.headers,
+                                    json={"bundle": bundle, "replace_existing": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        check = find_check_by_name("Replace", self.project_id)
+        self.assertEqual(json.loads(check["alert_policy_json"])["notification_channel_ids"], ["new"])
+        self.assertEqual(storage.get_project_alert_settings(self.project_id)["notification_channels"][0]["id"], "new")
+        self.assertEqual(storage.get_project_variables(self.project_id)[0]["value"], "new")
+
+    def test_failed_replacement_preserves_entire_project(self) -> None:
+        bundle = self.replacement_bundle()
+        storage.create_check(api_check_payload("Untouched", alert_policy_json=json.dumps(
+            {"notification_channel_ids": ["old"]})), project_id=self.project_id)
+        before = config_transfer.export_project(self.project_id, redact=False)
+        check_id = find_check_by_name("Replace", self.project_id)["id"]
+        versions = storage.list_check_versions(check_id)
+        with self.assertRaisesRegex(ValueError, "Untouched"):
+            config_transfer.apply_project_import(bundle, self.project_id, replace_existing=True)
+        after = config_transfer.export_project(self.project_id, redact=False)
+        for key in ("checks", "alerts", "variables"):
+            self.assertEqual(before[key], after[key])
+        self.assertEqual(storage.list_check_versions(check_id), versions)
+
+    def test_late_import_failure_rolls_back_tasks_and_versions(self) -> None:
+        bundle = self.replacement_bundle()
+        before = config_transfer.export_project(self.project_id, redact=False)
+        with patch.object(storage, "update_project_alert_settings", side_effect=RuntimeError("write failed")):
+            with self.assertRaisesRegex(RuntimeError, "write failed"):
+                config_transfer.apply_project_import(bundle, self.project_id, replace_existing=True)
+        after = config_transfer.export_project(self.project_id, redact=False)
+        for key in ("checks", "alerts", "variables"):
+            self.assertEqual(before[key], after[key])
+
+    def test_system_import_rejects_old_combined_bundle_and_imports_runners(self) -> None:
+        old_bundle = {
+            "version": 3,
+            "settings": {},
+            "runners": [],
+            "checks": [api_check_payload("Old task")],
+        }
+        old_preview = self.client.post("/api/config/import-preview", json={"bundle": old_bundle})
+
+        bundle = system_config(
+            runners=[
+                {
+                    "runner_id": "edge-import",
+                    "name": "Imported Edge",
+                    "address": "http://10.0.0.12:8787",
                     "network_region": "edge",
                     "enabled": True,
+                    "allow_insecure_http": True,
                 }
-                if confirmation is not None:
-                    runner["allow_insecure_http"] = confirmation
-                bundle = transfer_config(settings={}, runners=[runner], checks=[])
-                bundle["version"] = config_transfer.EXPORT_SCHEMA_VERSION
+            ]
+        )
+        preview = self.client.post("/api/config/import-preview", json={"bundle": bundle})
+        applied = self.client.post("/api/config/import", json={"bundle": bundle})
 
-                preview = self.client.post(
-                    "/api/config/import-preview",
-                    json={"bundle": bundle, "replace_existing": False},
-                )
+        self.assertEqual(old_preview.status_code, 200)
+        self.assertFalse(old_preview.json()["valid"])
+        self.assertIn("旧 v3", "；".join(old_preview.json()["issues"]))
+        self.assertEqual(preview.status_code, 200)
+        self.assertTrue(preview.json()["valid"])
+        self.assertEqual(preview.json()["counts"]["runners"], 1)
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(applied.json()["runners_imported"], 1)
+        self.assertIsNotNone(storage.get_probe_runner("edge-import"))
+        self.assertEqual(self.runner.reload_count, 1)
 
-                self.assertEqual(preview.status_code, 200)
-                self.assertFalse(preview.json()["valid"])
-                self.assertTrue(any("allow_insecure_http=true" in issue for issue in preview.json()["issues"]))
-
-    def test_import_apply_without_replace_preserves_existing_duplicate_name_policy(self) -> None:
-        existing = storage.create_check(api_check_payload("Duplicate API", entry_url="https://old.example.com/health"))
-        payload = {
-            "bundle": transfer_config(
-                settings={"default_api_timeout_ms": 12345},
-                checks=[api_check_payload("Duplicate API", entry_url="https://new.example.com/health")],
-            ),
-            "replace_existing": False,
+    def test_system_import_requires_explicit_manual_http_confirmation(self) -> None:
+        runner = {
+            "runner_id": "edge-current-http",
+            "name": "Current HTTP Runner",
+            "address": "http://10.0.0.13:8787",
+            "network_region": "edge",
+            "enabled": True,
         }
+        preview = self.client.post(
+            "/api/config/import-preview", json={"bundle": system_config(runners=[runner])}
+        )
 
-        response = self.client.post("/api/config/import", json=payload)
-
-        self.assertEqual(response.status_code, 200)
-        result_text = json.dumps(response.json(), ensure_ascii=False).lower()
-        original = storage.get_check(int(existing["id"]))
-        duplicates = [check for check in storage.list_checks() if check["name"].startswith("Duplicate API")]
-        imported_duplicates = [check for check in duplicates if int(check["id"]) != int(existing["id"])]
-
-        self.assertEqual(original["entry_url"], "https://old.example.com/health")
-        if imported_duplicates:
-            self.assertTrue(all(check["name"] != "Duplicate API" for check in imported_duplicates))
-            self.assertIn("renamed", result_text)
-        else:
-            self.assertEqual(len(duplicates), 1)
-            self.assertIn("skipped", result_text)
+        self.assertEqual(preview.status_code, 200)
+        self.assertFalse(preview.json()["valid"])
+        self.assertTrue(any("allow_insecure_http=true" in issue for issue in preview.json()["issues"]))
 
 
-def transfer_config(
-    settings: dict[str, Any],
-    checks: list[dict[str, Any]],
-    runners: list[dict[str, Any]] | None = None,
+def system_config(
+    settings: dict[str, Any] | None = None, runners: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
     return {
-        "version": 1,
-        "exported_at": "2026-06-08T00:00:00+00:00",
-        "settings": settings,
+        "schema": "pulseguard.config",
+        "version": config_transfer.EXPORT_SCHEMA_VERSION,
+        "exported_at": "2026-09-02T00:00:00+08:00",
+        "settings": settings or {},
         "runners": runners or [],
+    }
+
+
+def project_config(
+    checks: list[dict[str, Any]], alerts: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return {
+        "schema": "pulseguard.project",
+        "version": config_transfer.PROJECT_EXPORT_SCHEMA_VERSION,
+        "exported_at": "2026-09-02T00:00:00+08:00",
+        "project": {"name": "Source"},
+        "alerts": alerts or {},
         "checks": checks,
     }
 
@@ -412,29 +326,11 @@ def api_check_payload(
     }
 
 
-def ui_check_payload(name: str, entry_url: str = "https://import.example.com/ui") -> dict[str, Any]:
-    return {
-        "name": name,
-        "type": "ui",
-        "enabled": True,
-        "interval_seconds": 180,
-        "timeout_ms": 15000,
-        "entry_url": entry_url,
-        "viewport_mode": "h5",
-        "method": "",
-        "headers_json": "{}",
-        "body": "",
-        "assertions_json": json.dumps(
-            [{"id": "title-ok", "type": "title_contains", "enabled": True, "expected_text": "OK"}]
-        ),
-        "setup_script": "async def setup(ctx, page):\n    pass\n",
-        "script": "",
-        "tags": "imported,ui",
-    }
-
-
-def find_check_by_name(name: str) -> dict[str, Any] | None:
-    return next((check for check in storage.list_checks() if check["name"] == name), None)
+def find_check_by_name(name: str, project_id: int) -> dict[str, Any] | None:
+    return next(
+        (check for check in storage.list_checks(project_id=project_id) if check["name"] == name),
+        None,
+    )
 
 
 if __name__ == "__main__":

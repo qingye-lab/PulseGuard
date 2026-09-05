@@ -184,6 +184,26 @@ class SettingsUpdate(BaseModel):
     values: dict[str, object]
 
 
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("项目名称不能为空")
+        return text
+
+
+class ProjectUpdate(ProjectCreate):
+    pass
+
+
+class ProjectAlertSettingsUpdate(BaseModel):
+    values: dict[str, object]
+
+
 class ConfigImportRequest(BaseModel):
     bundle: dict[str, Any]
     replace_existing: bool = False
@@ -346,7 +366,7 @@ def normalize_settings_values(values: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = _bounded_int(key, value, *SETTING_RANGES[key])
         elif key in BOOLEAN_SETTINGS:
             normalized[key] = _coerce_bool(key, value)
-        elif key == "notification_channels":
+        elif key in {"notification_channels", "system_notification_channels"}:
             normalized[key] = _notification_channels(value)
         elif key in {"execution_notification_channel_ids", "system_notification_channel_ids"}:
             normalized[key] = _string_list(key, value, max_length=80)
@@ -508,6 +528,22 @@ class BrowserInstallRequest(BaseModel):
 
 class ReadOnlyTokenCreate(BaseModel):
     read_only_token_name: str = Field(default="", max_length=120)
+    project_ids: list[int] = Field(..., min_length=1)
+
+    @field_validator("project_ids")
+    @classmethod
+    def normalize_project_ids(cls, value: list[int]) -> list[int]:
+        result: list[int] = []
+        seen: set[int] = set()
+        for raw in value:
+            project_id = int(raw)
+            if project_id <= 0 or project_id in seen:
+                continue
+            seen.add(project_id)
+            result.append(project_id)
+        if not result:
+            raise ValueError("只读令牌至少需要绑定一个项目")
+        return result
 
 
 def _bounded_int(key: str, value: Any, minimum: int, maximum: int) -> int:
@@ -571,8 +607,46 @@ def _read_only_tokens(value: Any) -> list[dict[str, Any]]:
             raise ValueError("只读访问令牌不能重复")
         seen_ids.add(token_id)
         seen_tokens.add(token)
-        tokens.append({"id": token_id, "name": name, "token": token, "created_at": created_at})
+        raw_project_ids = raw.get("project_ids")
+        if not isinstance(raw_project_ids, list):
+            raise ValueError(f"第 {index} 个只读访问令牌缺少项目范围")
+        project_ids: list[int] = []
+        seen_project_ids: set[int] = set()
+        for raw_project_id in raw_project_ids:
+            project_id = int(raw_project_id)
+            if project_id <= 0 or project_id in seen_project_ids:
+                continue
+            seen_project_ids.add(project_id)
+            project_ids.append(project_id)
+        if not project_ids:
+            raise ValueError(f"第 {index} 个只读访问令牌缺少项目范围")
+        tokens.append(
+            {
+                "id": token_id,
+                "name": name,
+                "token": token,
+                "created_at": created_at,
+                "project_ids": project_ids,
+            }
+        )
     return tokens
+
+
+DEFAULT_PROJECT_ALERT_SETTINGS_KEYS = {
+    "alerts_enabled",
+    "notification_channels",
+    "execution_notification_channel_ids",
+    "alert_tag_policies",
+    "alert_cooldown_minutes",
+    "recovery_notification",
+}
+
+
+def normalize_project_alert_settings_values(values: dict[str, Any]) -> dict[str, Any]:
+    unknown = sorted(set(values) - DEFAULT_PROJECT_ALERT_SETTINGS_KEYS)
+    if unknown:
+        raise ValueError(f"不支持的项目告警设置项：{', '.join(unknown)}")
+    return normalize_settings_values(values)
 
 
 def _absolute_http_url(key: str, value: Any) -> str:

@@ -1,10 +1,10 @@
-import { Line as PlotLine } from "@ant-design/plots";
 import {
   Alert,
   Badge,
   Button,
   Card,
   DatePicker,
+  Descriptions,
   Drawer,
   Empty,
   Input,
@@ -21,7 +21,7 @@ import {
 } from "antd";
 import dayjs, { type Dayjs } from "dayjs";
 import { Activity, Calendar, Maximize2, RefreshCw, RotateCcw, SlidersHorizontal } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { Button as UiButton } from "../components/ui/button";
@@ -38,15 +38,10 @@ import type {
 import { formatDuration } from "../utils";
 
 const { RangePicker } = DatePicker;
-const { Text, Title } = Typography;
+const { Text } = Typography;
 const TASK_PAGE_SIZE = 12;
-const CHART_COLORS = {
-  avg: palette.primary,
-  p95: palette.warning,
-  p99: palette.danger,
-  grid: palette.border,
-  pointStroke: palette.surface
-} as const;
+const loadLatencyChart = () => import("../components/LatencyChart");
+const LatencyChart = lazy(loadLatencyChart);
 const NUMBER_FORMATTER = new Intl.NumberFormat();
 function formatCount(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "0";
@@ -226,6 +221,11 @@ function paramsEqual(a: URLSearchParams, b: URLSearchParams): boolean {
 }
 
 export function MonitoringPage() {
+  // Fetch the primary chart runtime alongside the trend request, not after it.
+  useEffect(() => {
+    // React.lazy remains the error owner when the component is rendered.
+    void loadLatencyChart().catch(() => undefined);
+  }, []);
   const [searchParams, setSearchParams] = useSearchParams();
   const [globalDimension, setGlobalDimension] = useState<Dimension>(() => dimensionFromParams(searchParams));
   const [type, setType] = useState<CheckType | "">(() => parseTypeParam(searchParams.get("type")));
@@ -392,42 +392,6 @@ export function MonitoringPage() {
 
   return (
     <div className="page-content monitoring-page">
-      <header className="monitoring-page-header">
-        <div className="monitoring-page-heading">
-          <Title level={3} style={{ margin: 0 }}>
-            趋势概览
-          </Title>
-          <Text type="secondary" aria-live="polite">
-            {waitingForCustomRange
-              ? "请选择自定义时间范围后查看趋势数据"
-              : data
-                ? `本地 / LAN，最后更新 ${lastUpdated}，${activeWindow}`
-                : "正在加载趋势数据..."}
-          </Text>
-        </div>
-        <Space className="monitoring-header-actions" size={8}>
-          {overrideCount > 0 && (
-            <Tag color="processing" aria-live="polite">
-              {overrideCount} 张卡片使用独立维度
-            </Tag>
-          )}
-          <Button
-            icon={<RefreshCw size={15} aria-hidden="true" />}
-            loading={loading}
-            disabled={loading}
-            onClick={refresh}
-          >
-            刷新
-          </Button>
-        </Space>
-        <div className="monitoring-header-stats" aria-label="监控趋势摘要">
-          <HeaderStat label="任务数" value={formatCount(totalTasks)} />
-          <HeaderStat label="观测量" value={formatCount(totalObservations)} />
-          <HeaderStat label="达标率" value={formatPercent(successfulObservations, totalObservations)} />
-          <HeaderStat label="P95" value={formatDuration(overallP95)} />
-        </div>
-      </header>
-
       {error && (
         <Alert
           type="error"
@@ -439,15 +403,48 @@ export function MonitoringPage() {
         />
       )}
 
-      <GlobalFilterBar
-        dimension={globalDimension}
-        onDimensionChange={handleGlobalDimensionChange}
-        onCustomPeriodRequest={openCustomRangeDialog}
-        type={type}
-        onTypeChange={setType}
-        q={q}
-        onQueryChange={setQ}
-      />
+      <Card
+        title="趋势范围"
+        className="project-summary-card monitoring-range-card"
+        extra={
+          <Space size={8}>
+            {waitingForCustomRange && <Tag color="warning">待选择时间</Tag>}
+            {overrideCount > 0 && <Tag color="processing">{overrideCount} 个独立维度</Tag>}
+            <Button
+              icon={<RefreshCw size={15} aria-hidden="true" />}
+              loading={loading}
+              disabled={loading}
+              onClick={refresh}
+            >
+              刷新
+            </Button>
+          </Space>
+        }
+      >
+        <GlobalFilterBar
+          dimension={globalDimension}
+          onDimensionChange={handleGlobalDimensionChange}
+          onCustomPeriodRequest={openCustomRangeDialog}
+          type={type}
+          onTypeChange={setType}
+          q={q}
+          onQueryChange={setQ}
+        />
+        <Descriptions
+          className="project-state-descriptions monitoring-range-summary"
+          bordered
+          size="small"
+          column={{ xs: 1, sm: 2, md: 3, lg: 3, xl: 5, xxl: 5 }}
+          items={[
+            { key: "window", label: "数据范围", children: activeWindow },
+            { key: "tasks", label: "任务数", children: formatCount(totalTasks) },
+            { key: "observations", label: "观测量", children: formatCount(totalObservations) },
+            { key: "success", label: "达标率", children: formatPercent(successfulObservations, totalObservations) },
+            { key: "p95", label: "P95", children: formatDuration(overallP95) }
+          ]}
+        />
+        <Text type="secondary" className="monitoring-last-updated" aria-live="polite">更新于 {lastUpdated}</Text>
+      </Card>
 
       <Modal
         title="选择自定义时间范围"
@@ -472,23 +469,20 @@ export function MonitoringPage() {
         />
       </Modal>
 
-      <section className="monitoring-summary-grid">
+      <section className="monitoring-summary-grid" aria-label="整体趋势">
         {loading && !data ? (
           <>
             <Card><Skeleton active paragraph={{ rows: 4 }} /></Card>
             <Card><Skeleton active paragraph={{ rows: 4 }} /></Card>
           </>
-        ) : (
+        ) : summaries.length ? (
           summaries.map((summary) => <SummaryCard key={summary.check_type} summary={summary} />)
+        ) : (
+          <Card className="monitoring-summary-empty"><Empty description="暂无整体趋势数据" /></Card>
         )}
       </section>
 
-      <section className="monitoring-task-section" aria-label="任务趋势卡片">
-        <div className="monitoring-section-heading">
-          <h3>任务趋势</h3>
-          <Text type="secondary">卡片展示核心延迟和缩略趋势；打开详情后查看完整坐标图和独立观察维度。</Text>
-        </div>
-
+      <Card title="任务趋势" extra={<Tag>{formatCount(totalTasks)} 个任务</Tag>} className="project-work-card monitoring-task-card">
         {loading && !data ? (
           <div className="monitoring-task-list">
             {SKELETON_TASK_KEYS.map((key) => (
@@ -519,11 +513,9 @@ export function MonitoringPage() {
             />
           </>
         ) : (
-          <Card>
-            <Empty description="没有符合筛选条件的监控任务，可清除搜索或切换类型再试。" />
-          </Card>
+          <Empty description="没有符合筛选条件的监控任务" />
         )}
-      </section>
+      </Card>
 
       <TaskTrendDrawer
         task={activeTask}
@@ -561,7 +553,7 @@ function GlobalFilterBar({
   const hasHourWindow = Boolean(dimension.hourStart && dimension.hourEnd);
 
   return (
-    <section className="monitoring-global-filter" aria-label="监控筛选">
+    <div className="monitoring-global-filter" aria-label="监控筛选">
       <div className="monitoring-filter-cluster">
         <div className="monitoring-filter-block">
           <span className="monitoring-filter-label">周期</span>
@@ -649,12 +641,14 @@ function GlobalFilterBar({
         <Input.Search
           value={q}
           onChange={(event) => onQueryChange(event.target.value)}
+          onSearch={onQueryChange}
           allowClear
           autoComplete="off"
+          enterButton="搜索"
           placeholder="搜索任务名称"
         />
       </div>
-    </section>
+    </div>
   );
 }
 
@@ -676,7 +670,7 @@ function SummaryCard({ summary }: { summary: MonitoringTrendSummary }) {
           )}
         </div>
       </div>
-      <LatencyChart points={summary.points} variant="summary" />
+      <Suspense fallback={<Skeleton active paragraph={{ rows: 3 }} />}><LatencyChart points={summary.points} variant="summary" /></Suspense>
     </Card>
   );
 }
@@ -789,7 +783,7 @@ function TaskTrendRow({
               <Text type="danger">独立维度加载失败</Text>
             </div>
           )}
-          <LatencyChart points={points} variant="sparkline" />
+          <Suspense fallback={<Skeleton active paragraph={{ rows: 3 }} />}><LatencyChart points={points} variant="sparkline" /></Suspense>
         </div>
       </UiButton>
       <div className="monitoring-task-sidecar">
@@ -824,7 +818,7 @@ function TaskTrendRow({
             }
           >
             <Tooltip title="调整观察维度">
-              <Badge dot={isOverridden} color={CHART_COLORS.avg} offset={[-4, 4]} aria-label={isOverridden ? "已使用独立维度" : undefined}>
+              <Badge dot={isOverridden} color={palette.primary} offset={[-4, 4]} aria-label={isOverridden ? "已使用独立维度" : undefined}>
                 <Button size="small" icon={<SlidersHorizontal size={14} aria-hidden="true" />} aria-label="调整观察维度" />
               </Badge>
             </Tooltip>
@@ -1056,338 +1050,12 @@ function TaskTrendDrawer({
             <StatChip label="P95" value={formatDuration(trend.p95_duration_ms)} />
             {trend.p99_duration_ms != null && <StatChip label="P99" value={formatDuration(trend.p99_duration_ms)} />}
           </div>
-          <LatencyChart points={trend.points} variant="drawer" />
+          <Suspense fallback={<Skeleton active paragraph={{ rows: 3 }} />}><LatencyChart points={trend.points} variant="drawer" /></Suspense>
         </div>
       ) : (
         <Empty description="暂无趋势数据" />
       )}
     </Drawer>
-  );
-}
-
-type ChartVariant = "summary" | "sparkline" | "drawer";
-
-interface ChartDatum {
-  bucket: number;
-  metric: "平均" | "P95" | "P99";
-  value: number;
-}
-
-type TickBucket = "minute" | "hourFine" | "hour" | "dayHour" | "day" | "week" | "month";
-
-interface TickPolicy {
-  tickCount: number;
-  labelStep: number;
-  labelFormatter: (value: number | Date) => string;
-  bucket: TickBucket;
-}
-
-interface ChartYAxisPolicy {
-  max: number;
-  ticks: number[];
-}
-
-const HOUR_MS = 3_600_000;
-const DAY_MS = 24 * HOUR_MS;
-const Y_AXIS_BASE_STEP = 100;
-
-function pickStep(variant: ChartVariant, steps: { task: number; summary: number; drawer: number }): number {
-  if (variant === "drawer") return steps.drawer;
-  if (variant === "summary") return steps.summary;
-  return steps.task;
-}
-
-function formatDayBoundary(value: number | Date, withTime: boolean): string {
-  const m = dayjs(value);
-  if (m.hour() === 0 && m.minute() === 0) return m.format("MM-DD");
-  return withTime ? m.format("MM-DD HH:mm") : m.format("HH:mm");
-}
-
-function tickPolicy(spanMs: number, variant: ChartVariant): TickPolicy {
-  if (spanMs <= 0 || !Number.isFinite(spanMs)) {
-    return {
-      tickCount: 12,
-      labelStep: pickStep(variant, { task: 2, summary: 4, drawer: 2 }),
-      labelFormatter: (value) => dayjs(value).format("HH:mm"),
-      bucket: "hour"
-    };
-  }
-
-  if (spanMs <= 2 * HOUR_MS) {
-    return {
-      tickCount: 12,
-      labelStep: pickStep(variant, { task: 2, summary: 3, drawer: 2 }),
-      labelFormatter: (value) => dayjs(value).format("HH:mm"),
-      bucket: "minute"
-    };
-  }
-
-  if (spanMs <= 12 * HOUR_MS) {
-    return {
-      tickCount: 12,
-      labelStep: pickStep(variant, { task: 2, summary: 3, drawer: 2 }),
-      labelFormatter: (value) => dayjs(value).format("HH:mm"),
-      bucket: "hourFine"
-    };
-  }
-
-  if (spanMs <= 36 * HOUR_MS) {
-    return {
-      tickCount: 12,
-      labelStep: pickStep(variant, { task: 2, summary: 4, drawer: 2 }),
-      labelFormatter: (value) => formatDayBoundary(value, false),
-      bucket: "hour"
-    };
-  }
-
-  if (spanMs <= 8 * DAY_MS) {
-    return {
-      tickCount: 14,
-      labelStep: pickStep(variant, { task: 2, summary: 4, drawer: 2 }),
-      labelFormatter: (value) => formatDayBoundary(value, true),
-      bucket: "dayHour"
-    };
-  }
-
-  if (spanMs <= 35 * DAY_MS) {
-    return {
-      tickCount: 15,
-      labelStep: pickStep(variant, { task: 2, summary: 3, drawer: 2 }),
-      labelFormatter: (value) => dayjs(value).format("MM-DD"),
-      bucket: "day"
-    };
-  }
-
-  if (spanMs <= 13 * 30 * DAY_MS) {
-    return {
-      tickCount: 13,
-      labelStep: pickStep(variant, { task: 2, summary: 3, drawer: 2 }),
-      labelFormatter: (value) => dayjs(value).format("MM-DD"),
-      bucket: "week"
-    };
-  }
-
-  return {
-    tickCount: 12,
-    labelStep: pickStep(variant, { task: 2, summary: 3, drawer: 2 }),
-    labelFormatter: (value) => dayjs(value).format("YYYY-MM"),
-    bucket: "month"
-  };
-}
-
-function buildLabelFilter(step: number) {
-  return (_item: unknown, index: number, all: unknown[]): boolean => {
-    if (!all || all.length <= 1) return true;
-    if (index === 0 || index === all.length - 1) return true;
-    const safeStep = Math.max(1, Math.floor(step));
-    return index % safeStep === 0;
-  };
-}
-
-function pointsToData(points: TrendPoint[]): ChartDatum[] {
-  const data: ChartDatum[] = [];
-  points.forEach((point) => {
-    const ts = dayjs(point.bucket_start).valueOf();
-    if (!Number.isFinite(ts)) return;
-    if (typeof point.avg_duration_ms === "number") {
-      data.push({ bucket: ts, metric: "平均", value: point.avg_duration_ms });
-    }
-    if (typeof point.p95_duration_ms === "number") {
-      data.push({ bucket: ts, metric: "P95", value: point.p95_duration_ms });
-    }
-    if (typeof point.p99_duration_ms === "number") {
-      data.push({ bucket: ts, metric: "P99", value: point.p99_duration_ms });
-    }
-  });
-  return data.sort((a, b) => a.bucket - b.bucket);
-}
-
-function buildCardYAxisPolicy(values: number[], variant: Extract<ChartVariant, "summary" | "sparkline">): ChartYAxisPolicy {
-  const rawMax = Math.max(0, ...values);
-  const roundedMax = Math.max(Y_AXIS_BASE_STEP, Math.ceil(rawMax / Y_AXIS_BASE_STEP) * Y_AXIS_BASE_STEP);
-  const max = roundedMax + Y_AXIS_BASE_STEP;
-  const targetSegments = variant === "summary" ? 5 : 4;
-  const step = Math.max(
-    Y_AXIS_BASE_STEP,
-    Math.round(max / targetSegments / Y_AXIS_BASE_STEP) * Y_AXIS_BASE_STEP
-  );
-  const ticks: number[] = [];
-  for (let value = 0; value < max; value += step) {
-    ticks.push(value);
-  }
-  if (ticks[ticks.length - 1] !== max) {
-    ticks.push(max);
-  }
-  return { max, ticks };
-}
-
-function LatencyChart({ points, variant }: { points: TrendPoint[]; variant: ChartVariant }) {
-  const data = useMemo(() => pointsToData(points), [points]);
-  const heightMap: Record<ChartVariant, number> = { summary: 190, sparkline: 168, drawer: 320 };
-  const height = heightMap[variant];
-  const isCardChart = variant !== "drawer";
-  const isSummaryCard = variant === "summary";
-
-  if (!data.length) {
-    return (
-      <div className="latency-chart latency-chart-empty" style={{ height }}>
-        暂无成功响应时间
-      </div>
-    );
-  }
-
-  if (variant === "drawer") {
-    const drawerSpan = data.length >= 2 ? data[data.length - 1].bucket - data[0].bucket : 0;
-    const drawerPolicy = tickPolicy(drawerSpan, "drawer");
-    return (
-      <div className="latency-chart latency-chart-drawer">
-        <PlotLine
-          data={data}
-          xField="bucket"
-          yField="value"
-          colorField="metric"
-          shapeField="smooth"
-          style={{
-            lineWidth: (datum: ChartDatum) => (datum.metric === "平均" ? 2.2 : 1.5),
-            lineDash: (datum: ChartDatum) => (datum.metric === "P99" ? [4, 3] : undefined)
-          }}
-          point={{ shapeField: "circle", sizeField: 3 }}
-          scale={{
-            x: { type: "time", nice: true },
-            y: { nice: true },
-            color: { domain: ["平均", "P95", "P99"], range: [CHART_COLORS.avg, CHART_COLORS.p95, CHART_COLORS.p99] }
-          }}
-          axis={{
-            x: {
-              tickCount: drawerPolicy.tickCount,
-              labelFormatter: drawerPolicy.labelFormatter,
-              labelFilter: buildLabelFilter(drawerPolicy.labelStep),
-              labelFill: palette.textTertiary,
-              labelAutoRotate: false,
-              labelAutoHide: true,
-              line: true,
-              lineStroke: palette.border,
-              tick: false
-            },
-            y: {
-              labelFormatter: (value: number) => formatDuration(value),
-              labelFill: palette.textTertiary,
-              nice: true,
-              grid: true,
-              gridStroke: CHART_COLORS.grid,
-              gridLineDash: [3, 3],
-              line: false,
-              tick: false
-            }
-          }}
-          tooltip={{
-            title: (datum: { bucket: number }) => dayjs(datum.bucket).format("YYYY-MM-DD HH:mm"),
-            items: [
-              {
-                field: "value",
-                name: (datum: { metric: string }) => datum.metric,
-                valueFormatter: (value: number) => formatDuration(value)
-              }
-            ]
-          }}
-          legend={{ color: { position: "top" } }}
-          height={height}
-          autoFit
-        />
-      </div>
-    );
-  }
-
-  const span = data.length >= 2 ? data[data.length - 1].bucket - data[0].bucket : 0;
-  const policy = tickPolicy(span, variant);
-  const values = data.map((item) => item.value);
-  const cardYAxis = buildCardYAxisPolicy(values, isSummaryCard ? "summary" : "sparkline");
-
-  return (
-    <div className={`latency-chart latency-chart-${variant}`}>
-      <PlotLine
-        data={data}
-        xField="bucket"
-        yField="value"
-        colorField="metric"
-        shapeField="smooth"
-        style={{
-          lineWidth: (datum: ChartDatum) => (datum.metric === "平均" ? (isCardChart ? 2 : 2.2) : 1.45),
-          lineDash: (datum: ChartDatum) => (datum.metric === "P99" ? [4, 3] : undefined),
-          opacity: (datum: ChartDatum) => (datum.metric === "平均" ? 1 : isCardChart ? 0.82 : 0.9)
-        }}
-        point={false}
-        paddingTop={isCardChart ? 0 : undefined}
-        paddingRight={isCardChart ? 2 : undefined}
-        paddingBottom={isCardChart ? 0 : undefined}
-        paddingLeft={isCardChart ? 1 : undefined}
-        scale={{
-          x: { type: "time", nice: !isCardChart },
-          y: isCardChart
-            ? { domain: [0, cardYAxis.max], tickCount: cardYAxis.ticks.length, nice: false }
-            : { nice: true },
-          color: { domain: ["平均", "P95", "P99"], range: [CHART_COLORS.avg, CHART_COLORS.p95, CHART_COLORS.p99] }
-        }}
-        axis={{
-          x: {
-            tickCount: isCardChart ? (isSummaryCard ? 7 : 6) : policy.tickCount,
-            labelFormatter: policy.labelFormatter,
-            labelFilter: buildLabelFilter(isCardChart ? Math.max(1, policy.labelStep - 1) : policy.labelStep),
-            labelFontSize: 10,
-            labelFill: palette.textTertiary,
-            labelDirection: isCardChart ? "positive" : undefined,
-            labelSpacing: isCardChart ? 0 : undefined,
-            labelTransform: isCardChart ? "translate(0, 3)" : "translate(0, 2)",
-            labelAutoRotate: false,
-            labelAutoHide: true,
-            line: true,
-            lineStroke: palette.border,
-            grid: isCardChart,
-            gridStroke: CHART_COLORS.grid,
-            gridLineDash: [3, 3],
-            tick: isCardChart,
-            tickStroke: palette.border,
-            tickLength: isCardChart ? 3 : undefined
-          },
-          y: {
-            tickCount: isCardChart ? cardYAxis.ticks.length : undefined,
-            tickMethod: isCardChart ? (() => cardYAxis.ticks) : undefined,
-            labelFormatter: isCardChart ? (value: number) => String(value) : (value: number) => formatDuration(value),
-            labelFontSize: 10,
-            labelFill: palette.textTertiary,
-            labelDirection: isCardChart ? "positive" : undefined,
-            labelSpacing: isCardChart ? 0 : undefined,
-            labelTextAlign: isCardChart ? "left" : undefined,
-            labelTextBaseline: "middle",
-            labelTransform: isCardChart ? "translate(10, 0)" : undefined,
-            grid: true,
-            gridStroke: CHART_COLORS.grid,
-            gridLineDash: [3, 3],
-            line: isCardChart,
-            lineStroke: palette.border,
-            tick: isCardChart,
-            tickStroke: palette.border,
-            tickLength: isCardChart ? 3 : undefined
-          }
-        }}
-        tooltip={{
-          title: (datum: { bucket: number }) => dayjs(datum.bucket).format("MM-DD HH:mm"),
-          css: {
-            zIndex: 24
-          },
-          items: [
-            {
-              field: "value",
-              name: (datum: { metric: string }) => datum.metric,
-              valueFormatter: (value: number) => formatDuration(value)
-            }
-          ]
-        }}
-        legend={false}
-        height={height}
-        autoFit
-      />
-    </div>
   );
 }
 
@@ -1397,15 +1065,6 @@ function StatChip({ label, value, tone = "neutral" }: { label: string; value: st
     <span className={`monitoring-stat-chip ${tone}${seriesClass}`}>
       <span className="monitoring-stat-chip-label">{label}</span>
       <strong className="monitoring-stat-chip-value">{value}</strong>
-    </span>
-  );
-}
-
-function HeaderStat({ label, value, tone = "neutral" }: { label: string; value: string | number; tone?: "neutral" | "danger" }) {
-  return (
-    <span className={`monitoring-header-stat ${tone}`}>
-      <span>{label}</span>
-      <strong>{value}</strong>
     </span>
   );
 }

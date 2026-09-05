@@ -3,6 +3,7 @@ import { ArrowLeft, Play, Save } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
+import { useProject } from "../ProjectContext";
 import {
   checkToPayload,
   detectBodyMode,
@@ -22,6 +23,8 @@ import type { Check, CheckPayload, Run } from "../types";
 import { dirtyTagColor } from "../utils";
 
 export function DebugPage() {
+  const { currentProject } = useProject();
+  const readOnly = currentProject.status === "archived";
   const { type, checkId } = useParams();
   const navigate = useNavigate();
   const checkType = type === "api" ? "api" : "ui";
@@ -150,13 +153,13 @@ export function DebugPage() {
             <Tooltip title={isDirty ? "运行草稿只验证当前编辑内容，不会保存配置或触发告警" : "当前内容与已保存配置一致"}>
               <Tag color={dirtyTagColor(isDirty)}>{isDirty ? "未保存变更" : "已保存"}</Tag>
             </Tooltip>
-            <Button icon={<Play size={16} />} onClick={runSaved} loading={busy === "saved-run"} disabled={Boolean(busy)}>
+            <Button icon={<Play size={16} />} onClick={runSaved} loading={busy === "saved-run"} disabled={readOnly || Boolean(busy)}>
               人工验证已保存配置
             </Button>
-            <Button icon={<Play size={16} />} onClick={runDraft} loading={busy === "draft-run"} disabled={Boolean(busy)}>
+            <Button icon={<Play size={16} />} onClick={runDraft} loading={busy === "draft-run"} disabled={readOnly || Boolean(busy)}>
               试运行当前配置
             </Button>
-            <Button type="primary" icon={<Save size={16} />} onClick={saveOnly} loading={busy === "save"} disabled={Boolean(busy)}>
+            <Button type="primary" icon={<Save size={16} />} onClick={saveOnly} loading={busy === "save"} disabled={readOnly || Boolean(busy)}>
               保存
             </Button>
           </Space>

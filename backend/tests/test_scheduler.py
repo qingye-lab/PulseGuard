@@ -12,9 +12,11 @@ class PulseSchedulerTests(unittest.TestCase):
         scheduler = PulseScheduler(runner)
         scheduler.scheduler = Mock()
         scheduler.scheduler.get_job.return_value = None
-        check = {"id": 7, "enabled": True, "interval_seconds": 60}
+        check = {"id": 7, "project_id": 1, "enabled": True, "interval_seconds": 60}
 
-        with patch("backend.app.scheduler.storage.get_check", return_value=check):
+        with patch("backend.app.scheduler.storage.get_check", return_value=check), patch(
+            "backend.app.scheduler.storage.get_project", return_value={"id": 1, "status": "active"}
+        ):
             scheduler.sync_check(7)
 
         add_job = scheduler.scheduler.add_job

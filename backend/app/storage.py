@@ -11,7 +11,7 @@ import threading
 import time as time_module
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -38,13 +38,82 @@ from .config import (
     TREND_BACKFILL_ON_STARTUP,
     ensure_runtime_dirs,
 )
-from .defaults import DEFAULT_SETTINGS, DEMO_CHECKS
+from .defaults import DEFAULT_PROJECT_ALERT_SETTINGS, DEFAULT_SETTINGS, DEMO_CHECKS
 from .monitoring import HEALTH_STATES, next_health_state, run_metadata
-from .schemas import normalize_settings_values
+from .schemas import normalize_project_alert_settings_values, normalize_settings_values
 from .variables import is_sensitive_variable_name
 
 
+class DatabaseRestoreRecoveryError(RuntimeError):
+    """Restore and its safety-backup recovery both failed; execution must stay paused."""
+
+
+class _DatabaseAccess:
+    """Let WAL readers and a writer coexist, but drain all access for maintenance."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition(threading.RLock())
+        self._shared: dict[int, int] = {}
+        self._exclusive_owner: int | None = None
+        self._exclusive_depth = 0
+        self._waiting_exclusive = 0
+
+    @contextmanager
+    def shared(self) -> Iterator[None]:
+        owner = threading.get_ident()
+        with self._condition:
+            self._condition.wait_for(
+                lambda: owner == self._exclusive_owner
+                or owner in self._shared
+                or (self._exclusive_owner is None and self._waiting_exclusive == 0)
+            )
+            self._shared[owner] = self._shared.get(owner, 0) + 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                remaining = self._shared[owner] - 1
+                if remaining:
+                    self._shared[owner] = remaining
+                else:
+                    del self._shared[owner]
+                self._condition.notify_all()
+
+    @contextmanager
+    def exclusive(self) -> Iterator[None]:
+        owner = threading.get_ident()
+        with self._condition:
+            if owner == self._exclusive_owner:
+                self._exclusive_depth += 1
+            else:
+                if owner in self._shared:
+                    raise RuntimeError("数据库维护必须在普通数据库访问之外开始")
+                self._waiting_exclusive += 1
+                self._condition.notify_all()
+                try:
+                    self._condition.wait_for(lambda: self._exclusive_owner is None and not self._shared)
+                    self._exclusive_owner = owner
+                    self._exclusive_depth = 1
+                finally:
+                    self._waiting_exclusive -= 1
+                    self._condition.notify_all()
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._exclusive_depth -= 1
+                if self._exclusive_depth == 0:
+                    self._exclusive_owner = None
+                self._condition.notify_all()
+
+
+_DATABASE_ACCESS = _DatabaseAccess()
 _LOCK = threading.RLock()
+_TRANSACTION = threading.local()
+_CLEANUP_BATCH_SIZE = 500
+_RUN_CLEANUP_BATCH_SQL = """SELECT id FROM runs
+    WHERE created_at < ? AND status IN ('ok', 'failed', 'timeout', 'skipped')
+    ORDER BY created_at, id LIMIT ?"""
 _TAG_SPLIT_PATTERN = re.compile(r"[,\s]+")
 LOCAL_RUNNER_ID = "local"
 RUNNER_HEARTBEAT_TIMEOUT_SECONDS = 120
@@ -57,6 +126,7 @@ RELAY_HEARTBEAT_TIMEOUT_SECONDS = 60
 ENCRYPTED_RUNNER_TOKEN_PREFIX = "fernet:"
 RUN_SUMMARY_COLUMNS = (
     "id",
+    "project_id",
     "check_id",
     "check_name",
     "check_type",
@@ -89,6 +159,8 @@ RUN_SUMMARY_COLUMNS = (
 )
 TREND_GRANULARITIES: tuple[tuple[str, int], ...] = (("5m", 300), ("1h", 3600), ("1d", 86400))
 TREND_GRANULARITY_SECONDS = dict(TREND_GRANULARITIES)
+DATABASE_MAINTENANCE_MIN_RECLAIMABLE_BYTES = 64 * 1024 * 1024
+DATABASE_MAINTENANCE_MIN_RECLAIMABLE_RATIO = 0.25
 TREND_LATENCY_BUCKETS_MS = (
     50,
     100,
@@ -116,14 +188,359 @@ TREND_LATENCY_BUCKETS_MS = (
 TREND_PERIOD_SECONDS = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 TREND_DISPLAY_BUCKET_SECONDS = (300, 900, 1800, 3600, 7200, 14400, 21600, 43200, 86400, 172800, 604800, 1209600, 2592000)
 TREND_SUMMARY_CHECK_IDS = {"ui": -1, "api": -2}
+PROJECT_SCHEMA_VERSION = 2
+DEFAULT_PROJECT_NAME = "默认项目"
+PROJECT_SCOPED_TABLES = (
+    "checks",
+    "runs",
+    "check_versions",
+    "trend_rollups",
+    "run_archives",
+    "anomaly_cycles",
+)
 
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _legacy_project_schema_detected() -> bool:
+    path = Path(DB_PATH)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        return "checks" in tables and "projects" not in tables
+    finally:
+        conn.close()
+
+
+def inspect_project_migration() -> dict[str, Any]:
+    with _DATABASE_ACCESS.shared():
+        return _inspect_project_migration()
+
+
+def _inspect_project_migration() -> dict[str, Any]:
+    path = Path(DB_PATH)
+    if not path.exists() or path.stat().st_size == 0:
+        return {"required": False, "state": "new", "tables": {}, "default_project_name": DEFAULT_PROJECT_NAME}
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        tables = {
+            str(row["name"])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if "projects" in tables:
+            version_applied = "schema_versions" in tables and conn.execute(
+                "SELECT 1 FROM schema_versions WHERE version = ?", (PROJECT_SCHEMA_VERSION,)
+            ).fetchone() is not None
+            return {
+                "required": not version_applied,
+                "state": "migrated" if version_applied else "incomplete",
+                "tables": _project_migration_counts(conn, tables),
+                "default_project_name": DEFAULT_PROJECT_NAME,
+            }
+        if "checks" not in tables:
+            return {"required": False, "state": "new", "tables": {}, "default_project_name": DEFAULT_PROJECT_NAME}
+        return {
+            "required": True,
+            "state": "legacy",
+            "tables": _project_migration_counts(conn, tables),
+            "default_project_name": DEFAULT_PROJECT_NAME,
+        }
+    finally:
+        conn.close()
+
+
+def migrate_projects(*, apply: bool = False) -> dict[str, Any]:
+    with _DATABASE_ACCESS.exclusive():
+        return _migrate_projects(apply=apply)
+
+
+def _migrate_projects(*, apply: bool = False) -> dict[str, Any]:
+    report = inspect_project_migration()
+    if not report["required"]:
+        return {**report, "applied": False}
+    if not apply:
+        return {**report, "applied": False}
+
+    with _connect() as conn:
+        tables = {
+            str(row["name"])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if "projects" in tables:
+            raise RuntimeError("项目迁移处于不完整状态，请从迁移前数据库备份恢复后重试")
+        timestamp = now_iso()
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'archived')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        project_id = int(
+            conn.execute(
+                "INSERT INTO projects(name, status, created_at, updated_at) VALUES (?, 'active', ?, ?)",
+                (DEFAULT_PROJECT_NAME, timestamp, timestamp),
+            ).lastrowid
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_alert_settings (
+                project_id INTEGER PRIMARY KEY,
+                alerts_enabled INTEGER NOT NULL DEFAULT 0,
+                notification_channels_json TEXT NOT NULL DEFAULT '[]',
+                execution_notification_channel_ids_json TEXT NOT NULL DEFAULT '[]',
+                alert_tag_policies_json TEXT NOT NULL DEFAULT '[]',
+                alert_cooldown_minutes INTEGER NOT NULL DEFAULT 30,
+                recovery_notification INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """
+        )
+        legacy_settings = {
+            key: _read_setting_value(conn, key)
+            for key in (
+                "alerts_enabled",
+                "notification_channels",
+                "execution_notification_channel_ids",
+                "alert_tag_policies",
+                "alert_cooldown_minutes",
+                "recovery_notification",
+                "system_notification_channel_ids",
+                "read_only_tokens",
+                "read_only_token",
+                "read_only_token_name",
+            )
+        }
+        conn.execute(
+            """
+            INSERT INTO project_alert_settings(
+                project_id, alerts_enabled, notification_channels_json,
+                execution_notification_channel_ids_json, alert_tag_policies_json,
+                alert_cooldown_minutes, recovery_notification, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                1 if legacy_settings.get("alerts_enabled") else 0,
+                json.dumps(legacy_settings.get("notification_channels") or [], ensure_ascii=False),
+                json.dumps(legacy_settings.get("execution_notification_channel_ids") or [], ensure_ascii=False),
+                json.dumps(legacy_settings.get("alert_tag_policies") or [], ensure_ascii=False),
+                int(legacy_settings.get("alert_cooldown_minutes") or 30),
+                1 if legacy_settings.get("recovery_notification", True) else 0,
+                timestamp,
+            ),
+        )
+
+        for table in PROJECT_SCOPED_TABLES:
+            if table not in tables or table in {"run_archives", "trend_rollups"}:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN project_id INTEGER NOT NULL DEFAULT {project_id}")
+        if "audit_events" in tables:
+            conn.execute("ALTER TABLE audit_events ADD COLUMN project_id INTEGER")
+            conn.execute("UPDATE audit_events SET project_id = ?", (project_id,))
+        if "run_archives" in tables:
+            _migrate_run_archives_table(conn, project_id)
+        if "trend_rollups" in tables:
+            _migrate_trend_rollups_table(conn, project_id)
+
+        system_channels = [
+            dict(channel)
+            for channel in (legacy_settings.get("notification_channels") or [])
+            if isinstance(channel, dict) and channel.get("id")
+        ]
+        available_system_ids = {str(channel["id"]) for channel in system_channels}
+        selected_system_ids = [
+            str(item)
+            for item in (legacy_settings.get("system_notification_channel_ids") or [])
+            if str(item) in available_system_ids
+        ]
+        _write_setting_value(conn, "system_notification_channels", system_channels, timestamp)
+        _write_setting_value(conn, "system_notification_channel_ids", selected_system_ids, timestamp)
+        tokens = legacy_settings.get("read_only_tokens") or []
+        if legacy_settings.get("read_only_token"):
+            tokens = [
+                *[item for item in tokens if isinstance(item, dict)],
+                {
+                    "id": f"rot_{uuid.uuid4().hex}",
+                    "name": str(legacy_settings.get("read_only_token_name") or "旧版只读令牌"),
+                    "token": str(legacy_settings["read_only_token"]),
+                    "created_at": timestamp,
+                },
+            ]
+        scoped_tokens = [
+            {**item, "project_ids": [project_id]}
+            for item in tokens
+            if isinstance(item, dict) and item.get("token")
+        ]
+        _write_setting_value(conn, "read_only_tokens", scoped_tokens, timestamp)
+        _write_setting_value(conn, "read_only_token", "", timestamp)
+        conn.execute(
+            "DELETE FROM settings WHERE key IN "
+            "('alerts_enabled', 'notification_channels', 'execution_notification_channel_ids', "
+            "'alert_tag_policies', 'alert_cooldown_minutes', 'recovery_notification', 'read_only_token_name')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (?, ?)",
+            (PROJECT_SCHEMA_VERSION, timestamp),
+        )
+        _create_project_indexes(conn)
+        _validate_project_migration(conn, project_id)
+        conn.execute("PRAGMA foreign_keys=ON")
+    return {**inspect_project_migration(), "applied": True}
+
+
+def _project_migration_counts(conn: sqlite3.Connection, tables: set[str]) -> dict[str, int]:
+    return {
+        table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in (*PROJECT_SCOPED_TABLES, "audit_events")
+        if table in tables
+    }
+
+
+def _write_setting_value(conn: sqlite3.Connection, key: str, value: Any, timestamp: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, json.dumps(value, ensure_ascii=False), timestamp),
+    )
+
+
+def _migrate_run_archives_table(conn: sqlite3.Connection, project_id: int) -> None:
+    conn.execute("ALTER TABLE run_archives RENAME TO run_archives_legacy_project_migration")
+    conn.execute(
+        """
+        CREATE TABLE run_archives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            archive_date TEXT NOT NULL,
+            check_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            run_count INTEGER NOT NULL DEFAULT 0,
+            duration_sum_ms INTEGER NOT NULL DEFAULT 0,
+            duration_sample_count INTEGER NOT NULL DEFAULT 0,
+            last_run_at TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(project_id, archive_date, check_type, status)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO run_archives(
+            id, project_id, archive_date, check_type, status, run_count,
+            duration_sum_ms, duration_sample_count, last_run_at, updated_at
+        )
+        SELECT id, ?, archive_date, check_type, status, run_count,
+               duration_sum_ms, duration_sample_count, last_run_at, updated_at
+        FROM run_archives_legacy_project_migration
+        """,
+        (project_id,),
+    )
+    conn.execute("DROP TABLE run_archives_legacy_project_migration")
+
+
+def _migrate_trend_rollups_table(conn: sqlite3.Connection, project_id: int) -> None:
+    conn.execute("ALTER TABLE trend_rollups RENAME TO trend_rollups_legacy_project_migration")
+    conn.execute(
+        """
+        CREATE TABLE trend_rollups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            check_id INTEGER NOT NULL,
+            check_type TEXT NOT NULL,
+            bucket_granularity TEXT NOT NULL,
+            bucket_start TEXT NOT NULL,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            duration_sum_ms INTEGER NOT NULL DEFAULT 0,
+            avg_duration_ms INTEGER,
+            p95_duration_ms INTEGER,
+            p99_duration_ms INTEGER,
+            latency_histogram_json TEXT NOT NULL DEFAULT '{}',
+            duration_samples_json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL,
+            UNIQUE(project_id, check_id, bucket_granularity, bucket_start)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO trend_rollups(
+            id, project_id, check_id, check_type, bucket_granularity, bucket_start,
+            success_count, failure_count, duration_sum_ms, avg_duration_ms,
+            p95_duration_ms, p99_duration_ms, latency_histogram_json,
+            duration_samples_json, updated_at
+        )
+        SELECT id, ?, check_id, check_type, bucket_granularity, bucket_start,
+               success_count, failure_count, duration_sum_ms, avg_duration_ms,
+               p95_duration_ms, p99_duration_ms, latency_histogram_json,
+               COALESCE(duration_samples_json, '[]'), updated_at
+        FROM trend_rollups_legacy_project_migration
+        """,
+        (project_id,),
+    )
+    conn.execute("DROP TABLE trend_rollups_legacy_project_migration")
+
+
+def _create_project_indexes(conn: sqlite3.Connection) -> None:
+    statements = (
+        "CREATE INDEX IF NOT EXISTS idx_checks_project_type ON checks(project_id, type)",
+        "CREATE INDEX IF NOT EXISTS idx_runs_project_started ON runs(project_id, started_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_project_created ON audit_events(project_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_check_versions_project_check ON check_versions(project_id, check_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_run_archives_project_date ON run_archives(project_id, archive_date DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_trend_rollups_project_bucket ON trend_rollups(project_id, bucket_granularity, bucket_start)",
+        "CREATE INDEX IF NOT EXISTS idx_anomaly_cycles_project_status ON anomaly_cycles(project_id, status, opened_at DESC)",
+    )
+    for statement in statements:
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+
+
+def _validate_project_migration(conn: sqlite3.Connection, project_id: int) -> None:
+    for table in PROJECT_SCOPED_TABLES:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is None:
+            continue
+        missing = int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE project_id IS NULL").fetchone()[0])
+        foreign = int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE project_id != ?", (project_id,)).fetchone()[0])
+        if missing or foreign:
+            raise RuntimeError(f"项目迁移校验失败：{table} 存在未归属数据")
+
+
 def init_db() -> None:
+    with _DATABASE_ACCESS.exclusive():
+        _init_db()
+
+
+def _init_db() -> None:
     ensure_runtime_dirs()
+    if _legacy_project_schema_detected():
+        raise RuntimeError(
+            "检测到未迁移的 PulseGuard 数据库。请先运行 "
+            "`uv run python scripts/migrate-projects.py --apply`，完成备份与迁移后再启动应用。"
+        )
     with _connect() as conn:
         conn.executescript(
             """
@@ -132,8 +549,35 @@ def init_db() -> None:
             PRAGMA busy_timeout=30000;
             PRAGMA foreign_keys=ON;
 
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'archived')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_alert_settings (
+                project_id INTEGER PRIMARY KEY,
+                alerts_enabled INTEGER NOT NULL DEFAULT 0,
+                notification_channels_json TEXT NOT NULL DEFAULT '[]',
+                execution_notification_channel_ids_json TEXT NOT NULL DEFAULT '[]',
+                alert_tag_policies_json TEXT NOT NULL DEFAULT '[]',
+                alert_cooldown_minutes INTEGER NOT NULL DEFAULT 30,
+                recovery_notification INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS project_variables (
+                project_id INTEGER PRIMARY KEY,
+                variables_json TEXT NOT NULL DEFAULT '[]',
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS checks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 type TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -159,6 +603,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
                 check_id INTEGER NOT NULL,
                 check_name TEXT NOT NULL,
                 check_type TEXT NOT NULL,
@@ -235,6 +680,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
                 action TEXT NOT NULL,
                 entity_type TEXT NOT NULL,
                 entity_id TEXT,
@@ -246,6 +692,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS check_versions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
                 check_id INTEGER NOT NULL,
                 action TEXT NOT NULL,
                 snapshot_json TEXT NOT NULL,
@@ -254,6 +701,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS run_archives (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
                 archive_date TEXT NOT NULL,
                 check_type TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -262,11 +710,12 @@ def init_db() -> None:
                 duration_sample_count INTEGER NOT NULL DEFAULT 0,
                 last_run_at TEXT,
                 updated_at TEXT NOT NULL,
-                UNIQUE(archive_date, check_type, status)
+                UNIQUE(project_id, archive_date, check_type, status)
             );
 
             CREATE TABLE IF NOT EXISTS trend_rollups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
                 check_id INTEGER NOT NULL,
                 check_type TEXT NOT NULL,
                 bucket_granularity TEXT NOT NULL,
@@ -280,7 +729,7 @@ def init_db() -> None:
                 latency_histogram_json TEXT NOT NULL DEFAULT '{}',
                 duration_samples_json TEXT NOT NULL DEFAULT '[]',
                 updated_at TEXT NOT NULL,
-                UNIQUE(check_id, bucket_granularity, bucket_start)
+                UNIQUE(project_id, check_id, bucket_granularity, bucket_start)
             );
 
             CREATE TABLE IF NOT EXISTS probe_runners (
@@ -333,6 +782,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS anomaly_cycles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
                 check_id INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
                 opened_at TEXT NOT NULL,
@@ -350,16 +800,20 @@ def init_db() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_checks_type ON checks(type);
+            CREATE INDEX IF NOT EXISTS idx_checks_project_type ON checks(project_id, type);
             CREATE INDEX IF NOT EXISTS idx_runs_check_id ON runs(check_id);
+            CREATE INDEX IF NOT EXISTS idx_runs_project_started ON runs(project_id, started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_runs_type_status ON runs(check_type, status);
             CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_events_project_created ON audit_events(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_check_versions_check_id ON check_versions(check_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_run_archives_date ON run_archives(archive_date DESC);
             CREATE INDEX IF NOT EXISTS idx_trend_rollups_bucket ON trend_rollups(bucket_granularity, bucket_start);
             CREATE INDEX IF NOT EXISTS idx_trend_rollups_type_bucket ON trend_rollups(check_type, bucket_granularity, bucket_start);
             CREATE INDEX IF NOT EXISTS idx_probe_runners_region ON probe_runners(network_region, status);
             CREATE INDEX IF NOT EXISTS idx_anomaly_cycles_check_status ON anomaly_cycles(check_id, status, opened_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_anomaly_cycles_project_status ON anomaly_cycles(project_id, status, opened_at DESC);
             """
         )
         _ensure_check_columns(conn)
@@ -367,9 +821,15 @@ def init_db() -> None:
         _ensure_trend_rollup_columns(conn)
         _ensure_check_status_columns(conn)
         _ensure_probe_runner_columns(conn)
+        _create_project_indexes(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_probe_runners_relay_port ON probe_runners(allocated_internal_port)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_observation ON runs(affects_health, started_at DESC)")
+        _ensure_default_project(conn)
         conn.execute("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (1, ?)", (now_iso(),))
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (?, ?)",
+            (PROJECT_SCHEMA_VERSION, now_iso()),
+        )
         _ensure_default_settings(conn)
         _migrate_read_only_tokens(conn)
         _ensure_local_probe_runner(conn)
@@ -400,13 +860,202 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_page_filter_started ON runs(observation_kind, check_type, status, started_at DESC, id DESC)"
         )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_runs_cleanup_terminal ON runs(created_at, id)
+               WHERE status IN ('ok', 'failed', 'timeout', 'skipped')"""
+        )
         if TREND_BACKFILL_ON_STARTUP:
             _backfill_trend_rollups(conn)
 
 
-def list_checks(check_type: str | None = None, enabled_only: bool = False, refresh_stale: bool = True) -> list[dict[str, Any]]:
+def list_projects(*, include_archived: bool = True) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM projects"
+    params: list[Any] = []
+    if not include_archived:
+        sql += " WHERE status = 'active'"
+    sql += " ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, name COLLATE NOCASE, id"
+    with _connect(read_only=True) as conn:
+        return [_normalize_project(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def get_project(project_id: int) -> dict[str, Any] | None:
+    with _connect(read_only=True) as conn:
+        row = conn.execute("SELECT * FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+    return _normalize_project(row) if row else None
+
+
+def default_project_id() -> int:
+    with _connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT id FROM projects ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, id LIMIT 1"
+        ).fetchone()
+    if not row:
+        raise RuntimeError("数据库中没有可用项目")
+    return int(row["id"])
+
+
+def create_project(name: str) -> dict[str, Any]:
+    normalized_name = _normalize_project_name(name)
+    timestamp = now_iso()
+    try:
+        with _connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO projects(name, status, created_at, updated_at) VALUES (?, 'active', ?, ?)",
+                (normalized_name, timestamp, timestamp),
+            )
+            project_id = int(cursor.lastrowid)
+            _ensure_project_alert_settings(conn, project_id)
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("项目名称已存在") from exc
+    return get_project(project_id)  # type: ignore[return-value]
+
+
+def rename_project(project_id: int, name: str) -> dict[str, Any] | None:
+    normalized_name = _normalize_project_name(name)
+    try:
+        with _connect() as conn:
+            cursor = conn.execute(
+                "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
+                (normalized_name, now_iso(), int(project_id)),
+            )
+            if cursor.rowcount == 0:
+                return None
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("项目名称已存在") from exc
+    return get_project(project_id)
+
+
+def archive_project(project_id: int) -> dict[str, Any] | None:
+    with _connect() as conn:
+        project = conn.execute("SELECT * FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+        if not project:
+            return None
+        if project["status"] == "archived":
+            return _normalize_project(project)
+        active_count = int(conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'active'").fetchone()[0])
+        if active_count <= 1:
+            raise ValueError("至少需要保留一个活跃项目")
+        conn.execute(
+            "UPDATE projects SET status = 'archived', updated_at = ? WHERE id = ?",
+            (now_iso(), int(project_id)),
+        )
+    return get_project(project_id)
+
+
+def restore_project(project_id: int) -> dict[str, Any] | None:
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE projects SET status = 'active', updated_at = ? WHERE id = ?",
+            (now_iso(), int(project_id)),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_project(project_id)
+
+
+def delete_empty_project(project_id: int) -> bool:
+    with _connect() as conn:
+        project = conn.execute("SELECT * FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+        if not project:
+            return False
+        active_count = int(conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'active'").fetchone()[0])
+        if project["status"] == "active" and active_count <= 1:
+            raise ValueError("至少需要保留一个活跃项目")
+        for table in PROJECT_SCOPED_TABLES:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is None:
+                continue
+            if conn.execute(f"SELECT 1 FROM {table} WHERE project_id = ? LIMIT 1", (int(project_id),)).fetchone():
+                raise ValueError("仅完全没有任务和历史数据的空项目可以删除")
+        read_only_tokens = _read_setting_value(conn, "read_only_tokens")
+        for token in read_only_tokens if isinstance(read_only_tokens, list) else []:
+            if not isinstance(token, dict):
+                continue
+            scoped_project_ids = {int(item) for item in token.get("project_ids", []) if int(item) > 0}
+            if int(project_id) in scoped_project_ids:
+                raise ValueError("项目仍被只读令牌引用，请先删除相关令牌")
+        conn.execute("UPDATE audit_events SET project_id = NULL WHERE project_id = ?", (int(project_id),))
+        conn.execute("DELETE FROM project_alert_settings WHERE project_id = ?", (int(project_id),))
+        cursor = conn.execute("DELETE FROM projects WHERE id = ?", (int(project_id),))
+        return cursor.rowcount > 0
+
+
+def get_project_alert_settings(project_id: int, *, public: bool = False) -> dict[str, Any]:
+    with _connect() as conn:
+        if conn.execute("SELECT 1 FROM projects WHERE id = ?", (int(project_id),)).fetchone() is None:
+            raise ValueError("项目不存在")
+        _ensure_project_alert_settings(conn, int(project_id))
+        row = conn.execute(
+            "SELECT * FROM project_alert_settings WHERE project_id = ?", (int(project_id),)
+        ).fetchone()
+    result = _normalize_project_alert_settings(row)
+    if public:
+        result["notification_channels"] = [
+            _public_notification_channel(channel)
+            for channel in result["notification_channels"]
+            if isinstance(channel, dict)
+        ]
+    return result
+
+
+def update_project_alert_settings(project_id: int, values: dict[str, Any]) -> dict[str, Any]:
+    current = get_project_alert_settings(project_id)
+    next_values = _preserve_project_notification_channel_secrets(values, current)
+    normalized = normalize_project_alert_settings_values(next_values)
+    merged = {**current, **normalized}
+    channel_ids = {
+        str(channel.get("id") or "")
+        for channel in merged["notification_channels"]
+        if isinstance(channel, dict) and channel.get("id")
+    }
+    selected_ids = {str(item) for item in merged["execution_notification_channel_ids"]}
+    if not selected_ids.issubset(channel_ids):
+        raise ValueError("执行告警引用了不存在的项目通知渠道")
+    for policy in merged["alert_tag_policies"]:
+        policy_channels = {str(item) for item in policy.get("notification_channel_ids", [])}
+        if not policy_channels.issubset(channel_ids):
+            raise ValueError("标签告警策略引用了不存在的项目通知渠道")
+    for check in list_checks(project_id=project_id, refresh_stale=False):
+        try:
+            policy = json.loads(check.get("alert_policy_json") or "{}")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(policy, dict):
+            continue
+        task_channels = {str(item) for item in policy.get("notification_channel_ids", [])}
+        if not task_channels.issubset(channel_ids):
+            raise ValueError(f"任务“{check['name']}”引用了即将缺失的项目通知渠道")
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE project_alert_settings
+            SET alerts_enabled = ?, notification_channels_json = ?,
+                execution_notification_channel_ids_json = ?, alert_tag_policies_json = ?,
+                alert_cooldown_minutes = ?, recovery_notification = ?, updated_at = ?
+            WHERE project_id = ?
+            """,
+            (
+                1 if merged["alerts_enabled"] else 0,
+                json.dumps(merged["notification_channels"], ensure_ascii=False),
+                json.dumps(merged["execution_notification_channel_ids"], ensure_ascii=False),
+                json.dumps(merged["alert_tag_policies"], ensure_ascii=False),
+                int(merged["alert_cooldown_minutes"]),
+                1 if merged["recovery_notification"] else 0,
+                now_iso(),
+                int(project_id),
+            ),
+        )
+    return get_project_alert_settings(project_id, public=True)
+
+
+def list_checks(
+    check_type: str | None = None,
+    enabled_only: bool = False,
+    refresh_stale: bool = True,
+    project_id: int | None = None,
+    active_projects_only: bool = False,
+) -> list[dict[str, Any]]:
     if refresh_stale:
-        refresh_stale_statuses()
+        refresh_stale_statuses(project_id=project_id)
     sql = """
         SELECT c.*, s.current_status, s.monitor_status, s.consecutive_failures,
                s.consecutive_successes, s.last_success_at, s.last_failed_at,
@@ -424,10 +1073,15 @@ def list_checks(check_type: str | None = None, enabled_only: bool = False, refre
         params.append(check_type)
     if enabled_only:
         clauses.append("c.enabled = 1")
+    if project_id is not None:
+        clauses.append("c.project_id = ?")
+        params.append(int(project_id))
+    if active_projects_only:
+        clauses.append("EXISTS (SELECT 1 FROM projects p WHERE p.id = c.project_id AND p.status = 'active')")
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY c.updated_at DESC, c.id DESC"
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         return [_normalize_check(row) for row in conn.execute(sql, params).fetchall()]
 
 
@@ -435,18 +1089,23 @@ def check_tag_set(tags: str | None) -> set[str]:
     return {item.strip().lower() for item in _TAG_SPLIT_PATTERN.split(tags or "") if item.strip()}
 
 
-def select_checks_for_batch(check_type: str | None = None, tag: str | None = None, enabled_only: bool = False) -> list[dict[str, Any]]:
-    checks = list_checks(check_type, enabled_only=enabled_only)
+def select_checks_for_batch(
+    check_type: str | None = None,
+    tag: str | None = None,
+    enabled_only: bool = False,
+    project_id: int | None = None,
+) -> list[dict[str, Any]]:
+    checks = list_checks(check_type, enabled_only=enabled_only, project_id=project_id)
     normalized_tag = (tag or "").strip().lower()
     if not normalized_tag:
         return checks
     return [check for check in checks if normalized_tag in check_tag_set(check.get("tags"))]
 
 
-def get_check(check_id: int, refresh_stale: bool = True) -> dict[str, Any] | None:
+def get_check(check_id: int, refresh_stale: bool = True, project_id: int | None = None) -> dict[str, Any] | None:
     if refresh_stale:
-        refresh_stale_statuses(check_id)
-    with _LOCK, _connect() as conn:
+        refresh_stale_statuses(check_id, project_id=project_id)
+    with _connect(read_only=True) as conn:
         row = conn.execute(
             """
             SELECT c.*, s.current_status, s.monitor_status, s.consecutive_failures,
@@ -457,25 +1116,27 @@ def get_check(check_id: int, refresh_stale: bool = True) -> dict[str, Any] | Non
             FROM checks c
             LEFT JOIN check_status s ON s.check_id = c.id
             LEFT JOIN runs r ON r.id = s.last_run_id
-            WHERE c.id = ?
+            WHERE c.id = ? AND (? IS NULL OR c.project_id = ?)
             """,
-            (check_id,),
+            (check_id, project_id, project_id),
         ).fetchone()
     return _normalize_check(row) if row else None
 
 
-def create_check(data: dict[str, Any]) -> dict[str, Any]:
+def create_check(data: dict[str, Any], project_id: int | None = None) -> dict[str, Any]:
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    owner_project_id = int(project_id or data.get("project_id") or default_project_id())
+    with _connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO checks (
-                name, type, enabled, interval_seconds, timeout_ms, entry_url, viewport_mode, method,
+                project_id, name, type, enabled, interval_seconds, timeout_ms, entry_url, viewport_mode, method,
                 headers_json, body, assertions_json, setup_script, script, tags, alert_policy_json,
                 runner_selection_mode, runner_ids_json, browser_selection_mode, browser_types_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                owner_project_id,
                 data["name"].strip(),
                 data["type"],
                 1 if data.get("enabled", True) else 0,
@@ -500,12 +1161,12 @@ def create_check(data: dict[str, Any]) -> dict[str, Any]:
             ),
         )
         check_id = int(cursor.lastrowid)
-    return get_check(check_id)  # type: ignore[return-value]
+    return get_check(check_id, project_id=owner_project_id)  # type: ignore[return-value]
 
 
-def update_check(check_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
+def update_check(check_id: int, data: dict[str, Any], project_id: int | None = None) -> dict[str, Any] | None:
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE checks
@@ -513,7 +1174,7 @@ def update_check(check_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 entry_url = ?, viewport_mode = ?, method = ?, headers_json = ?, body = ?, assertions_json = ?, setup_script = ?,
                 script = ?, tags = ?, alert_policy_json = ?, runner_selection_mode = ?, runner_ids_json = ?,
                 browser_selection_mode = ?, browser_types_json = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND (? IS NULL OR project_id = ?)
             """,
             (
                 data["name"].strip(),
@@ -537,53 +1198,61 @@ def update_check(check_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 json.dumps(_normalize_check_browser_types(data), ensure_ascii=False),
                 timestamp,
                 check_id,
+                project_id,
+                project_id,
             ),
         )
         if cursor.rowcount == 0:
             return None
-    return get_check(check_id)
+    return get_check(check_id, project_id=project_id)
 
 
-def delete_check(check_id: int) -> bool:
-    with _LOCK, _connect() as conn:
+def delete_check(check_id: int, project_id: int | None = None) -> bool:
+    with _connect() as conn:
+        owned = conn.execute(
+            "SELECT 1 FROM checks WHERE id = ? AND (? IS NULL OR project_id = ?)",
+            (check_id, project_id, project_id),
+        ).fetchone()
+        if not owned:
+            return False
         conn.execute("DELETE FROM check_status WHERE check_id = ?", (check_id,))
         cursor = conn.execute("DELETE FROM checks WHERE id = ?", (check_id,))
         return cursor.rowcount > 0
 
 
-def set_check_enabled(check_id: int, enabled: bool) -> dict[str, Any] | None:
-    with _LOCK, _connect() as conn:
+def set_check_enabled(check_id: int, enabled: bool, project_id: int | None = None) -> dict[str, Any] | None:
+    with _connect() as conn:
         cursor = conn.execute(
-            "UPDATE checks SET enabled = ?, updated_at = ? WHERE id = ?",
-            (1 if enabled else 0, now_iso(), check_id),
+            "UPDATE checks SET enabled = ?, updated_at = ? WHERE id = ? AND (? IS NULL OR project_id = ?)",
+            (1 if enabled else 0, now_iso(), check_id, project_id, project_id),
         )
         if cursor.rowcount == 0:
             return None
-    return get_check(check_id)
+    return get_check(check_id, project_id=project_id)
 
 
-def batch_set_check_enabled(check_ids: list[int], enabled: bool) -> int:
+def batch_set_check_enabled(check_ids: list[int], enabled: bool, project_id: int | None = None) -> int:
     ids = _clean_check_ids(check_ids)
     if not ids:
         return 0
     placeholders = ",".join("?" for _ in ids)
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
-            f"UPDATE checks SET enabled = ?, updated_at = ? WHERE id IN ({placeholders})",
-            [1 if enabled else 0, now_iso(), *ids],
+            f"UPDATE checks SET enabled = ?, updated_at = ? WHERE id IN ({placeholders}) AND (? IS NULL OR project_id = ?)",
+            [1 if enabled else 0, now_iso(), *ids, project_id, project_id],
         )
         return int(cursor.rowcount)
 
 
-def batch_update_check_interval(check_ids: list[int], interval_seconds: int) -> int:
+def batch_update_check_interval(check_ids: list[int], interval_seconds: int, project_id: int | None = None) -> int:
     ids = _clean_check_ids(check_ids)
     if not ids:
         return 0
     placeholders = ",".join("?" for _ in ids)
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
-            f"UPDATE checks SET interval_seconds = ?, updated_at = ? WHERE id IN ({placeholders})",
-            [int(interval_seconds), now_iso(), *ids],
+            f"UPDATE checks SET interval_seconds = ?, updated_at = ? WHERE id IN ({placeholders}) AND (? IS NULL OR project_id = ?)",
+            [int(interval_seconds), now_iso(), *ids, project_id, project_id],
         )
         return int(cursor.rowcount)
 
@@ -604,7 +1273,7 @@ def record_heartbeat(key: str, status: str = "ok", message: str = "", payload: d
     heartbeat_key = key.strip()
     timestamp = now_iso()
     payload_json = json.dumps(payload or {}, ensure_ascii=False)
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         conn.execute(
             """
             INSERT INTO heartbeats(key, status, message, payload_json, received_at, updated_at)
@@ -625,19 +1294,19 @@ def get_heartbeat(key: str) -> dict[str, Any] | None:
     heartbeat_key = key.strip()
     if not heartbeat_key:
         return None
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         row = conn.execute("SELECT * FROM heartbeats WHERE key = ?", (heartbeat_key,)).fetchone()
     return _normalize_heartbeat(row) if row else None
 
 
 def get_deployment_state() -> dict[str, Any]:
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         return _read_deployment_state(conn)
 
 
 def start_deployment_window(reason: str = "docker-deploy") -> dict[str, Any]:
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         previous = _read_deployment_state(conn)
         started_at = previous.get("started_at") if previous.get("active") else timestamp
         state = {
@@ -653,7 +1322,7 @@ def start_deployment_window(reason: str = "docker-deploy") -> dict[str, Any]:
 
 def finish_deployment_window() -> dict[str, Any]:
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         previous = _read_deployment_state(conn)
         state = {
             "active": False,
@@ -671,12 +1340,12 @@ def is_deployment_window_active() -> bool:
 
 
 def discard_incomplete_runs() -> int:
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         return _discard_incomplete_runs(conn)
 
 
 def discard_incomplete_run(run_id: int) -> bool:
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         conn.execute("UPDATE check_status SET last_run_id = NULL WHERE last_run_id = ?", (run_id,))
         conn.execute("UPDATE check_status SET last_scheduled_run_id = NULL WHERE last_scheduled_run_id = ?", (run_id,))
         cursor = conn.execute(
@@ -693,15 +1362,17 @@ def record_audit_event(
     entity_name: str = "",
     summary: str = "",
     payload: dict[str, Any] | None = None,
+    project_id: int | None = None,
 ) -> dict[str, Any]:
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO audit_events(action, entity_type, entity_id, entity_name, summary, payload_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audit_events(project_id, action, entity_type, entity_id, entity_name, summary, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                project_id,
                 action,
                 entity_type,
                 str(entity_id) if entity_id is not None else None,
@@ -715,17 +1386,35 @@ def record_audit_event(
     return get_audit_event(event_id)  # type: ignore[return-value]
 
 
-def get_audit_event(event_id: int) -> dict[str, Any] | None:
-    with _LOCK, _connect() as conn:
-        row = conn.execute("SELECT * FROM audit_events WHERE id = ?", (event_id,)).fetchone()
+def get_audit_event(event_id: int, project_id: int | None = None) -> dict[str, Any] | None:
+    with _connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM audit_events WHERE id = ? AND (? IS NULL OR project_id = ?)",
+            (event_id, project_id, project_id),
+        ).fetchone()
     return _normalize_audit_event(row) if row else None
 
 
-def list_audit_events(limit: int = 100) -> list[dict[str, Any]]:
-    with _LOCK, _connect() as conn:
+def list_audit_events(
+    limit: int = 100,
+    project_id: int | None = None,
+    *,
+    include_global: bool = False,
+) -> list[dict[str, Any]]:
+    if project_id is None:
+        where = "1 = 1"
+        params: list[Any] = []
+    elif include_global:
+        where = "(project_id = ? OR project_id IS NULL)"
+        params = [int(project_id)]
+    else:
+        where = "project_id = ?"
+        params = [int(project_id)]
+    params.append(max(1, min(500, int(limit))))
+    with _connect(read_only=True) as conn:
         rows = conn.execute(
-            "SELECT * FROM audit_events ORDER BY created_at DESC, id DESC LIMIT ?",
-            (max(1, min(500, int(limit))),),
+            f"SELECT * FROM audit_events WHERE {where} ORDER BY created_at DESC, id DESC LIMIT ?",
+            params,
         ).fetchall()
     return [_normalize_audit_event(row) for row in rows]
 
@@ -734,48 +1423,52 @@ def record_check_version(check: dict[str, Any], action: str) -> dict[str, Any]:
     timestamp = now_iso()
     check_id = int(check["id"])
     snapshot = _check_snapshot(check)
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO check_versions(check_id, action, snapshot_json, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO check_versions(project_id, check_id, action, snapshot_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (check_id, action, json.dumps(snapshot, ensure_ascii=False), timestamp),
+            (int(check["project_id"]), check_id, action, json.dumps(snapshot, ensure_ascii=False), timestamp),
         )
         version_id = int(cursor.lastrowid)
     return get_check_version(version_id)  # type: ignore[return-value]
 
 
-def get_check_version(version_id: int) -> dict[str, Any] | None:
-    with _LOCK, _connect() as conn:
-        row = conn.execute("SELECT * FROM check_versions WHERE id = ?", (version_id,)).fetchone()
+def get_check_version(version_id: int, project_id: int | None = None) -> dict[str, Any] | None:
+    with _connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM check_versions WHERE id = ? AND (? IS NULL OR project_id = ?)",
+            (version_id, project_id, project_id),
+        ).fetchone()
     return _normalize_check_version(row) if row else None
 
 
-def list_check_versions(check_id: int, limit: int = 50) -> list[dict[str, Any]]:
-    with _LOCK, _connect() as conn:
+def list_check_versions(check_id: int, limit: int = 50, project_id: int | None = None) -> list[dict[str, Any]]:
+    with _connect(read_only=True) as conn:
         rows = conn.execute(
             """
             SELECT * FROM check_versions
-            WHERE check_id = ?
+            WHERE check_id = ? AND (? IS NULL OR project_id = ?)
             ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
-            (check_id, max(1, min(200, int(limit)))),
+            (check_id, project_id, project_id, max(1, min(200, int(limit)))),
         ).fetchall()
     return [_normalize_check_version(row) for row in rows]
 
 
-def list_run_archives(limit: int = 90) -> list[dict[str, Any]]:
-    with _LOCK, _connect() as conn:
+def list_run_archives(limit: int = 90, project_id: int | None = None) -> list[dict[str, Any]]:
+    with _connect(read_only=True) as conn:
         rows = conn.execute(
             """
             SELECT *
             FROM run_archives
+            WHERE (? IS NULL OR project_id = ?)
             ORDER BY archive_date DESC, check_type ASC, status ASC
             LIMIT ?
             """,
-            (max(1, min(365, int(limit))),),
+            (project_id, project_id, max(1, min(365, int(limit)))),
         ).fetchall()
     return [_normalize_run_archive(row) for row in rows]
 
@@ -796,6 +1489,7 @@ def list_monitoring_trends(
     page_size: int = 12,
     hour_start: str | None = None,
     hour_end: str | None = None,
+    project_id: int | None = None,
 ) -> dict[str, Any]:
     range_start, range_end = _trend_window(period, start, end)
     hour_window = _parse_hour_window(hour_start, hour_end)
@@ -803,17 +1497,17 @@ def list_monitoring_trends(
     page_size = max(1, min(50, int(page_size)))
     normalized_type = _normalize_trend_check_type(check_type)
     query = (q or "").strip()
-    refresh_stale_statuses()
-    with _LOCK, _connect() as conn:
-        total, checks = _monitoring_checks_page(conn, normalized_type, query, page, page_size)
+    refresh_stale_statuses(project_id=project_id)
+    with _connect(read_only=True) as conn:
+        total, checks = _monitoring_checks_page(conn, normalized_type, query, page, page_size, project_id)
         summary_types = [normalized_type] if normalized_type else ["ui", "api"]
         summary_ids = [TREND_SUMMARY_CHECK_IDS[item] for item in summary_types]
         summaries_by_id = _trend_series_by_check(
-            conn, summary_ids, range_start, range_end, 100, hour_window=hour_window
+            conn, summary_ids, range_start, range_end, 100, hour_window=hour_window, project_id=project_id
         )
         task_ids = [int(check["id"]) for check in checks]
         tasks_by_id = _trend_series_by_check(
-            conn, task_ids, range_start, range_end, 20, hour_window=hour_window
+            conn, task_ids, range_start, range_end, 20, hour_window=hour_window, project_id=project_id
         )
 
     return {
@@ -858,15 +1552,16 @@ def get_check_trend(
     end: str | None = None,
     hour_start: str | None = None,
     hour_end: str | None = None,
+    project_id: int | None = None,
 ) -> dict[str, Any] | None:
-    check = get_check(check_id)
+    check = get_check(check_id, project_id=project_id)
     if not check:
         return None
     range_start, range_end = _trend_window(period, start, end)
     hour_window = _parse_hour_window(hour_start, hour_end)
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         series = _trend_series_by_check(
-            conn, [check_id], range_start, range_end, 100, hour_window=hour_window
+            conn, [check_id], range_start, range_end, 100, hour_window=hour_window, project_id=project_id
         ).get(check_id, _empty_trend_series())
     return {
         "period": period,
@@ -897,19 +1592,20 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
     metadata = check.get("_run") if isinstance(check.get("_run"), dict) else run_metadata(
         "scheduled" if int(check.get("id") or 0) > 0 else "draft"
     )
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO runs (
-                check_id, check_name, check_type, status, started_at, finished_at,
+                project_id, check_id, check_name, check_type, status, started_at, finished_at,
                 duration_ms, error_message, error_stack, logs, screenshot_path,
                 trace_path, response_path, request_snapshot, response_snapshot,
                 runner_id, runner_name, runner_address, runner_region, runner_browser_version, browser_type, failure_kind,
                 notification_status, notification_channel, notification_error,
                 notification_sent_at, trigger, observation_kind, affects_health, run_group_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                int(check.get("project_id") or default_project_id()),
                 int(check["id"]),
                 check["name"],
                 check["type"],
@@ -949,7 +1645,7 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
 
 def start_run(run_id: int) -> dict[str, Any] | None:
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE runs
@@ -976,7 +1672,7 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
         data.get("error_message"),
     )
     removed_artifact_paths: list[str] = []
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE runs
@@ -1159,7 +1855,7 @@ def upsert_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
     if not runner_id:
         raise ValueError("Runner ID 不能为空")
     metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         conn.execute(
             """
             INSERT INTO probe_runners (
@@ -1223,7 +1919,7 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
             "allow_insecure_http": allow_insecure_http,
         }
     )
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         if conn.execute("SELECT 1 FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone():
             raise ValueError("Runner ID already exists")
         conn.execute(
@@ -1269,7 +1965,7 @@ def provision_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
     timestamp = now_iso()
     expires_at = (datetime.now().astimezone() + timedelta(hours=RELAY_DEPLOY_COMMAND_TTL_HOURS)).isoformat(timespec="seconds")
     metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         _expire_probe_runner_provisions(conn)
         if conn.execute("SELECT 1 FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone():
             raise ValueError("Runner ID already exists")
@@ -1319,7 +2015,7 @@ def regenerate_probe_runner_provision(runner_id: str) -> dict[str, Any] | None:
     relay_token = create_relay_token()
     timestamp = now_iso()
     expires_at = (datetime.now().astimezone() + timedelta(hours=RELAY_DEPLOY_COMMAND_TTL_HOURS)).isoformat(timespec="seconds")
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         _expire_probe_runner_provisions(conn)
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         if not row:
@@ -1380,7 +2076,7 @@ def regenerate_probe_runner_provision(runner_id: str) -> dict[str, Any] | None:
 def update_probe_runner(runner_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         current = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         if not current:
             return None
@@ -1450,7 +2146,7 @@ def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = 
     available_browser_types = _normalize_runner_browser_types(health.get("available_browser_types"))
     metadata = health.get("metadata") if isinstance(health.get("metadata"), dict) else {}
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         current = conn.execute("SELECT connection_mode FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         next_status = "available" if current and str(current["connection_mode"] or "") == "relay" else status
         cursor = conn.execute(
@@ -1492,7 +2188,7 @@ def delete_probe_runner(runner_id: str) -> bool:
     runner_id = _normalize_runner_id(runner_id)
     if runner_id == LOCAL_RUNNER_ID:
         raise ValueError("local Runner cannot be deleted")
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         row = conn.execute("SELECT allocated_internal_port FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         cursor = conn.execute("DELETE FROM probe_runners WHERE runner_id = ?", (runner_id,))
         if cursor.rowcount > 0 and row and row["allocated_internal_port"]:
@@ -1507,7 +2203,7 @@ def rotate_probe_runner_token(runner_id: str) -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     token = create_runner_token()
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE probe_runners
@@ -1524,14 +2220,14 @@ def rotate_probe_runner_token(runner_id: str) -> dict[str, Any] | None:
 
 
 def get_probe_runner(runner_id: str) -> dict[str, Any] | None:
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         _expire_probe_runner_provisions(conn)
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
     return _normalize_probe_runner(row) if row else None
 
 
 def list_probe_runners(limit: int = 100) -> list[dict[str, Any]]:
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         _expire_probe_runner_provisions(conn)
         rows = conn.execute(
             """
@@ -1546,7 +2242,7 @@ def list_probe_runners(limit: int = 100) -> list[dict[str, Any]]:
 
 
 def list_enabled_probe_runners() -> list[dict[str, Any]]:
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         _expire_probe_runner_provisions(conn)
         rows = conn.execute(
             """
@@ -1568,7 +2264,7 @@ def list_probe_runners_by_ids(runner_ids: list[str]) -> list[dict[str, Any]]:
     if not ids:
         return []
     placeholders = ",".join("?" for _ in ids)
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         _expire_probe_runner_provisions(conn)
         rows = conn.execute(f"SELECT * FROM probe_runners WHERE runner_id IN ({placeholders})", ids).fetchall()
     by_id = {_normalize_probe_runner(row)["runner_id"]: _normalize_probe_runner(row) for row in rows}
@@ -1673,7 +2369,7 @@ def verify_probe_runner_token(runner_id: str, token: str) -> dict[str, Any] | No
     token = str(token or "").strip()
     if not runner_id or not token:
         return None
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
     if not row:
         return None
@@ -1688,7 +2384,7 @@ def verify_probe_runner_token(runner_id: str, token: str) -> dict[str, Any] | No
 
 def get_probe_runner_token(runner_id: str) -> str:
     runner_id = _normalize_runner_id(runner_id)
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         row = conn.execute("SELECT token_value FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
     return _load_runner_token(str(row["token_value"] or "")) if row else ""
 
@@ -1701,7 +2397,7 @@ def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) ->
     token = str(token or "").strip()
     if not token:
         return None
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         _expire_probe_runner_provisions(conn)
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
     if not row:
@@ -1733,7 +2429,7 @@ def mark_probe_runner_relay_connected(runner_id: str, token_version: int | None 
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
     connected_version = int(token_version or 0)
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE probe_runners
@@ -1771,7 +2467,7 @@ def mark_probe_runner_relay_connected(runner_id: str, token_version: int | None 
 def mark_probe_runner_relay_seen(runner_id: str) -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE probe_runners
@@ -1790,7 +2486,7 @@ def mark_probe_runner_relay_seen(runner_id: str) -> dict[str, Any] | None:
 def mark_probe_runner_relay_disconnected(runner_id: str, reason: str = "") -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         current_status = str(row["status"] or "") if row else ""
         if row and _relay_token_rotation_pending(row):
@@ -1819,7 +2515,7 @@ def mark_relay_runners_restarted(reason: str = "relay server restarted") -> int:
     timestamp = now_iso()
     pre_activation = tuple(RELAY_PRE_ACTIVATION_STATUSES)
     placeholders = ", ".join("?" for _ in pre_activation)
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             f"""
             UPDATE probe_runners
@@ -1848,7 +2544,7 @@ def mark_probe_runner_relay_auth_failed(runner_id: str) -> dict[str, Any] | None
     except ValueError:
         return None
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         current_status = str(row["status"] or "") if row else ""
         if row and _relay_token_rotation_pending(row):
@@ -1914,7 +2610,7 @@ def ensure_probe_runner_transport_allowed(runner: dict[str, Any]) -> None:
 def mark_probe_runner_updating(runner_id: str) -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE probe_runners
@@ -1936,7 +2632,7 @@ def restore_probe_runner_status(runner_id: str, status: str) -> dict[str, Any] |
     if not status:
         return get_probe_runner(runner_id)
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE probe_runners
@@ -1954,7 +2650,7 @@ def restore_probe_runner_status(runner_id: str, status: str) -> dict[str, Any] |
 def mark_probe_runner_unavailable(runner_id: str, status: str = "offline") -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         row = conn.execute("SELECT connection_mode, was_available, status FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         next_status = status
         if row and str(row["connection_mode"] or "") == "relay":
@@ -1983,7 +2679,7 @@ def mark_probe_runner_unavailable(runner_id: str, status: str = "offline") -> di
 def mark_probe_runner_unavailable_notified(runner_id: str) -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE probe_runners
@@ -2008,7 +2704,7 @@ def should_notify_probe_runner_unavailable(runner: dict[str, Any]) -> bool:
 def next_runner_cursor(scope: str, count: int) -> int:
     count = max(1, int(count))
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         row = conn.execute("SELECT cursor FROM runner_cursors WHERE scope = ?", (scope,)).fetchone()
         current = int(row["cursor"] or 0) if row else 0
         next_cursor = (current + 1) % count
@@ -2029,7 +2725,7 @@ def update_run_notification(
     error: str | None = None,
     sent_at: str | None = None,
 ) -> dict[str, Any] | None:
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE runs
@@ -2050,7 +2746,7 @@ def update_check_status(check_id: int, run: dict[str, Any]) -> dict[str, Any]:
     timestamp = run.get("finished_at") or now_iso()
     settings = get_settings()
 
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         previous = conn.execute(
             "SELECT * FROM check_status WHERE check_id = ?",
             (check_id,),
@@ -2113,7 +2809,7 @@ def update_check_status(check_id: int, run: dict[str, Any]) -> dict[str, Any]:
     return transition
 
 
-def refresh_stale_statuses(check_id: int | None = None) -> int:
+def refresh_stale_statuses(check_id: int | None = None, project_id: int | None = None) -> int:
     settings = get_settings()
     stale_after = max(1, int(settings.get("stale_after_intervals", 2)))
     clauses = ["c.enabled = 1", "s.last_scheduled_at IS NOT NULL", "s.monitor_status != 'stale'"]
@@ -2121,39 +2817,35 @@ def refresh_stale_statuses(check_id: int | None = None) -> int:
     if check_id is not None:
         clauses.append("c.id = ?")
         params.append(check_id)
-    with _LOCK, _connect() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT c.id, c.interval_seconds, s.last_scheduled_at
-            FROM checks c
-            JOIN check_status s ON s.check_id = c.id
-            WHERE {" AND ".join(clauses)}
-            """,
-            params,
-        ).fetchall()
-        stale_ids: list[int] = []
-        now = datetime.now().astimezone()
-        for row in rows:
-            try:
-                last_scheduled = datetime.fromisoformat(str(row["last_scheduled_at"]))
-            except ValueError:
-                continue
-            if now - last_scheduled > timedelta(seconds=max(5, int(row["interval_seconds"])) * stale_after):
-                stale_ids.append(int(row["id"]))
-        if not stale_ids:
+    if project_id is not None:
+        clauses.append("c.project_id = ?")
+        params.append(int(project_id))
+    clauses.append("julianday(s.last_scheduled_at) < julianday(?) - (MAX(5, c.interval_seconds) * ? / 86400.0)")
+    params.extend((datetime.now().astimezone().isoformat(timespec="microseconds"), stale_after))
+    candidates_sql = f"""
+        SELECT c.id
+        FROM checks c
+        JOIN check_status s ON s.check_id = c.id
+        WHERE {" AND ".join(clauses)}
+    """
+    # Most GETs find no expired checks. Keep that path entirely on a read-only
+    # snapshot, then recheck the predicate during UPDATE so a new result cannot
+    # be overwritten by an expiry decision from an earlier snapshot.
+    with _connect(read_only=True) as conn:
+        if conn.execute(f"{candidates_sql} LIMIT 1", params).fetchone() is None:
             return 0
-        placeholders = ",".join("?" for _ in stale_ids)
+    with _connect() as conn:
         timestamp = now_iso()
-        conn.execute(
+        cursor = conn.execute(
             f"""
             UPDATE check_status
             SET current_status = 'stale', monitor_status = 'stale',
                 last_state_changed_at = ?, updated_at = ?
-            WHERE check_id IN ({placeholders})
+            WHERE check_id IN ({candidates_sql})
             """,
-            [timestamp, timestamp, *stale_ids],
+            [timestamp, timestamp, *params],
         )
-        return len(stale_ids)
+        return cursor.rowcount
 
 
 def _update_anomaly_cycle(
@@ -2189,11 +2881,12 @@ def _update_anomaly_cycle(
             conn.execute(
                 """
                 INSERT INTO anomaly_cycles (
-                    check_id, status, opened_at, first_run_id, last_run_id,
+                    project_id, check_id, status, opened_at, first_run_id, last_run_id,
                     failure_count, failure_kind, summary
-                ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    int(run["project_id"]),
                     check_id,
                     timestamp,
                     run["id"],
@@ -2215,7 +2908,7 @@ def _update_anomaly_cycle(
 
 
 def get_status_transition(check_id: int, current_status: str) -> dict[str, Any]:
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         row = conn.execute("SELECT * FROM check_status WHERE check_id = ?", (check_id,)).fetchone()
     previous = dict(row) if row else {}
     return {
@@ -2228,16 +2921,19 @@ def get_status_transition(check_id: int, current_status: str) -> dict[str, Any]:
 
 
 def update_last_notified(check_id: int, notified_at: str | None = None) -> None:
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         conn.execute(
             "UPDATE check_status SET last_notified_at = ?, updated_at = ? WHERE check_id = ?",
             (notified_at or now_iso(), now_iso(), check_id),
         )
 
 
-def get_run(run_id: int) -> dict[str, Any] | None:
-    with _LOCK, _connect() as conn:
-        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+def get_run(run_id: int, project_id: int | None = None) -> dict[str, Any] | None:
+    with _connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM runs WHERE id = ? AND (? IS NULL OR project_id = ?)",
+            (run_id, project_id, project_id),
+        ).fetchone()
     return _normalize_run(row) if row else None
 
 
@@ -2246,7 +2942,7 @@ def get_previous_successful_run(run: dict[str, Any]) -> dict[str, Any] | None:
     run_id = int(run.get("id") or 0)
     if check_id <= 0 or run_id <= 0:
         return None
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         row = conn.execute(
             """
             SELECT *
@@ -2262,9 +2958,9 @@ def get_previous_successful_run(run: dict[str, Any]) -> dict[str, Any] | None:
     return _normalize_run(row) if row else None
 
 
-def list_recent_business_incidents(limit: int = 20) -> list[dict[str, Any]]:
+def list_recent_business_incidents(limit: int = 20, project_id: int | None = None) -> list[dict[str, Any]]:
     limit = max(1, min(100, int(limit)))
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         rows = conn.execute(
             f"""
             SELECT {_run_summary_select()}
@@ -2273,10 +2969,11 @@ def list_recent_business_incidents(limit: int = 20) -> list[dict[str, Any]]:
               AND affects_health = 1
               AND status IN ('failed', 'timeout')
               AND (failure_kind IS NULL OR failure_kind = 'target')
+              AND (? IS NULL OR project_id = ?)
             ORDER BY started_at DESC, id DESC
             LIMIT ?
             """,
-            (limit,),
+            (project_id, project_id, limit),
         ).fetchall()
     return [_normalize_run(row) for row in rows]
 
@@ -2285,6 +2982,10 @@ def list_runs(filters: dict[str, Any] | None = None, limit: int = 100, summary_o
     filters = filters or {}
     clauses: list[str] = []
     params: list[Any] = []
+
+    if filters.get("project_id") is not None:
+        clauses.append("project_id = ?")
+        params.append(int(filters["project_id"]))
 
     if filters.get("check_type"):
         clauses.append("check_type = ?")
@@ -2330,7 +3031,7 @@ def list_runs(filters: dict[str, Any] | None = None, limit: int = 100, summary_o
     sql += " ORDER BY started_at DESC, id DESC LIMIT ?"
     params.append(limit)
 
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         return [_normalize_run(row) for row in conn.execute(sql, params).fetchall()]
 
 
@@ -2344,7 +3045,7 @@ def list_runs_page(
     page_size = max(1, min(100, int(page_size)))
     clauses, params = _run_filter_clauses(filters)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         total = int(conn.execute(f"SELECT COUNT(*) AS count FROM runs{where}", params).fetchone()["count"])
         rows = conn.execute(
             f"SELECT {_run_summary_select()} FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -2361,6 +3062,9 @@ def list_runs_page(
 def _run_filter_clauses(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
+    if filters.get("project_id") is not None:
+        clauses.append("project_id = ?")
+        params.append(int(filters["project_id"]))
     mappings = (
         ("check_type", "check_type"),
         ("notification_status", "notification_status"),
@@ -2394,13 +3098,19 @@ def _run_filter_clauses(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
     return clauses, params
 
 
-def list_anomaly_cycles(limit: int = 100, status: str | None = None) -> list[dict[str, Any]]:
+def list_anomaly_cycles(
+    limit: int = 100, status: str | None = None, project_id: int | None = None
+) -> list[dict[str, Any]]:
     params: list[Any] = []
-    where = ""
+    clauses: list[str] = []
     if status:
-        where = "WHERE a.status = ?"
+        clauses.append("a.status = ?")
         params.append(status)
-    with _LOCK, _connect() as conn:
+    if project_id is not None:
+        clauses.append("a.project_id = ?")
+        params.append(int(project_id))
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    with _connect(read_only=True) as conn:
         rows = conn.execute(
             f"""
             SELECT a.*, c.name AS check_name, c.type AS check_type
@@ -2416,18 +3126,16 @@ def list_anomaly_cycles(limit: int = 100, status: str | None = None) -> list[dic
 
 
 def create_database_backup(preserve_filename: str | None = None) -> dict[str, Any]:
+    with _DATABASE_ACCESS.shared(), _LOCK:
+        return _create_database_backup(preserve_filename)
+
+
+def _create_database_backup(preserve_filename: str | None = None) -> dict[str, Any]:
     ensure_runtime_dirs()
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"pulseguard-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f')}.db"
     target = BACKUPS_DIR / filename
-    with _LOCK:
-        source = sqlite3.connect(DB_PATH, timeout=30)
-        destination = sqlite3.connect(target, timeout=30)
-        try:
-            source.backup(destination)
-        finally:
-            destination.close()
-            source.close()
+    _copy_database(Path(DB_PATH), target)
     preserve_filenames = {target.name}
     if preserve_filename:
         preserve_filenames.add(preserve_filename)
@@ -2435,27 +3143,101 @@ def create_database_backup(preserve_filename: str | None = None) -> dict[str, An
     return _database_backup_info(target)
 
 
+def get_database_health() -> dict[str, Any]:
+    """Return read-only SQLite capacity signals for operational diagnosis."""
+    database_path = Path(DB_PATH)
+    with _connect(read_only=True) as conn:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        freelist_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
+        file_size = _database_file_size(database_path, fallback=page_count * page_size)
+        wal_size = _database_file_size(Path(f"{database_path}-wal"))
+
+    reclaimable_bytes = freelist_pages * page_size
+    allocated_bytes = page_count * page_size
+    reclaimable_ratio = reclaimable_bytes / allocated_bytes if allocated_bytes else 0.0
+    maintenance_recommended = (
+        reclaimable_bytes >= DATABASE_MAINTENANCE_MIN_RECLAIMABLE_BYTES
+        and reclaimable_ratio >= DATABASE_MAINTENANCE_MIN_RECLAIMABLE_RATIO
+    )
+    return {
+        "status": "attention" if maintenance_recommended else "normal",
+        "file_size_bytes": file_size,
+        "wal_size_bytes": wal_size,
+        "page_size_bytes": page_size,
+        "page_count": page_count,
+        "freelist_pages": freelist_pages,
+        "estimated_used_bytes": max(0, allocated_bytes - reclaimable_bytes),
+        "reclaimable_bytes": reclaimable_bytes,
+        "reclaimable_ratio": round(reclaimable_ratio, 4),
+        "journal_mode": journal_mode,
+        "maintenance_recommended": maintenance_recommended,
+    }
+
+
+def _database_file_size(path: Path, *, fallback: int = 0) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        # A WAL file can disappear when the last writable connection closes.
+        return fallback
+
+
 def list_database_backups() -> list[dict[str, Any]]:
-    ensure_runtime_dirs()
-    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-    return [_database_backup_info(path) for path in sorted(BACKUPS_DIR.glob("pulseguard-*.db"), reverse=True)]
+    with _DATABASE_ACCESS.shared(), _LOCK:
+        ensure_runtime_dirs()
+        BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+        return [_database_backup_info(path) for path in sorted(BACKUPS_DIR.glob("pulseguard-*.db"), reverse=True)]
 
 
 def restore_database_backup(filename: str) -> dict[str, Any]:
+    with _DATABASE_ACCESS.exclusive():
+        return _restore_database_backup(filename)
+
+
+def _restore_database_backup(filename: str) -> dict[str, Any]:
     source_path = (BACKUPS_DIR / filename).resolve()
     if source_path.parent != BACKUPS_DIR.resolve() or not source_path.is_file():
         raise ValueError("数据库备份不存在")
+    source = sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True, timeout=30)
+    try:
+        if [row[0] for row in source.execute("PRAGMA quick_check")] != ["ok"]:
+            raise ValueError("数据库备份校验失败")
+        tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if not {"projects", "checks", "runs", "settings"}.issubset(tables):
+            raise ValueError("数据库备份缺少必要的数据表，请先完成对应版本迁移")
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("数据库备份校验失败") from exc
+    finally:
+        source.close()
     safety_backup = create_database_backup(preserve_filename=source_path.name)
-    with _LOCK:
-        source = sqlite3.connect(source_path, timeout=30)
-        destination = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        _copy_database(source_path, Path(DB_PATH))
+        init_db()
+    except BaseException:
+        # Keep the exclusive gate until the original, already initialized state is
+        # restored. In particular, never publish a partially migrated database.
+        try:
+            _copy_database(BACKUPS_DIR / safety_backup["filename"], Path(DB_PATH))
+        except BaseException as recovery_error:
+            raise DatabaseRestoreRecoveryError(
+                f"数据库恢复及自动回滚均失败，请保持执行暂停并使用安全备份 {safety_backup['filename']} 人工恢复"
+            ) from recovery_error
+        raise
+    return {"restored": _database_backup_info(source_path), "safety_backup": safety_backup}
+
+
+def _copy_database(source_path: Path, destination_path: Path) -> None:
+    source = sqlite3.connect(f"{source_path.resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+    try:
+        destination = sqlite3.connect(destination_path, timeout=30)
         try:
             source.backup(destination)
         finally:
             destination.close()
-            source.close()
-    init_db()
-    return {"restored": _database_backup_info(source_path), "safety_backup": safety_backup}
+    finally:
+        source.close()
 
 
 def _database_backup_info(path: Any) -> dict[str, Any]:
@@ -2480,7 +3262,7 @@ def _cleanup_database_backups(preserve_filenames: set[str] | None = None) -> Non
 
 
 def get_settings() -> dict[str, Any]:
-    with _LOCK, _connect() as conn:
+    with _connect(read_only=True) as conn:
         rows = conn.execute("SELECT key, value FROM settings").fetchall()
     settings = dict(DEFAULT_SETTINGS)
     for row in rows:
@@ -2493,6 +3275,51 @@ def get_settings() -> dict[str, Any]:
     return normalized_browser_settings(settings)
 
 
+def get_project_variables(project_id: int, *, public: bool = False) -> list[dict[str, Any]]:
+    with _connect(read_only=True) as conn:
+        row = conn.execute("SELECT variables_json FROM project_variables WHERE project_id = ?", (project_id,)).fetchone()
+    values = json.loads(row[0]) if row else []
+    return [_public_environment_variable(item) for item in values] if public else values
+
+
+def update_project_variables(project_id: int, variables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Read/merge/write secret placeholders under one writer transaction.
+    with _connect() as conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        project = conn.execute("SELECT status FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if not project or project[0] != "active":
+            raise ValueError("项目不存在或已归档")
+        row = conn.execute("SELECT variables_json FROM project_variables WHERE project_id = ?", (project_id,)).fetchone()
+        current = {item["id"]: item for item in json.loads(row[0])} if row else {}
+        merged = []
+        for raw in variables:
+            item = dict(raw)
+            previous = current.get(item.get("id"), {})
+            if not item.get("value") and not item.pop("value_clear", False) and previous:
+                if previous.get("secret") or is_sensitive_variable_name(str(previous.get("name") or "")):
+                    item["value"] = previous.get("value", "")
+                    item["secret"] = True
+            merged.append(item)
+        normalized = normalize_settings_values({"environment_variables": merged})["environment_variables"]
+        conn.execute(
+            "INSERT INTO project_variables(project_id, variables_json) VALUES (?, ?) "
+            "ON CONFLICT(project_id) DO UPDATE SET variables_json = excluded.variables_json",
+            (project_id, json.dumps(normalized, ensure_ascii=False)),
+        )
+    return get_project_variables(project_id, public=True)
+
+
+def settings_for_project(settings: dict[str, Any], project_id: int | None) -> dict[str, Any]:
+    if not project_id:
+        return settings
+    project_values = get_project_variables(int(project_id))
+    names = {item["name"] for item in project_values}
+    return {**settings, "environment_variables": [
+        item for item in settings.get("environment_variables", []) if item.get("name") not in names
+    ] + [{**item, "url_encode": True} for item in project_values]}
+
+
 def get_public_settings() -> dict[str, Any]:
     settings = get_settings()
     settings["read_only_tokens"] = [
@@ -2502,9 +3329,9 @@ def get_public_settings() -> dict[str, Any]:
     ]
     settings["read_only_token_set"] = bool(settings.get("read_only_token") or settings["read_only_tokens"])
     settings["read_only_token"] = ""
-    settings["notification_channels"] = [
+    settings["system_notification_channels"] = [
         _public_notification_channel(channel)
-        for channel in settings.get("notification_channels", [])
+        for channel in settings.get("system_notification_channels", [])
         if isinstance(channel, dict)
     ]
     settings["environment_variables"] = [
@@ -2521,8 +3348,17 @@ def update_settings(values: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"不支持的设置项：{', '.join(unknown)}")
     normalized_values = normalize_settings_update_values(values)
+    prospective = {**get_settings(), **normalized_values}
+    system_channel_ids = {
+        str(channel.get("id") or "")
+        for channel in prospective.get("system_notification_channels", [])
+        if isinstance(channel, dict) and channel.get("id")
+    }
+    selected_system_ids = {str(item) for item in prospective.get("system_notification_channel_ids", [])}
+    if not selected_system_ids.issubset(system_channel_ids):
+        raise ValueError("系统告警引用了不存在的系统通知渠道")
     timestamp = now_iso()
-    with _LOCK, _connect() as conn:
+    with _connect() as conn:
         for key, value in normalized_values.items():
             if key not in allowed:
                 continue
@@ -2540,10 +3376,10 @@ def update_settings(values: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(member, dict) and member.get("id")
             }
             _prune_unknown_member_references(conn, member_ids, timestamp)
-        if "notification_channels" in normalized_values:
+        if "system_notification_channels" in normalized_values:
             channel_ids = {
                 str(channel.get("id") or "")
-                for channel in normalized_values["notification_channels"]
+                for channel in normalized_values["system_notification_channels"]
                 if isinstance(channel, dict) and channel.get("id")
             }
             _prune_unknown_channel_references(conn, channel_ids, timestamp)
@@ -2563,13 +3399,27 @@ def normalize_settings_update_values(values: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def create_read_only_token(name: str) -> dict[str, Any]:
+def create_read_only_token(name: str, project_ids: list[int]) -> dict[str, Any]:
+    normalized_project_ids = sorted({int(project_id) for project_id in project_ids if int(project_id) > 0})
+    if not normalized_project_ids:
+        raise ValueError("只读令牌至少需要绑定一个项目")
+    with _connect() as conn:
+        existing_ids = {
+            int(row["id"])
+            for row in conn.execute(
+                f"SELECT id FROM projects WHERE id IN ({','.join('?' for _ in normalized_project_ids)})",
+                normalized_project_ids,
+            ).fetchall()
+        }
+    if existing_ids != set(normalized_project_ids):
+        raise ValueError("只读令牌引用了不存在的项目")
     token = f"pgro_{secrets.token_urlsafe(32)}"
     item = {
         "id": f"rot_{uuid.uuid4().hex}",
         "name": str(name or "").strip() or "未命名令牌",
         "token": token,
         "created_at": now_iso(),
+        "project_ids": normalized_project_ids,
     }
     settings = get_settings()
     tokens = [
@@ -2604,7 +3454,19 @@ def _public_read_only_token(token: dict[str, Any]) -> dict[str, Any]:
         "id": str(token.get("id") or ""),
         "name": str(token.get("name") or "未命名令牌"),
         "created_at": str(token.get("created_at") or ""),
+        "project_ids": [int(item) for item in token.get("project_ids", []) if int(item) > 0],
     }
+
+
+def validate_read_only_token(token: str, project_id: int) -> bool:
+    candidate = str(token or "").strip()
+    if not candidate:
+        return False
+    for item in get_settings().get("read_only_tokens", []):
+        if not isinstance(item, dict) or not secrets.compare_digest(str(item.get("token") or ""), candidate):
+            continue
+        return int(project_id) in {int(value) for value in item.get("project_ids", [])}
+    return False
 
 
 def _prune_unknown_member_references(conn: sqlite3.Connection, member_ids: set[str], timestamp: str) -> None:
@@ -2629,7 +3491,7 @@ def _prune_unknown_member_references(conn: sqlite3.Connection, member_ids: set[s
 
 
 def _prune_unknown_channel_references(conn: sqlite3.Connection, channel_ids: set[str], timestamp: str) -> None:
-    for key in ("execution_notification_channel_ids", "system_notification_channel_ids"):
+    for key in ("system_notification_channel_ids",):
         raw_value = _read_setting_value(conn, key)
         selected = raw_value if isinstance(raw_value, list) else []
         if not isinstance(selected, list):
@@ -2644,51 +3506,6 @@ def _prune_unknown_channel_references(conn: sqlite3.Connection, channel_ids: set
             """,
             (key, json.dumps(next_selected, ensure_ascii=False), timestamp),
         )
-
-    for row in conn.execute("SELECT id, alert_policy_json FROM checks").fetchall():
-        try:
-            policy = json.loads(row["alert_policy_json"] or "{}")
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(policy, dict) or not isinstance(policy.get("notification_channel_ids"), list):
-            continue
-        selected = [str(channel_id) for channel_id in policy["notification_channel_ids"] if str(channel_id) in channel_ids]
-        if selected == policy["notification_channel_ids"]:
-            continue
-        if selected:
-            policy["notification_channel_ids"] = selected
-        else:
-            policy.pop("notification_channel_ids", None)
-        conn.execute(
-            "UPDATE checks SET alert_policy_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(policy, ensure_ascii=False), timestamp, int(row["id"])),
-        )
-
-    raw_policies = _read_setting_value(conn, "alert_tag_policies")
-    policies = raw_policies if isinstance(raw_policies, list) else []
-    if not isinstance(policies, list):
-        return
-    changed = False
-    for policy in policies:
-        if not isinstance(policy, dict) or not isinstance(policy.get("notification_channel_ids"), list):
-            continue
-        selected = [str(channel_id) for channel_id in policy["notification_channel_ids"] if str(channel_id) in channel_ids]
-        if selected == policy["notification_channel_ids"]:
-            continue
-        changed = True
-        if selected:
-            policy["notification_channel_ids"] = selected
-        else:
-            policy.pop("notification_channel_ids", None)
-    if changed:
-        conn.execute(
-            """
-            INSERT INTO settings(key, value, updated_at) VALUES ('alert_tag_policies', ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            """,
-            (json.dumps(policies, ensure_ascii=False), timestamp),
-        )
-
 
 def _public_notification_channel(channel: dict[str, Any]) -> dict[str, Any]:
     public = dict(channel)
@@ -2707,13 +3524,13 @@ def _public_environment_variable(variable: dict[str, Any]) -> dict[str, Any]:
 
 
 def _preserve_notification_channel_secrets(values: dict[str, Any]) -> dict[str, Any]:
-    channels = values.get("notification_channels")
+    channels = values.get("system_notification_channels")
     if not isinstance(channels, list):
         return values
 
     current_channels = {
         str(channel.get("id")): channel
-        for channel in get_settings().get("notification_channels", [])
+        for channel in get_settings().get("system_notification_channels", [])
         if isinstance(channel, dict) and channel.get("id")
     }
     merged_channels: list[Any] = []
@@ -2731,7 +3548,7 @@ def _preserve_notification_channel_secrets(values: dict[str, Any]) -> dict[str, 
         merged_channels.append(channel)
 
     next_values = dict(values)
-    next_values["notification_channels"] = merged_channels
+    next_values["system_notification_channels"] = merged_channels
     return next_values
 
 
@@ -2765,50 +3582,65 @@ def _preserve_environment_variable_secrets(values: dict[str, Any]) -> dict[str, 
     return next_values
 
 
-def get_overview() -> dict[str, Any]:
-    refresh_stale_statuses()
+def get_overview(project_id: int | None = None) -> dict[str, Any]:
+    refresh_stale_statuses(project_id=project_id)
     today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    with _LOCK, _connect() as conn:
-        ui_count = conn.execute("SELECT COUNT(*) AS count FROM checks WHERE type = 'ui'").fetchone()["count"]
-        api_count = conn.execute("SELECT COUNT(*) AS count FROM checks WHERE type = 'api'").fetchone()["count"]
+    check_scope_sql, check_scope_params = _project_scope_sql(project_id)
+    check_alias_scope_sql, check_alias_scope_params = _project_scope_sql(project_id, "c.project_id")
+    run_scope_sql, run_scope_params = _project_scope_sql(project_id)
+    with _connect(read_only=True) as conn:
+        ui_count = conn.execute(
+            f"SELECT COUNT(*) AS count FROM checks WHERE type = 'ui'{check_scope_sql}",
+            check_scope_params,
+        ).fetchone()["count"]
+        api_count = conn.execute(
+            f"SELECT COUNT(*) AS count FROM checks WHERE type = 'api'{check_scope_sql}",
+            check_scope_params,
+        ).fetchone()["count"]
         state_counts = {
             str(row["monitor_status"] or "unknown"): int(row["count"])
             for row in conn.execute(
-                """
+                f"""
                 SELECT COALESCE(s.monitor_status, 'unknown') AS monitor_status, COUNT(*) AS count
                 FROM checks c
                 LEFT JOIN check_status s ON s.check_id = c.id
-                WHERE c.enabled = 1
+                WHERE c.enabled = 1{check_alias_scope_sql}
                 GROUP BY COALESCE(s.monitor_status, 'unknown')
-                """
+                """,
+                check_alias_scope_params,
             ).fetchall()
         }
         failing_count = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS count
             FROM check_status s
             JOIN checks c ON c.id = s.check_id
             WHERE c.enabled = 1 AND s.monitor_status = 'failing'
-            """
+              {check_alias_scope_sql}
+            """,
+            check_alias_scope_params,
         ).fetchone()["count"]
         today_runs = conn.execute(
-            "SELECT COUNT(*) AS count FROM runs WHERE check_id > 0 AND affects_health = 1 AND started_at >= ?",
-            (today,),
+            f"SELECT COUNT(*) AS count FROM runs WHERE check_id > 0 AND affects_health = 1 AND started_at >= ?{run_scope_sql}",
+            (today, *run_scope_params),
         ).fetchone()["count"]
         latest_run = conn.execute(
-            f"SELECT {_run_summary_select()} FROM runs WHERE check_id > 0 AND affects_health = 1 ORDER BY started_at DESC, id DESC LIMIT 1"
+            f"SELECT {_run_summary_select()} FROM runs WHERE check_id > 0 AND affects_health = 1{run_scope_sql} ORDER BY started_at DESC, id DESC LIMIT 1",
+            run_scope_params,
         ).fetchone()
         recovered = conn.execute(
-            """
+            f"""
             SELECT c.name, c.type, s.last_success_at
             FROM check_status s
             JOIN checks c ON c.id = s.check_id
             WHERE s.last_failed_at IS NOT NULL
               AND s.last_success_at IS NOT NULL
               AND s.last_success_at > s.last_failed_at
+              {check_alias_scope_sql}
             ORDER BY s.last_success_at DESC
             LIMIT 1
-            """
+            """,
+            check_alias_scope_params,
         ).fetchone()
         failures = conn.execute(
             f"""
@@ -2820,11 +3652,13 @@ def get_overview() -> dict[str, Any]:
               AND s.monitor_status = 'failing'
               AND r.status IN ('failed', 'timeout')
               AND (r.failure_kind IS NULL OR r.failure_kind = 'target')
+              {check_alias_scope_sql}
             ORDER BY r.started_at DESC, r.id DESC
             LIMIT 8
-            """
+            """,
+            check_alias_scope_params,
         ).fetchall()
-        trends = _overview_trends(conn)
+        trends = _overview_trends(conn, project_id=project_id)
 
     return {
         "ui_count": ui_count,
@@ -2844,7 +3678,9 @@ def get_overview() -> dict[str, Any]:
     }
 
 
-def _overview_trends(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[str, Any]]:
+def _overview_trends(
+    conn: sqlite3.Connection, now: datetime | None = None, project_id: int | None = None
+) -> list[dict[str, Any]]:
     now = now or datetime.now().astimezone()
     periods = [
         ("24h", "近 24 小时", now - timedelta(hours=24)),
@@ -2852,9 +3688,10 @@ def _overview_trends(conn: sqlite3.Connection, now: datetime | None = None) -> l
     ]
     trend_types = [("ui", "UI"), ("api", "API")]
     trends: list[dict[str, Any]] = []
+    run_scope_sql, run_scope_params = _project_scope_sql(project_id)
     for key, label, cutoff in periods:
         rows = conn.execute(
-            """
+            f"""
             SELECT check_type, status, duration_ms
             FROM runs
             WHERE check_id > 0
@@ -2864,8 +3701,13 @@ def _overview_trends(conn: sqlite3.Connection, now: datetime | None = None) -> l
               AND check_type IN ('ui', 'api')
               AND status IN ('ok', 'failed', 'timeout')
               AND (status = 'ok' OR failure_kind IS NULL OR failure_kind = 'target')
+              {run_scope_sql}
             """,
-            (cutoff.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")),
+            (
+                cutoff.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+                *run_scope_params,
+            ),
         ).fetchall()
         rows_by_type: dict[str, list[sqlite3.Row]] = {check_type: [] for check_type, _ in trend_types}
         for row in rows:
@@ -2885,6 +3727,12 @@ def _overview_trends(conn: sqlite3.Connection, now: datetime | None = None) -> l
             }
         )
     return trends
+
+
+def _project_scope_sql(project_id: int | None, column: str = "project_id") -> tuple[str, tuple[int, ...]]:
+    if project_id is None:
+        return "", ()
+    return f" AND {column} = ?", (int(project_id),)
 
 
 def _overview_trend_metrics(rows: list[sqlite3.Row]) -> dict[str, Any]:
@@ -2950,9 +3798,13 @@ def _monitoring_checks_page(
     q: str,
     page: int,
     page_size: int,
+    project_id: int | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     clauses: list[str] = []
     params: list[Any] = []
+    if project_id is not None:
+        clauses.append("c.project_id = ?")
+        params.append(int(project_id))
     if check_type:
         clauses.append("c.type = ?")
         params.append(check_type)
@@ -2987,6 +3839,7 @@ def _trend_series_by_check(
     range_end: datetime,
     max_points: int,
     hour_window: tuple[time, time] | None = None,
+    project_id: int | None = None,
 ) -> dict[int, dict[str, Any]]:
     if not check_ids:
         return {}
@@ -3003,6 +3856,7 @@ def _trend_series_by_check(
         SELECT *
         FROM trend_rollups
         WHERE check_id IN ({placeholders})
+          AND (? IS NULL OR project_id = ?)
           AND bucket_granularity = ?
           AND bucket_start >= ?
           AND bucket_start <= ?
@@ -3010,6 +3864,8 @@ def _trend_series_by_check(
         """,
         [
             *check_ids,
+            project_id,
+            project_id,
             source_granularity,
             query_start.isoformat(timespec="seconds"),
             range_end.isoformat(timespec="seconds"),
@@ -3170,6 +4026,7 @@ def _record_trend_rollups(conn: sqlite3.Connection, run: sqlite3.Row) -> bool:
         for granularity, seconds in TREND_GRANULARITIES:
             _upsert_trend_rollup(
                 conn,
+                project_id=int(run["project_id"]),
                 check_id=check_id,
                 check_type=check_type,
                 granularity=granularity,
@@ -3198,6 +4055,7 @@ def _run_should_record_trend(run: sqlite3.Row) -> bool:
 
 def _upsert_trend_rollup(
     conn: sqlite3.Connection,
+    project_id: int,
     check_id: int,
     check_type: str,
     granularity: str,
@@ -3210,9 +4068,9 @@ def _upsert_trend_rollup(
         """
         SELECT *
         FROM trend_rollups
-        WHERE check_id = ? AND bucket_granularity = ? AND bucket_start = ?
+        WHERE project_id = ? AND check_id = ? AND bucket_granularity = ? AND bucket_start = ?
         """,
-        (check_id, granularity, bucket_iso),
+        (project_id, check_id, granularity, bucket_iso),
     ).fetchone()
     success_count = int(row["success_count"] or 0) if row else 0
     failure_count = int(row["failure_count"] or 0) if row else 0
@@ -3239,6 +4097,7 @@ def _upsert_trend_rollup(
         }
     )
     payload = (
+        project_id,
         check_id,
         check_type,
         granularity,
@@ -3256,11 +4115,11 @@ def _upsert_trend_rollup(
     conn.execute(
         """
         INSERT INTO trend_rollups (
-            check_id, check_type, bucket_granularity, bucket_start, success_count,
+            project_id, check_id, check_type, bucket_granularity, bucket_start, success_count,
             failure_count, duration_sum_ms, avg_duration_ms, p95_duration_ms,
             p99_duration_ms, latency_histogram_json, duration_samples_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(check_id, bucket_granularity, bucket_start) DO UPDATE SET
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id, check_id, bucket_granularity, bucket_start) DO UPDATE SET
             check_type = excluded.check_type,
             success_count = excluded.success_count,
             failure_count = excluded.failure_count,
@@ -3353,36 +4212,56 @@ def _backfill_trend_rollups(conn: sqlite3.Connection) -> None:
 
 
 def cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
+    # Maintenance must not swap the database between archiving records and
+    # reconciling artifact references. Writers still yield between each batch.
+    with _DATABASE_ACCESS.shared():
+        return _cleanup_old_data(settings)
+
+
+def _cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
     settings = settings or get_settings()
     retention_days = int(settings.get("run_retention_days", 30))
     cutoff = (datetime.now().astimezone() - timedelta(days=retention_days)).isoformat(timespec="seconds")
-    with _LOCK, _connect() as conn:
-        _archive_runs_before(conn, cutoff)
-        expired_run_ids = [
-            int(row["id"])
-            for row in conn.execute("SELECT id FROM runs WHERE created_at < ?", (cutoff,)).fetchall()
-        ]
-        cursor = conn.execute("DELETE FROM runs WHERE created_at < ?", (cutoff,))
-        removed_runs = cursor.rowcount
-        if expired_run_ids:
+    removed_runs = 0
+    while True:
+        with _connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            expired_run_ids = [
+                int(row["id"])
+                for row in conn.execute(
+                    _RUN_CLEANUP_BATCH_SQL,
+                    (cutoff, _CLEANUP_BATCH_SIZE),
+                ).fetchall()
+            ]
+            if not expired_run_ids:
+                break
+            _archive_runs(conn, expired_run_ids)
             placeholders = ", ".join("?" for _ in expired_run_ids)
             conn.execute(
                 f"UPDATE check_status SET last_run_id = NULL WHERE last_run_id IN ({placeholders})",
                 expired_run_ids,
             )
+            conn.execute(
+                f"UPDATE check_status SET last_scheduled_run_id = NULL WHERE last_scheduled_run_id IN ({placeholders})",
+                expired_run_ids,
+            )
+            cursor = conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", expired_run_ids)
+            removed_runs += cursor.rowcount
     removed_artifacts = cleanup_old_artifacts(settings)
     removed_artifact_count = sum(len(paths) for paths in removed_artifacts.values())
     if removed_artifact_count:
-        with _LOCK, _connect() as conn:
+        with _connect() as conn:
             for column, paths in removed_artifacts.items():
                 _clear_artifact_paths(conn, column, paths)
     return removed_runs + removed_artifact_count
 
 
-def _archive_runs_before(conn: sqlite3.Connection, cutoff: str) -> None:
+def _archive_runs(conn: sqlite3.Connection, run_ids: list[int]) -> None:
+    placeholders = ", ".join("?" for _ in run_ids)
     rows = conn.execute(
-        """
+        f"""
         SELECT
+            project_id,
             substr(started_at, 1, 10) AS archive_date,
             check_type,
             status,
@@ -3391,22 +4270,22 @@ def _archive_runs_before(conn: sqlite3.Connection, cutoff: str) -> None:
             SUM(CASE WHEN duration_ms IS NULL THEN 0 ELSE 1 END) AS duration_sample_count,
             MAX(started_at) AS last_run_at
         FROM runs
-        WHERE created_at < ?
+        WHERE id IN ({placeholders})
           AND check_id > 0
           AND status IN ('ok', 'failed', 'timeout', 'skipped')
-        GROUP BY archive_date, check_type, status
+        GROUP BY project_id, archive_date, check_type, status
         """,
-        (cutoff,),
+        run_ids,
     ).fetchall()
     timestamp = now_iso()
     for row in rows:
         conn.execute(
             """
             INSERT INTO run_archives (
-                archive_date, check_type, status, run_count, duration_sum_ms,
+                project_id, archive_date, check_type, status, run_count, duration_sum_ms,
                 duration_sample_count, last_run_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(archive_date, check_type, status) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, archive_date, check_type, status) DO UPDATE SET
                 run_count = run_archives.run_count + excluded.run_count,
                 duration_sum_ms = run_archives.duration_sum_ms + excluded.duration_sum_ms,
                 duration_sample_count = run_archives.duration_sample_count + excluded.duration_sample_count,
@@ -3417,6 +4296,7 @@ def _archive_runs_before(conn: sqlite3.Connection, cutoff: str) -> None:
                 updated_at = excluded.updated_at
             """,
             (
+                int(row["project_id"]),
                 row["archive_date"] or "",
                 row["check_type"] or "",
                 row["status"] or "",
@@ -3434,25 +4314,56 @@ def _clear_artifact_paths(conn: sqlite3.Connection, column: str, paths: list[str
         return
     if column not in {"screenshot_path", "trace_path", "response_path"}:
         raise ValueError(f"不支持的产物字段：{column}")
-    placeholders = ", ".join("?" for _ in paths)
-    conn.execute(f"UPDATE runs SET {column} = NULL WHERE {column} IN ({placeholders})", paths)
+    for offset in range(0, len(paths), _CLEANUP_BATCH_SIZE):
+        batch = paths[offset:offset + _CLEANUP_BATCH_SIZE]
+        placeholders = ", ".join("?" for _ in batch)
+        conn.execute(f"UPDATE runs SET {column} = NULL WHERE {column} IN ({placeholders})", batch)
 
 
 @contextmanager
-def _connect() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    try:
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.row_factory = sqlite3.Row
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+def write_transaction() -> Iterator[None]:
+    """Compose synchronous storage operations atomically on this thread."""
+    if getattr(_TRANSACTION, "connection", None) is not None:
+        raise RuntimeError("嵌套写事务不受支持")
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _TRANSACTION.connection = conn
+        try:
+            yield
+        finally:
+            del _TRANSACTION.connection
+
+
+@contextmanager
+def _connect(*, read_only: bool = False) -> Iterator[sqlite3.Connection]:
+    transaction = getattr(_TRANSACTION, "connection", None)
+    if transaction is not None:
+        yield transaction
+        return
+    # Always enter the maintenance gate before the writer lock. A read transaction
+    # keeps multi-query responses consistent while other connections commit to WAL.
+    with _DATABASE_ACCESS.shared(), (nullcontext() if read_only else _LOCK):
+        if read_only:
+            # mode=ro also prevents close-time automatic checkpoints. query_only
+            # alone would still leave a writable connection outside the writer lock.
+            conn = sqlite3.connect(f"{Path(DB_PATH).resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+        else:
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.row_factory = sqlite3.Row
+            if read_only:
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("BEGIN")
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def _ensure_check_columns(conn: sqlite3.Connection) -> None:
@@ -3644,6 +4555,47 @@ def _ensure_local_probe_runner(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_default_project(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT id FROM projects ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, id LIMIT 1"
+    ).fetchone()
+    if row:
+        project_id = int(row["id"])
+    else:
+        timestamp = now_iso()
+        project_id = int(
+            conn.execute(
+                "INSERT INTO projects(name, status, created_at, updated_at) VALUES (?, 'active', ?, ?)",
+                (DEFAULT_PROJECT_NAME, timestamp, timestamp),
+            ).lastrowid
+        )
+    _ensure_project_alert_settings(conn, project_id)
+    return project_id
+
+
+def _ensure_project_alert_settings(conn: sqlite3.Connection, project_id: int) -> None:
+    defaults = DEFAULT_PROJECT_ALERT_SETTINGS
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO project_alert_settings(
+            project_id, alerts_enabled, notification_channels_json,
+            execution_notification_channel_ids_json, alert_tag_policies_json,
+            alert_cooldown_minutes, recovery_notification, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(project_id),
+            1 if defaults["alerts_enabled"] else 0,
+            json.dumps(defaults["notification_channels"], ensure_ascii=False),
+            json.dumps(defaults["execution_notification_channel_ids"], ensure_ascii=False),
+            json.dumps(defaults["alert_tag_policies"], ensure_ascii=False),
+            int(defaults["alert_cooldown_minutes"]),
+            1 if defaults["recovery_notification"] else 0,
+            now_iso(),
+        ),
+    )
+
+
 def _ensure_default_settings(conn: sqlite3.Connection) -> None:
     timestamp = now_iso()
     for key, value in DEFAULT_SETTINGS.items():
@@ -3660,8 +4612,17 @@ def _migrate_read_only_tokens(conn: sqlite3.Connection) -> None:
     tokens = tokens_value if isinstance(tokens_value, list) else []
     timestamp = now_iso()
 
+    default_id = _ensure_default_project(conn)
+    normalized_tokens = [
+        {
+            **token,
+            "project_ids": [int(item) for item in token.get("project_ids", [default_id]) if int(item) > 0]
+            or [default_id],
+        }
+        for token in tokens
+        if isinstance(token, dict)
+    ]
     if legacy_token:
-        normalized_tokens = [token for token in tokens if isinstance(token, dict)]
         if not any(str(token.get("token") or "") == legacy_token for token in normalized_tokens):
             normalized_tokens.append(
                 {
@@ -3669,8 +4630,10 @@ def _migrate_read_only_tokens(conn: sqlite3.Connection) -> None:
                     "name": legacy_name,
                     "token": legacy_token,
                     "created_at": timestamp,
+                    "project_ids": [default_id],
                 }
             )
+    if normalized_tokens != tokens or legacy_token:
         conn.execute(
             """
             INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
@@ -3800,15 +4763,17 @@ def _seed_demo_checks(conn: sqlite3.Connection) -> None:
     if count:
         return
     timestamp = now_iso()
+    project_id = _ensure_default_project(conn)
     for item in DEMO_CHECKS:
         conn.execute(
             """
             INSERT INTO checks (
-                name, type, enabled, interval_seconds, timeout_ms, entry_url, viewport_mode, method,
+                project_id, name, type, enabled, interval_seconds, timeout_ms, entry_url, viewport_mode, method,
                 headers_json, body, assertions_json, setup_script, script, tags, alert_policy_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                project_id,
                 item["name"],
                 item["type"],
                 1 if item["enabled"] else 0,
@@ -3857,6 +4822,68 @@ def _normalize_check(row: sqlite3.Row) -> dict[str, Any]:
     data["consecutive_successes"] = int(data.get("consecutive_successes") or 0)
     data["last_duration_ms"] = data.get("last_duration_ms")
     return data
+
+
+def _normalize_project_name(value: str) -> str:
+    name = str(value or "").strip()
+    if not name:
+        raise ValueError("项目名称不能为空")
+    if len(name) > 80:
+        raise ValueError("项目名称不能超过 80 个字符")
+    return name
+
+
+def _normalize_project(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["id"] = int(data["id"])
+    data["archived"] = data.get("status") == "archived"
+    return data
+
+
+def _normalize_project_alert_settings(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(DEFAULT_PROJECT_ALERT_SETTINGS)
+    data["project_id"] = int(row["project_id"])
+    data["alerts_enabled"] = bool(row["alerts_enabled"])
+    data["alert_cooldown_minutes"] = int(row["alert_cooldown_minutes"] or 30)
+    data["recovery_notification"] = bool(row["recovery_notification"])
+    for result_key, column in (
+        ("notification_channels", "notification_channels_json"),
+        ("execution_notification_channel_ids", "execution_notification_channel_ids_json"),
+        ("alert_tag_policies", "alert_tag_policies_json"),
+    ):
+        try:
+            value = json.loads(row[column] or "[]")
+        except json.JSONDecodeError:
+            value = []
+        data[result_key] = value if isinstance(value, list) else []
+    data["updated_at"] = row["updated_at"]
+    return data
+
+
+def _preserve_project_notification_channel_secrets(
+    values: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    channels = values.get("notification_channels")
+    if not isinstance(channels, list):
+        return values
+    current_channels = {
+        str(channel.get("id")): channel
+        for channel in current.get("notification_channels", [])
+        if isinstance(channel, dict) and channel.get("id")
+    }
+    merged_channels: list[Any] = []
+    for raw_channel in channels:
+        if not isinstance(raw_channel, dict):
+            merged_channels.append(raw_channel)
+            continue
+        channel = dict(raw_channel)
+        channel_id = str(channel.get("id") or "")
+        has_new_secret = bool(str(channel.get("dingtalk_secret") or "").strip())
+        should_clear_secret = bool(channel.pop("dingtalk_secret_clear", False))
+        if not has_new_secret and not should_clear_secret and channel_id in current_channels:
+            channel["dingtalk_secret"] = current_channels[channel_id].get("dingtalk_secret") or ""
+        merged_channels.append(channel)
+    return {**values, "notification_channels": merged_channels}
 
 
 def _normalize_run(row: sqlite3.Row) -> dict[str, Any]:

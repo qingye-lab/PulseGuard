@@ -25,12 +25,14 @@ docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d
   -RelayPort 9443
 ```
 
-脚本会在本地运行后端测试和前端构建，打包源码，上传到远端，保留远端 `data/`、`reports/`、`.venv`，使用固定版本 `uv` 和仓库 `uv.lock` 同步后端依赖。若远端已有数据库，脚本会先通过 SQLite backup API 创建带 SHA-256 的一致性备份，并在副本上执行数据库迁移预检；只有预检通过后才停止服务、安装 Chromium 并创建/重启：
+脚本会在本地运行后端测试和前端构建，打包源码，上传到远端，保留远端 `data/`、`reports/`、`.venv`，使用固定版本 `uv` 和仓库 `uv.lock` 同步后端依赖。若远端已有数据库，脚本会先通过 SQLite backup API 创建带 SHA-256 的一致性备份，并在副本上执行包括项目隔离在内的数据库迁移预检。预检通过后，脚本停止服务，对停写后的最新数据库再次做一致性备份，在临时副本上迁移和校验成功后才替换活动数据库，随后创建或重启：
 
 - `pulseguard.service`
 - `pulseguard-relay.service`
 
-OpenSSH 可能会提示输入远端密码；脚本不会把 `remote.env` 里的密码拼到命令行。
+项目隔离迁移不支持新旧应用并行。回滚时必须同时恢复 `source-before-deploy-*.tar.gz` 和对应的 `pulseguard-before-cutover-*.db`，不能只恢复代码或只恢复数据库。
+
+脚本优先使用 SSH key；`remote.env` 配置密码时，通过进程级 `SSH_ASKPASS` 临时传递，并在结束时清除环境和辅助脚本，不会把密码拼到命令行或部署日志。
 
 ## 可换镜像源
 

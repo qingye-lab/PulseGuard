@@ -1,4 +1,4 @@
-import { Alert, Button, DatePicker, Empty, Input, Pagination, Select, Skeleton, Space, Table, Tag, Tooltip } from "antd";
+import { Alert, Button, Card, DatePicker, Empty, Input, Pagination, Select, Skeleton, Space, Table, Tag, Tooltip } from "antd";
 import type { PaginationProps } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import dayjs from "dayjs";
@@ -8,6 +8,7 @@ import { cloneElement, isValidElement, lazy, Suspense, useEffect, useState } fro
 import type { ReactElement } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import { useProject } from "../ProjectContext";
 import { RunnerExecutionTag } from "../components/shared/businessTags";
 import type { CheckType, NotificationStatus, ProbeRunner, Run, RunStatus } from "../types";
 import {
@@ -16,6 +17,7 @@ import {
   notificationChannelLabel,
   notificationStatusMeta,
   notificationStatusTagColor,
+  runnerExecutionMeta,
   runnerSummary,
   runStatusLabel,
   runStatusTagColor
@@ -82,6 +84,8 @@ function sameDateRange(a: [Dayjs | null, Dayjs | null] | null, b: [Dayjs | null,
 }
 
 export function RunsPage() {
+  const { currentProject } = useProject();
+  const readOnly = currentProject.status === "archived";
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [runs, setRuns] = useState<Run[]>([]);
@@ -305,7 +309,7 @@ export function RunsPage() {
             aria-label="重新执行"
             icon={<RotateCcw size={15} />}
             loading={rerunningId === run.id}
-            disabled={run.check_id <= 0}
+            disabled={readOnly || run.check_id <= 0}
             onClick={(event) => {
               event.stopPropagation();
               rerun(run);
@@ -320,123 +324,129 @@ export function RunsPage() {
     <div className="page-content">
       {error && <Alert type="error" title={error} showIcon />}
 
-      <section className="history-toolbar">
-        <div className="history-filter-row">
-          <Select
-            value={type}
-            className="history-filter-control"
-            onChange={(value) => setType(value)}
-            options={[
-              { label: "全部类型", value: "" },
-              { label: "UI", value: "ui" },
-              { label: "API", value: "api" }
-            ]}
-          />
-          <Select
-            value={status}
-            className="history-filter-control"
-            onChange={(value) => setStatus(value)}
-            options={RUN_STATUS_FILTER_OPTIONS}
-          />
-          <Select
-            value={notificationStatus}
-            className="history-filter-control history-notification-filter"
-            onChange={(value) => setNotificationStatus(value)}
-            options={NOTIFICATION_FILTER_OPTIONS}
-          />
-          <Select
-            value={runnerId}
-            className="history-filter-control"
-            onChange={(value) => setRunnerId(value)}
-            options={[
-              { label: "全部节点", value: "" },
-              ...runners.map((runner) => ({ label: runner.name || runner.runner_id, value: runner.runner_id }))
-            ]}
-          />
-          <RangePicker
-            value={dateRange}
-            onChange={(value) => setDateRange(value)}
-            className="history-date-range"
-            aria-label="按执行日期筛选"
-          />
-          <Input
-            name="runs-search"
-            value={q}
-            onChange={(event) => setQ(event.target.value)}
-            placeholder="任务名称…"
-            allowClear
-            autoComplete="off"
-            className="history-search"
-          />
-        </div>
-        <Space wrap>
-          <Button icon={<FilterX size={16} />} onClick={resetFilters} disabled={!hasFilters}>
-            清空筛选
-          </Button>
+      <Card
+        title="执行流水"
+        className="project-data-card"
+        extra={
           <Button icon={<RefreshCw size={16} />} onClick={load} loading={loading}>
             刷新
           </Button>
-        </Space>
-      </section>
+        }
+      >
+        <div className="project-data-toolbar">
+          <div className="history-filter-row">
+            <Select
+              value={type}
+              className="history-filter-control"
+              onChange={(value) => setType(value)}
+              options={[
+                { label: "全部类型", value: "" },
+                { label: "UI", value: "ui" },
+                { label: "API", value: "api" }
+              ]}
+            />
+            <Select
+              value={status}
+              className="history-filter-control"
+              onChange={(value) => setStatus(value)}
+              options={RUN_STATUS_FILTER_OPTIONS}
+            />
+            <Select
+              value={notificationStatus}
+              className="history-filter-control history-notification-filter"
+              onChange={(value) => setNotificationStatus(value)}
+              options={NOTIFICATION_FILTER_OPTIONS}
+            />
+            <Select
+              value={runnerId}
+              className="history-filter-control"
+              onChange={(value) => setRunnerId(value)}
+              options={[
+                { label: "全部节点", value: "" },
+                ...runners.map((runner) => ({ label: runner.name || runner.runner_id, value: runner.runner_id }))
+              ]}
+            />
+            <RangePicker
+              value={dateRange}
+              onChange={(value) => setDateRange(value)}
+              className="history-date-range"
+              aria-label="按执行日期筛选"
+            />
+            <Input
+              name="runs-search"
+              value={q}
+              onChange={(event) => setQ(event.target.value)}
+              placeholder="任务名称…"
+              allowClear
+              autoComplete="off"
+              className="history-search"
+            />
+          </div>
+          <Button icon={<FilterX size={16} />} onClick={resetFilters} disabled={!hasFilters}>
+            清空筛选
+          </Button>
+        </div>
 
-      <div className="history-result-bar">
-        <span>当前结果</span>
-        <strong>{total}</strong>
-        <span>条</span>
-        {type && <Tag>{type === "ui" ? "UI" : "API"}</Tag>}
-        {status && <Tag>{runStatusFilterLabel(status)}</Tag>}
-        {notificationStatus && <Tag>告警：{notificationStatusMeta(notificationStatus).label}</Tag>}
-        {runnerId && <Tag>执行节点：{runnerLabel(runnerId, runners)}</Tag>}
-        {checkId && (
-          <Tag
-            closable
-            onClose={(event) => {
-              event.preventDefault();
-              clearTaskScope();
+        <div className="project-result-strip">
+          <span>当前结果</span>
+          <strong>{total}</strong>
+          <span>条</span>
+          {type && <Tag>{type === "ui" ? "UI" : "API"}</Tag>}
+          {status && <Tag>{runStatusFilterLabel(status)}</Tag>}
+          {notificationStatus && <Tag>告警：{notificationStatusMeta(notificationStatus).label}</Tag>}
+          {runnerId && <Tag>执行节点：{runnerLabel(runnerId, runners)}</Tag>}
+          {checkId && (
+            <Tag
+              closable
+              onClose={(event) => {
+                event.preventDefault();
+                clearTaskScope();
+              }}
+            >
+              任务 #{checkId}
+            </Tag>
+          )}
+          {dateRange?.[0] && <Tag>开始：{dateRange[0].format("YYYY-MM-DD")}</Tag>}
+          {dateRange?.[1] && <Tag>结束：{dateRange[1].format("YYYY-MM-DD")}</Tag>}
+          {normalizedQ && <Tag>关键词：{normalizedQ}</Tag>}
+        </div>
+
+        {isCompactList ? (
+          <CompactRunList
+            hasFilters={hasFilters}
+            loading={loading}
+            page={page}
+            total={total}
+            rerunningId={rerunningId}
+            readOnly={readOnly}
+            runs={runs}
+            onOpen={(run) => setDetailRunId(run.id)}
+            onPageChange={setPage}
+            onRerun={rerun}
+          />
+        ) : (
+          <Table
+            rowKey="id"
+            columns={columns}
+            dataSource={runs}
+            loading={loading}
+            className="history-table project-data-table"
+            locale={{ emptyText: <Empty description={hasFilters ? "没有符合筛选条件的运行记录" : "暂无运行记录"} /> }}
+            pagination={{
+              current: page,
+              pageSize: HISTORY_PAGE_SIZE,
+              total,
+              showSizeChanger: false,
+              itemRender: runPaginationItemRender,
+              onChange: setPage
             }}
-          >
-            任务 #{checkId}
-          </Tag>
+            scroll={{ x: 960 }}
+          />
         )}
-        {dateRange?.[0] && <Tag>开始：{dateRange[0].format("YYYY-MM-DD")}</Tag>}
-        {dateRange?.[1] && <Tag>结束：{dateRange[1].format("YYYY-MM-DD")}</Tag>}
-        {normalizedQ && <Tag>关键词：{normalizedQ}</Tag>}
-      </div>
-
-      {isCompactList ? (
-        <CompactRunList
-          hasFilters={hasFilters}
-          loading={loading}
-          page={page}
-          total={total}
-          rerunningId={rerunningId}
-          runs={runs}
-          onOpen={(run) => setDetailRunId(run.id)}
-          onPageChange={setPage}
-          onRerun={rerun}
-        />
-      ) : (
-        <Table
-          rowKey="id"
-          columns={columns}
-          dataSource={runs}
-          loading={loading}
-          className="history-table"
-          locale={{ emptyText: <Empty description={hasFilters ? "没有符合筛选条件的运行记录" : "暂无运行记录"} /> }}
-          pagination={{
-            current: page,
-            pageSize: HISTORY_PAGE_SIZE,
-            total,
-            showSizeChanger: false,
-            itemRender: runPaginationItemRender,
-            onChange: setPage
-          }}
-          scroll={{ x: 960 }}
-        />
-      )}
+      </Card>
       {detailRunId && (
         <Suspense fallback={null}>
-          <RunDetailDrawer runId={detailRunId} onClose={() => setDetailRunId(null)} onRerun={rerun} returnTo={`${location.pathname}${location.search}`} />
+          <RunDetailDrawer runId={detailRunId} onClose={() => setDetailRunId(null)} onRerun={readOnly ? undefined : rerun} returnTo={`${location.pathname}${location.search}`} />
         </Suspense>
       )}
     </div>
@@ -449,13 +459,14 @@ interface CompactRunListProps {
   page: number;
   total: number;
   rerunningId: number | null;
+  readOnly: boolean;
   runs: Run[];
   onOpen: (run: Run) => void;
   onPageChange: (page: number) => void;
   onRerun: (run: Run) => void;
 }
 
-function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, onOpen, onPageChange, onRerun }: CompactRunListProps) {
+function CompactRunList({ hasFilters, loading, page, total, rerunningId, readOnly, runs, onOpen, onPageChange, onRerun }: CompactRunListProps) {
   if (loading) {
     return (
       <section className="history-card-list" aria-label="运行记录加载中">
@@ -480,6 +491,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
     <section className="history-card-list" aria-label="运行记录列表">
       {runs.map((run) => {
         const notification = notificationStatusMeta(run.notification_status);
+        const execution = runnerExecutionMeta(run.status, run.failure_kind);
         return (
           <article className={`history-card history-card-${run.status}`} key={run.id}>
             <header className="history-card-header">
@@ -495,9 +507,9 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
                 <RunIssueSummary run={run} compact />
               </div>
               <div className="history-card-state">
-                <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>
-                <RunnerExecutionTag run={run} />
-                <Tag color={notificationStatusTagColor(run.notification_status)}>{notification.label}</Tag>
+                <Tag color={runStatusTagColor(run.status)}>运行：{runStatusLabel(run.status)}</Tag>
+                <Tag color={execution.color}>节点：{execution.label}</Tag>
+                <Tag color={notificationStatusTagColor(run.notification_status)}>告警：{notification.label}</Tag>
               </div>
             </header>
 
@@ -505,7 +517,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
               <HistoryMeta label="执行时间" value={formatDate(run.started_at)} />
               <HistoryMeta label="耗时" value={formatDuration(run.duration_ms)} />
               <HistoryMeta label="执行节点" value={runnerSummary(run)} />
-              {run.check_type === "ui" && run.browser_type && <HistoryMeta label="Browser Type" value={run.browser_type} />}
+              {run.check_type === "ui" && run.browser_type && <HistoryMeta label="浏览器类型" value={run.browser_type} />}
               <HistoryMeta label="告警渠道" value={notificationChannelLabel(run.notification_channel, run.notification_status)} />
               <HistoryMeta label="连续失败" value={run.consecutive_failures || "-"} />
               {Boolean(run.deduplicated_count) && <HistoryMeta label="同错压缩" value={`${run.deduplicated_count} 条`} />}
@@ -518,7 +530,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
               <Button
                 icon={<RotateCcw size={15} />}
                 loading={rerunningId === run.id}
-                disabled={run.check_id <= 0}
+                disabled={readOnly || run.check_id <= 0}
                 title={run.check_id > 0 ? "重新执行" : "草稿调试记录不能重新执行"}
                 onClick={() => onRerun(run)}
               >
@@ -571,7 +583,7 @@ function runnerTooltip(run: Run): string {
   const details = [
     `执行节点: ${runnerSummary(run)}`,
     run.runner_address ? `地址: ${run.runner_address}` : "",
-    run.check_type === "ui" && run.browser_type ? `Browser Type: ${run.browser_type}` : "",
+    run.check_type === "ui" && run.browser_type ? `浏览器类型: ${run.browser_type}` : "",
     run.runner_browser_version ? `浏览器: ${run.runner_browser_version}` : ""
   ].filter(Boolean);
   return details.join("\n");

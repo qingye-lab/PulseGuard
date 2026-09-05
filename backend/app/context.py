@@ -11,7 +11,7 @@ from jsonschema import ValidationError, validate
 from . import network_checks
 from .artifacts import ArtifactStore
 from .resource_pool import ProbeResourcePool, ResourcePoolError
-from .variables import mask_data, resolve_data, resolve_text
+from .variables import RuntimeVariables, mask_data, mask_text, resolve_data, resolve_text, resolve_url
 from .viewport import browser_context_options, normalize_viewport_mode, viewport_for_mode
 
 
@@ -31,6 +31,10 @@ class PulseHttpClient:
         self.last_response: httpx.Response | None = None
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        # A failed next request must not appear to have the previous response.
+        self.last_response = None
+        self.ctx.response_snapshot = None
+        self.ctx.request_snapshot = {"method": method.upper(), "url_template": url}
         resolved_url = resolve_text(url, self.ctx.settings)
         resolved_kwargs = resolve_data(kwargs, self.ctx.settings)
         resolved_kwargs.setdefault("timeout", self.ctx.timeout_ms / 1000)
@@ -43,6 +47,10 @@ class PulseHttpClient:
             },
             self.ctx.settings,
         )
+        exchange: dict[str, Any] = {"request": self.ctx.request_snapshot, "response": None}
+        if self.ctx.check.get("type") == "ui":
+            self.ctx.http_exchanges.append(exchange)
+            del self.ctx.http_exchanges[:-10]
         try:
             if self._resources is not None:
                 async with self._resources.http_client() as client:
@@ -52,9 +60,11 @@ class PulseHttpClient:
             else:
                 raise RuntimeError("HTTP client 未初始化")
         except httpx.RequestError as exc:
+            exchange["error"] = mask_text(str(exc) or type(exc).__name__, self.ctx.settings)
             raise RunFailure(f"请求目标失败：{exc}") from exc
         self.last_response = response
         self.ctx.response_snapshot = self.ctx.response_snapshot_from(response)
+        exchange["response"] = self.ctx.response_snapshot
         return response
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
@@ -98,10 +108,11 @@ class RunContext:
     ) -> None:
         self.check = check
         self.run_id = run_id
-        self.settings = settings
+        self.vars = RuntimeVariables(settings)
+        self.settings = self.vars.settings
         self.artifacts = artifacts
         self.resources = resources
-        self.entry_url = resolve_text(check.get("entry_url") or "", settings)
+        self.entry_url = (check.get("entry_url") or "") if check.get("type") == "ui" else resolve_text(check.get("entry_url") or "", settings)
         self.viewport_mode = normalize_viewport_mode(check.get("viewport_mode"))
         self.viewport_width = self._optional_int(check.get("viewport_width"))
         self.viewport_height = self._optional_int(check.get("viewport_height"))
@@ -110,6 +121,8 @@ class RunContext:
         self.body = resolve_text(check.get("body") or "", settings)
         self.timeout_ms = int(check.get("timeout_ms") or 15000)
         self.logs: list[str] = []
+        self.ui_stage = "prepare"
+        self.http_exchanges: list[dict[str, Any]] = []
         self.console_messages: list[dict[str, str]] = []
         self.schema_errors: list[str] = []
         self.screenshot_path: str | None = None
@@ -123,7 +136,7 @@ class RunContext:
         if str(check.get("type") or "") == "ui":
             self.request_snapshot = {
                 "type": "ui",
-                "url": self.entry_url,
+                "url": self._entry_url_template,
                 "timeout_ms": self.timeout_ms,
                 "viewport_mode": self.viewport_mode,
             }
@@ -135,6 +148,16 @@ class RunContext:
         self._browser_context: Any = None
         self._trace_started = False
         self._pages: list[Any] = []
+
+    @property
+    def entry_url(self) -> str:
+        if self.check.get("type") == "ui":
+            return resolve_url(self._entry_url_template, self.settings)
+        return self._entry_url_template
+
+    @entry_url.setter
+    def entry_url(self, value: str) -> None:
+        self._entry_url_template = value
 
     async def request(self, **kwargs: Any) -> httpx.Response:
         request_kwargs = dict(kwargs)
@@ -387,8 +410,14 @@ class RunContext:
 
     def response_snapshot_from(self, response: httpx.Response, include_body: bool = False) -> dict[str, Any]:
         body_text = response.text
+        if self.check.get("type") == "ui":
+            try:
+                body_text = json.dumps(mask_data(response.json(), self.settings), ensure_ascii=False)
+            except ValueError:
+                pass
+            body_text = mask_text(body_text, self.settings)
         if not include_body and len(body_text) > 5000:
-            body_text = body_text[:5000] + "\n... 响应体已截断，完整内容见产物。"
+            body_text = body_text[:5000] + "\n... 响应体已截断。"
         return mask_data(
             {
             "status_code": response.status_code,

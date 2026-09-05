@@ -30,12 +30,14 @@ class DraftRunnerTests(unittest.TestCase):
             "backend.app.runner.storage",
             get_probe_runner=Mock(return_value=None),
             can_schedule_runner=Mock(return_value=True),
+            get_project=Mock(return_value={"id": 1, "status": "active"}),
         )
         self._runner_state_patch.start()
         self.addCleanup(self._runner_state_patch.stop)
 
     def test_draft_run_does_not_update_task_status_or_send_notification(self) -> None:
         check = {
+            "project_id": 1,
             "name": "草稿调试",
             "type": "api",
             "enabled": True,
@@ -63,6 +65,19 @@ class DraftRunnerTests(unittest.TestCase):
             "failure_kind": "none",
         }
 
+        persisted_run = {
+            "id": 101,
+            "project_id": 1,
+            "check_id": 0,
+            "check_name": "草稿调试",
+            "check_type": "api",
+            "status": "ok",
+            "notification_status": "not_required",
+            "observation_kind": "draft",
+            "affects_health": False,
+            "runner_id": "local",
+        }
+
         with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
             "backend.app.runner.storage.get_settings",
             return_value={"max_task_runtime_seconds": 60, "browser_type": "chromium", "browser_headless": True},
@@ -74,9 +89,13 @@ class DraftRunnerTests(unittest.TestCase):
             "_execute_core",
             new_callable=AsyncMock,
             return_value=result_data,
-        ) as execute_core, patch("backend.app.runner.storage.create_run") as create_run, patch(
-            "backend.app.runner.storage.finish_run"
-        ) as finish_run, patch("backend.app.runner.storage.get_run") as get_run, patch(
+        ) as execute_core, patch(
+            "backend.app.runner.storage.create_run", return_value={"id": 101}
+        ) as create_run, patch(
+            "backend.app.runner.storage.finish_run", return_value=persisted_run
+        ) as finish_run, patch(
+            "backend.app.runner.storage.get_run", return_value=persisted_run
+        ) as get_run, patch(
             "backend.app.runner.storage.update_run_notification"
         ) as update_run_notification, patch(
             "backend.app.runner.storage.update_check_status"
@@ -86,7 +105,7 @@ class DraftRunnerTests(unittest.TestCase):
             runner = CheckRunner()
             result = asyncio.run(runner.run_draft(check))
 
-        self.assertEqual(result["id"], 0)
+        self.assertEqual(result["id"], 101)
         self.assertEqual(result["check_id"], 0)
         self.assertEqual(result["check_name"], "草稿调试")
         self.assertEqual(result["check_type"], "api")
@@ -96,15 +115,16 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertFalse(result["affects_health"])
         self.assertEqual(result["runner_id"], "local")
         execute_core.assert_awaited_once()
-        create_run.assert_not_called()
-        finish_run.assert_not_called()
-        get_run.assert_not_called()
-        update_run_notification.assert_not_called()
+        create_run.assert_called_once()
+        finish_run.assert_called_once_with(101, unittest.mock.ANY)
+        get_run.assert_called_once_with(101)
+        update_run_notification.assert_called_once_with(101, "not_required", channel=None, error=None, sent_at=None)
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
 
     def test_structured_api_check_runs_without_loading_user_script(self) -> None:
         check = {
+            "project_id": 1,
             "id": 7,
             "name": "无脚本接口",
             "type": "api",
@@ -153,6 +173,7 @@ class DraftRunnerTests(unittest.TestCase):
 
     def test_duration_excludes_preparation_and_notification_latency(self) -> None:
         check = {
+            "project_id": 1,
             "id": 27,
             "name": "Precise duration API",
             "type": "api",
@@ -208,6 +229,7 @@ class DraftRunnerTests(unittest.TestCase):
 
     def test_target_failure_records_runner_metadata_and_failure_kind(self) -> None:
         check = {
+            "project_id": 1,
             "id": 17,
             "name": "Runner metadata API",
             "type": "api",
@@ -264,6 +286,7 @@ class DraftRunnerTests(unittest.TestCase):
 
     def test_target_failure_retry_can_recover_with_single_run_record(self) -> None:
         check = {
+            "project_id": 1,
             "id": 19,
             "name": "Retry API",
             "type": "api",
@@ -334,6 +357,7 @@ class DraftRunnerTests(unittest.TestCase):
 
     def test_retry_duration_uses_final_failed_attempt_instead_of_cumulative_total(self) -> None:
         check = {
+            "project_id": 1,
             "id": 29,
             "name": "Retry duration API",
             "type": "api",
@@ -399,6 +423,7 @@ class DraftRunnerTests(unittest.TestCase):
 
     def test_runner_environment_failure_persists_non_health_run(self) -> None:
         check = {
+            "project_id": 1,
             "id": 18,
             "name": "Runner browser failure",
             "type": "ui",
@@ -469,6 +494,7 @@ class DraftRunnerTests(unittest.TestCase):
 
     def test_playwright_target_crash_persists_system_run_not_target_failure(self) -> None:
         check = {
+            "project_id": 1,
             "id": 19,
             "name": "浏览器崩溃",
             "type": "ui",
@@ -538,7 +564,7 @@ class DraftRunnerTests(unittest.TestCase):
         notify_system_error.assert_awaited_once()
 
     def test_system_alert_delivery_outcome_is_persisted_on_runner_run(self) -> None:
-        check = {"id": 20, "name": "Runner system failure", "type": "api"}
+        check = {"id": 20, "project_id": 1, "name": "Runner system failure", "type": "api"}
         result = {
             "id": 182,
             "check_id": 20,
@@ -623,6 +649,7 @@ class DraftRunnerTests(unittest.TestCase):
 
     def test_structured_ui_check_runs_without_loading_user_script(self) -> None:
         check = {
+            "project_id": 1,
             "id": 8,
             "name": "无脚本 UI",
             "type": "ui",
@@ -662,8 +689,12 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertEqual(result, finished_run)
         run_structured_ui_check.assert_awaited_once()
         ctx = run_structured_ui_check.call_args.args[0]
+        diagnostics = ctx.request_snapshot["diagnostics"]
+        self.assertEqual(diagnostics["status"], "ok")
+        self.assertEqual(diagnostics["stage"], "prepare")  # execution is mocked in this test
+        self.assertEqual(diagnostics["variables"], {})
         self.assertEqual(
-            ctx.request_snapshot,
+            {key: value for key, value in ctx.request_snapshot.items() if key != "diagnostics"},
             {
                 "type": "ui",
                 "url": "https://example.com",
@@ -671,10 +702,12 @@ class DraftRunnerTests(unittest.TestCase):
                 "viewport_mode": "web",
             },
         )
+        self.assertEqual(diagnostics["request"], {key: value for key, value in ctx.request_snapshot.items() if key != "diagnostics"})
         maybe_notify.assert_awaited_once()
 
     def test_structured_ui_check_loads_setup_script_without_running_advanced_script(self) -> None:
         check = {
+            "project_id": 1,
             "id": 9,
             "name": "带前置脚本 UI",
             "type": "ui",
@@ -1065,6 +1098,13 @@ class RunnerQueueTests(unittest.TestCase):
 
 
 class DistributedRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._project_patch = patch(
+            "backend.app.runner.storage.get_project", return_value={"id": 1, "status": "active"}
+        )
+        self._project_patch.start()
+        self.addCleanup(self._project_patch.stop)
+
     def test_worker_settings_include_browser_prewarm_configuration(self) -> None:
         settings = {
             "max_task_runtime_seconds": 60,
@@ -1102,7 +1142,7 @@ class DistributedRunnerTests(unittest.TestCase):
                 "prewarmed_browser_types": ["chromium"],
                 "browser_pool_sizes": {"chromium": 3, "firefox": 1, "webkit": 1},
             }
-            check = {"id": 41, "name": "worker api", "type": "api"}
+            check = {"id": 41, "project_id": 1, "name": "worker api", "type": "api"}
             runner.resources.reload = AsyncMock()  # type: ignore[method-assign]
             runner._execute_core = AsyncMock(return_value={"status": "ok"})  # type: ignore[method-assign]
 
@@ -1204,7 +1244,7 @@ class DistributedRunnerTests(unittest.TestCase):
             }
             stale = {**runner, "available": False, "status": "unavailable"}
             target = BrowserRunTarget(runner=runner, browser_type="")
-            check = {"id": 42, "name": "Remote stale", "type": "api"}
+            check = {"id": 42, "project_id": 1, "name": "Remote stale", "type": "api"}
 
             with patch("backend.app.runner.storage.get_probe_runner", return_value=stale), patch(
                 "backend.app.runner.storage.can_schedule_runner", return_value=False
@@ -1241,7 +1281,7 @@ class DistributedRunnerTests(unittest.TestCase):
                 "role": "child",
             }
             target = BrowserRunTarget(runner=runner, browser_type="")
-            check = {"id": 43, "name": "Remote system failure", "type": "api"}
+            check = {"id": 43, "project_id": 1, "name": "Remote system failure", "type": "api"}
             worker_result = {
                 "ok": True,
                 "run": {
@@ -1367,6 +1407,7 @@ class DistributedRunnerTests(unittest.TestCase):
 
     def test_disabled_local_runner_is_skipped_without_executing_probe(self) -> None:
         check = {
+            "project_id": 1,
             "id": 31,
             "name": "Disabled local runner",
             "type": "api",
@@ -1438,7 +1479,7 @@ class DistributedRunnerTests(unittest.TestCase):
 
     def test_local_distributed_runner_system_failure_sends_system_alert(self) -> None:
         async def scenario() -> tuple[dict[str, object], int]:
-            check = {"id": 32, "name": "Local distributed", "type": "api"}
+            check = {"id": 32, "project_id": 1, "name": "Local distributed", "type": "api"}
             target = BrowserRunTarget(
                 runner={
                     "runner_id": "local",
@@ -1496,7 +1537,7 @@ class DistributedRunnerTests(unittest.TestCase):
         self.assertEqual(system_alert_count, 1)
 
     def test_runner_only_distributed_group_does_not_update_target_health(self) -> None:
-        check = {"id": 32, "name": "Runner only", "type": "api"}
+        check = {"id": 32, "project_id": 1, "name": "Runner only", "type": "api"}
         runner_failure = {
             "id": 320,
             "check_id": 32,
@@ -1515,7 +1556,7 @@ class DistributedRunnerTests(unittest.TestCase):
         maybe_notify.assert_not_called()
 
     def test_distributed_group_target_failure_wins_over_success_and_updates_once(self) -> None:
-        check = {"id": 33, "name": "Aggregate target failure", "type": "api"}
+        check = {"id": 33, "project_id": 1, "name": "Aggregate target failure", "type": "api"}
         success = {
             "id": 331,
             "check_id": 33,
@@ -1547,9 +1588,10 @@ class DistributedRunnerTests(unittest.TestCase):
 def runner_patches(max_concurrency: int = 2, max_ui_concurrency: int = 1, max_queue_size: int = 50, check_type: str = "api"):
     run_ids = {"value": 0}
 
-    def check_for(check_id: int) -> dict[str, object]:
+    def check_for(check_id: int, **_: object) -> dict[str, object]:
         return {
             "id": check_id,
+            "project_id": 1,
             "name": f"任务 {check_id}",
             "type": check_type,
             "enabled": True,
@@ -1586,9 +1628,11 @@ def runner_patches(max_concurrency: int = 2, max_ui_concurrency: int = 1, max_qu
         "backend.app.runner.storage",
         get_settings=Mock(return_value=settings),
         get_check=Mock(side_effect=check_for),
+        get_project=Mock(return_value={"id": 1, "status": "active"}),
         get_probe_runner=Mock(return_value=local_runner_stub()),
         can_schedule_runner=Mock(return_value=True),
         create_run=Mock(side_effect=create_run),
+        get_run=Mock(return_value=None),
         start_run=Mock(),
     )
 
