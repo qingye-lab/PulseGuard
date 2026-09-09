@@ -29,6 +29,8 @@ def inspection_diagnostics(ctx: Any, *, error: Exception | None = None) -> dict[
         "variables": ctx.vars.snapshot(),
         "request": ctx.request_snapshot,
         "http_requests": getattr(ctx, "http_exchanges", []),
+        "modules": getattr(ctx, "library_metadata", None),
+        "compile": list(getattr(ctx, "compile_diagnostics", []) or []),
         "logs": "\n".join(ctx.logs[-50:]),
     }
     # Mask BEFORE truncation, so truncating a secret never leaves a visible prefix.

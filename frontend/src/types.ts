@@ -21,6 +21,31 @@ export type WebhookType = "feishu" | "wecom" | "dingtalk";
 export type ConfigBundle = Record<string, unknown>;
 export type CheckBatchAction = "enable" | "disable" | "run";
 
+export interface ModuleExport {
+  name: string;
+  signature: string | null;
+  docstring: string;
+  kind: "async" | "sync" | "constant";
+  positional: string[];
+  required_positional: number;
+  keyword_only: string[];
+  required_keyword_only: string[];
+}
+
+export interface ProjectModule {
+  name: string;
+  source: string;
+  description?: string | null;
+  exports: ModuleExport[];
+}
+
+export interface ModuleLibrary {
+  project_id: number;
+  /** Current saved library exposed by the atomic library endpoint. */
+  effective_revision: number;
+  effective_modules: ProjectModule[];
+}
+
 export interface Project {
   id: number;
   name: string;
@@ -114,7 +139,35 @@ export interface ApiInspectPayload {
   method: string;
   headers_json: string;
   body: string;
+  script: string;
   timeout_ms: number;
+}
+
+export interface ApiHttpExchange {
+  request: unknown;
+  response: unknown;
+  error?: string | null;
+  duration_ms?: number | null;
+}
+
+export interface ApiInspectionTimings {
+  request_ms?: number | null;
+  task_ms?: number | null;
+}
+
+export interface ApiInspectionDiagnostics {
+  stage: string;
+  status: "ok" | "failed";
+  message: string | null;
+  error_type: string | null;
+  url_variables: Record<string, "available" | "missing">;
+  variables: Record<string, string>;
+  request: unknown;
+  response: unknown;
+  http_requests: ApiHttpExchange[];
+  timings: ApiInspectionTimings;
+  logs: string;
+  cleanup_error?: string;
 }
 
 export interface ApiInspectResult {
@@ -124,6 +177,8 @@ export interface ApiInspectResult {
   body: string;
   json_valid: boolean;
   json_paths: ApiJsonPathOption[];
+  timings?: ApiInspectionTimings;
+  diagnostics?: ApiInspectionDiagnostics;
 }
 
 export interface UiInspectPayload {
@@ -229,6 +284,8 @@ export interface UiInspectionDiagnostics {
   logs: string;
   cleanup_error?: string;
 }
+
+export type InspectionDiagnostics = UiInspectionDiagnostics | ApiInspectionDiagnostics;
 
 export interface Check {
   project_id: number;

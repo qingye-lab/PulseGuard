@@ -3,6 +3,7 @@ import type { MenuProps } from "antd";
 import {
   Activity,
   BellRing,
+  BookOpen,
   Check,
   ChevronDown,
   History,
@@ -17,7 +18,8 @@ import {
   ScrollText,
   ShieldCheck,
   Settings,
-  Users
+  Users,
+  WandSparkles
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
@@ -60,12 +62,14 @@ const navEntries: NavEntry[] = [
   },
   { to: "/runs", label: "运行记录", icon: <History size={16} /> },
   { to: "/members", label: "成员管理", icon: <Users size={16} /> },
+  { to: "/integrations", label: "Skill / MCP", icon: <BookOpen size={16} /> },
   {
     key: "projects",
     label: "项目管理",
     icon: <FolderKanban size={16} />,
     children: [
       { to: "/projects", label: "项目列表", icon: <FolderKanban size={16} /> },
+      { to: "/projects/modules", label: "公共方法", icon: <WandSparkles size={16} /> },
       { to: "/projects/alerts", label: "项目告警", icon: <BellRing size={16} /> }
     ]
   },
@@ -110,6 +114,7 @@ const mobileMoreItems: NavLeaf[] = [
   { to: "/monitoring", label: "监控趋势", icon: <Activity size={16} /> },
   { to: "/members", label: "成员管理", icon: <Users size={16} /> },
   { to: "/projects", label: "项目列表", icon: <FolderKanban size={16} /> },
+  { to: "/projects/modules", label: "公共方法", icon: <WandSparkles size={16} /> },
   { to: "/projects/alerts", label: "项目告警", icon: <BellRing size={16} /> },
   { to: "/settings/execution", label: "执行配置", icon: <Activity size={16} /> },
   { to: "/settings/system-alerts", label: "系统告警", icon: <ShieldCheck size={16} /> },

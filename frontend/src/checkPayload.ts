@@ -114,8 +114,22 @@ export function prepareApiInspectPayload(value: CheckPayload, options: PrepareCh
     method: payload.method || "GET",
     headers_json: payload.headers_json,
     body: payload.body,
+    script: payload.script,
     timeout_ms: payload.timeout_ms
   };
+}
+
+export function apiInspectSignature(value: CheckPayload, projectId?: number | null): string {
+  const payload = normalizeCheckPayload(value);
+  return JSON.stringify({
+    project_id: Number.isInteger(projectId) ? Number(projectId) : null,
+    entry_url: payload.entry_url,
+    method: payload.method || "GET",
+    headers_json: payload.headers_json,
+    body: payload.body,
+    script: payload.script,
+    timeout_ms: payload.timeout_ms
+  });
 }
 
 export function normalizeCheckPayload(value: CheckPayload): CheckPayload {

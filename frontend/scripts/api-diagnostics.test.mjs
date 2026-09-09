@@ -22,3 +22,36 @@ test("UI error retains structured evidence without breaking legacy detail", asyn
     await assert.rejects(api.inspectUi({}), /503/);
   } finally { globalThis.fetch = original; }
 });
+
+test("API preview error retains bounded history and timing diagnostics", async () => {
+  const original = globalThis.fetch;
+  const diagnostics = {
+    stage: "script",
+    status: "failed",
+    message: "脚本未产生 HTTP 响应",
+    error_type: "RunFailure",
+    url_variables: {},
+    variables: {},
+    request: { method: "GET", url: "https://example.test" },
+    response: null,
+    http_requests: [{ request: { method: "GET", url: "https://example.test" }, response: null, duration_ms: 12 }],
+    timings: { request_ms: 12, task_ms: 19 },
+    logs: ""
+  };
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ detail: "接口请求失败：脚本未产生 HTTP 响应", diagnostics }), { status: 400 });
+    await assert.rejects(api.inspectApi({
+      type: "api",
+      entry_url: "https://example.test",
+      method: "GET",
+      headers_json: "{}",
+      body: "",
+      script: "async def check(ctx): pass",
+      timeout_ms: 10000
+    }), error => {
+      assert.ok(error instanceof ApiError);
+      assert.deepEqual(error.diagnostics, diagnostics);
+      return true;
+    });
+  } finally { globalThis.fetch = original; }
+});

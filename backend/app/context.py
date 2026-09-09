@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime
+from time import perf_counter
 from typing import Any
 
 import httpx
@@ -11,6 +12,7 @@ from jsonschema import ValidationError, validate
 from . import network_checks
 from .artifacts import ArtifactStore
 from .resource_pool import ProbeResourcePool, ResourcePoolError
+from .script_modules import ModuleBundleError, ModuleRuntime, ScriptStaticError, compile_script_entry, normalize_module_bundle
 from .variables import RuntimeVariables, mask_data, mask_text, resolve_data, resolve_text, resolve_url
 from .viewport import browser_context_options, normalize_viewport_mode, viewport_for_mode
 
@@ -21,6 +23,37 @@ class RunFailure(Exception):
 
 class RunnerEnvironmentFailure(RunFailure):
     """Expected failure caused by local runner dependencies or browser setup."""
+
+
+def compile_check_function(
+    script: str,
+    ctx: "RunContext",
+    function_name: str = "check",
+    expected_signature: str = "async def check(ctx)",
+    script_label: str = "脚本",
+    *,
+    module_bundle: dict[str, Any] | None = None,
+    filename: str | None = None,
+    attempt: int | None = None,
+) -> Any:
+    try:
+        return compile_script_entry(
+            script,
+            ctx,
+            function_name=function_name,
+            expected_signature=expected_signature,
+            script_label=script_label,
+            module_bundle=module_bundle,
+            modules=getattr(ctx, "modules", None),
+            filename=filename,
+            check_id=getattr(ctx, "original_check_id", None),
+            attempt=attempt,
+        )
+    except ScriptStaticError as exc:
+        ctx.compile_diagnostics = list(exc.diagnostics)
+        raise RunFailure(str(exc)) from exc
+    except ModuleBundleError as exc:
+        raise RunFailure(str(exc)) from exc
 
 
 class PulseHttpClient:
@@ -34,24 +67,33 @@ class PulseHttpClient:
         # A failed next request must not appear to have the previous response.
         self.last_response = None
         self.ctx.response_snapshot = None
+        self.ctx.last_request_duration_ms = None
+        if self.ctx.check.get("type") == "api":
+            self.ctx.api_stage = "request"
         self.ctx.request_snapshot = {"method": method.upper(), "url_template": url}
-        resolved_url = resolve_text(url, self.ctx.settings)
-        resolved_kwargs = resolve_data(kwargs, self.ctx.settings)
-        resolved_kwargs.setdefault("timeout", self.ctx.timeout_ms / 1000)
-        self.ctx.request_snapshot = mask_data(
-            {
-                "method": method.upper(),
-                "url": resolved_url,
-                "headers": dict(resolved_kwargs.get("headers") or {}),
-                "body": self._snapshot_body(resolved_kwargs),
-            },
-            self.ctx.settings,
-        )
         exchange: dict[str, Any] = {"request": self.ctx.request_snapshot, "response": None}
-        if self.ctx.check.get("type") == "ui":
+        if self.ctx.check.get("type") in {"api", "ui"}:
             self.ctx.http_exchanges.append(exchange)
             del self.ctx.http_exchanges[:-10]
+        started = perf_counter()
+        resolved_url = str(url)
+        resolved_kwargs: dict[str, Any] = {}
+        request_url = resolved_url
         try:
+            resolved_url = resolve_text(url, self.ctx.settings)
+            resolved_kwargs = resolve_data(kwargs, self.ctx.settings)
+            resolved_kwargs.setdefault("timeout", self.ctx.timeout_ms / 1000)
+            request_url = self._request_url_with_params(method, resolved_url, resolved_kwargs)
+            self.ctx.request_snapshot = mask_data(
+                {
+                    "method": method.upper(),
+                    "url": request_url,
+                    "headers": dict(resolved_kwargs.get("headers") or {}),
+                    "body": self._snapshot_body(resolved_kwargs),
+                },
+                self.ctx.settings,
+            )
+            exchange["request"] = self.ctx.request_snapshot
             if self._resources is not None:
                 async with self._resources.http_client() as client:
                     response = await client.request(method, resolved_url, **resolved_kwargs)
@@ -60,10 +102,34 @@ class PulseHttpClient:
             else:
                 raise RuntimeError("HTTP client 未初始化")
         except httpx.RequestError as exc:
+            self._update_request_snapshot_url(getattr(exc, "request", None), request_url)
+            duration_ms = max(0, int((perf_counter() - started) * 1000))
+            self.ctx.last_request_duration_ms = duration_ms
+            exchange["duration_ms"] = duration_ms
             exchange["error"] = mask_text(str(exc) or type(exc).__name__, self.ctx.settings)
             raise RunFailure(f"请求目标失败：{exc}") from exc
+        except Exception as exc:
+            self._update_request_snapshot_url(getattr(exc, "request", None), request_url)
+            duration_ms = max(0, int((perf_counter() - started) * 1000))
+            self.ctx.last_request_duration_ms = duration_ms
+            exchange["duration_ms"] = duration_ms
+            exchange["error"] = mask_text(str(exc) or type(exc).__name__, self.ctx.settings)
+            raise
+        except asyncio.CancelledError:
+            self._update_request_snapshot_url(None, request_url)
+            duration_ms = max(0, int((perf_counter() - started) * 1000))
+            self.ctx.last_request_duration_ms = duration_ms
+            exchange["duration_ms"] = duration_ms
+            exchange["error"] = "请求已取消"
+            raise
+        duration_ms = max(0, int((perf_counter() - started) * 1000))
+        self._update_request_snapshot_url(getattr(response, "request", None), request_url)
         self.last_response = response
+        self.ctx.last_request_duration_ms = duration_ms
         self.ctx.response_snapshot = self.ctx.response_snapshot_from(response)
+        self.ctx.response_snapshot["duration_ms"] = duration_ms
+        self.ctx.response_snapshot["timings"] = {"request_ms": duration_ms}
+        exchange["duration_ms"] = duration_ms
         exchange["response"] = self.ctx.response_snapshot
         return response
 
@@ -82,6 +148,26 @@ class PulseHttpClient:
     async def close(self) -> None:
         if self._client is not None:
             await self._client.aclose()
+
+    def _update_request_snapshot_url(self, request: Any, fallback: str) -> None:
+        try:
+            request_url = getattr(request, "url", None) if request is not None else None
+        except Exception:
+            request_url = None
+        actual_url = str(request_url) if request_url is not None else str(fallback)
+        if not isinstance(self.ctx.request_snapshot, dict):
+            self.ctx.request_snapshot = {"method": self.ctx.method.upper()}
+        self.ctx.request_snapshot["url"] = mask_text(actual_url, self.ctx.settings)
+
+    @staticmethod
+    def _request_url_with_params(method: str, url: str, kwargs: dict[str, Any]) -> str:
+        params = kwargs.get("params")
+        if params is None:
+            return url
+        try:
+            return str(httpx.Request(method, url, params=params).url)
+        except Exception:
+            return url
 
     @staticmethod
     def _snapshot_body(kwargs: dict[str, Any]) -> Any:
@@ -105,23 +191,30 @@ class RunContext:
         settings: dict[str, Any],
         artifacts: ArtifactStore,
         resources: ProbeResourcePool | None = None,
+        module_bundle: dict[str, Any] | None = None,
+        attempt: int | None = None,
     ) -> None:
         self.check = check
         self.run_id = run_id
+        self.project_id = int(check.get("project_id") or 0) or None
+        self.original_check_id = int(
+            check.get("original_check_id") or check.get("_original_check_id") or check.get("id") or 0
+        )
         self.vars = RuntimeVariables(settings)
         self.settings = self.vars.settings
         self.artifacts = artifacts
         self.resources = resources
-        self.entry_url = (check.get("entry_url") or "") if check.get("type") == "ui" else resolve_text(check.get("entry_url") or "", settings)
+        self.entry_url = check.get("entry_url") or ""
         self.viewport_mode = normalize_viewport_mode(check.get("viewport_mode"))
         self.viewport_width = self._optional_int(check.get("viewport_width"))
         self.viewport_height = self._optional_int(check.get("viewport_height"))
         self.method = (check.get("method") or "GET").upper()
-        self.headers = self._parse_headers(resolve_text(check.get("headers_json") or "{}", settings))
-        self.body = resolve_text(check.get("body") or "", settings)
+        self._headers_template = check.get("headers_json") or "{}"
+        self._body_template = check.get("body") or ""
         self.timeout_ms = int(check.get("timeout_ms") or 15000)
         self.logs: list[str] = []
         self.ui_stage = "prepare"
+        self.api_stage = "prepare"
         self.http_exchanges: list[dict[str, Any]] = []
         self.console_messages: list[dict[str, str]] = []
         self.schema_errors: list[str] = []
@@ -130,6 +223,17 @@ class RunContext:
         self.response_path: str | None = None
         self.request_snapshot: dict[str, Any] | None = None
         self.response_snapshot: dict[str, Any] | None = None
+        self.last_request_duration_ms: int | None = None
+        self.task_duration_ms: int | None = None
+        self.attempt = attempt
+        self.compile_diagnostics: list[dict[str, Any]] = []
+        raw_module_bundle = module_bundle if module_bundle is not None else (check.get("_module_bundle") or check.get("module_bundle"))
+        try:
+            self.module_bundle = normalize_module_bundle(raw_module_bundle, expected_project_id=self.project_id)
+            self.modules = ModuleRuntime(self.module_bundle, expected_project_id=self.project_id)
+        except ModuleBundleError as exc:
+            raise RunFailure(str(exc)) from exc
+        self.library_metadata = self.modules.metadata()
         self.browser_version: str | None = None
         self.trace_artifacts_enabled = bool(settings.get("trace_artifacts_enabled", False))
         self.http = PulseHttpClient(self, resources)
@@ -153,7 +257,7 @@ class RunContext:
     def entry_url(self) -> str:
         if self.check.get("type") == "ui":
             return resolve_url(self._entry_url_template, self.settings)
-        return self._entry_url_template
+        return resolve_text(self._entry_url_template, self.settings)
 
     @entry_url.setter
     def entry_url(self, value: str) -> None:
@@ -169,6 +273,14 @@ class RunContext:
             request_kwargs["headers"] = headers
 
         return await self.http.request(self.method, self.entry_url, **request_kwargs)
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return self._parse_headers(resolve_text(self._headers_template, self.settings))
+
+    @property
+    def body(self) -> str:
+        return resolve_text(self._body_template, self.settings)
 
     async def tcp_connect(self, host: str, port: int | None = None, timeout_seconds: float | None = None) -> dict[str, Any]:
         resolved_host = resolve_text(host, self.settings)
@@ -310,7 +422,11 @@ class RunContext:
         target = response or self.http.last_response
         if target is None:
             raise RunFailure("当前没有可保存的响应体")
+        existing = self.response_snapshot or {}
         payload = self.response_snapshot_from(target, include_body=True)
+        for key in ("duration_ms", "timings", "assertions"):
+            if key in existing:
+                payload[key] = existing[key]
         self.response_snapshot = payload
         self.response_path = self.artifacts.save_response(self.run_id, payload)
         return self.response_path
@@ -348,6 +464,18 @@ class RunContext:
 
     def log(self, message: Any) -> None:
         self.logs.append(str(message))
+
+    def set_task_duration(self, duration_ms: int | None) -> None:
+        self.task_duration_ms = max(0, int(duration_ms or 0))
+        if self.response_snapshot is None:
+            return
+        timings = self.response_snapshot.get("timings")
+        if not isinstance(timings, dict):
+            timings = {}
+        if self.last_request_duration_ms is not None:
+            timings.setdefault("request_ms", self.last_request_duration_ms)
+        timings["task_ms"] = self.task_duration_ms
+        self.response_snapshot["timings"] = timings
 
     async def close(self, failed: bool) -> None:
         if failed and self.check.get("type") == "ui" and self._pages and not self.screenshot_path:
@@ -409,13 +537,12 @@ class RunContext:
             self._browser = None
 
     def response_snapshot_from(self, response: httpx.Response, include_body: bool = False) -> dict[str, Any]:
-        body_text = response.text
-        if self.check.get("type") == "ui":
-            try:
-                body_text = json.dumps(mask_data(response.json(), self.settings), ensure_ascii=False)
-            except ValueError:
-                pass
-            body_text = mask_text(body_text, self.settings)
+        body_text = mask_text(response.text, self.settings)
+        try:
+            body_text = json.dumps(mask_data(response.json(), self.settings), ensure_ascii=False)
+        except ValueError:
+            pass
+        body_text = mask_text(body_text, self.settings)
         if not include_body and len(body_text) > 5000:
             body_text = body_text[:5000] + "\n... 响应体已截断。"
         return mask_data(

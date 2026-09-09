@@ -1,0 +1,76 @@
+.modules-page {
+  gap: var(--space-md);
+}
+
+.modules-page-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-md);
+}
+
+.modules-page-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--line));
+  border-radius: var(--radius-tight);
+  background: var(--danger-soft);
+}
+
+.modules-page-loading {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+}
+
+.modules-page-table {
+  min-width: 0;
+}
+
+.modules-page-table .ant-table-cell:last-child {
+  white-space: nowrap;
+}
+
+.modules-page-table .ant-table-cell {
+  vertical-align: middle;
+}
+
+.module-editor-form {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.module-editor-form .ant-form-item {
+  margin-bottom: 0;
+}
+
+.module-editor-source {
+  min-width: 0;
+  margin-top: var(--space-xs);
+}
+
+.module-editor-source .code-editor-panel,
+.module-editor-source .editor-frame {
+  width: 100%;
+  min-width: 0;
+}
+
+.module-editor-drawer .ant-drawer-body {
+  overflow: hidden auto;
+}
+
+.module-tutorial-content .code-block {
+  margin-bottom: var(--space-lg);
+}
+
+.module-tutorial-content ul {
+  padding-left: var(--space-lg);
+  margin-bottom: var(--space-md);
+}
+
+.module-tutorial-content li + li {
+  margin-top: var(--space-sm);
+}

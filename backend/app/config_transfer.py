@@ -11,11 +11,13 @@ from pydantic import ValidationError
 from . import storage
 from .defaults import DEFAULT_PROJECT_ALERT_SETTINGS, DEFAULT_SETTINGS
 from .schemas import CheckCreate, normalize_project_alert_settings_values, normalize_settings_values
+from .script_library import ModuleLibraryError, normalize_modules, referenced_module_names, static_reference_diagnostics
 from .variables import is_sensitive_variable_name, mask_data
 
 
 EXPORT_SCHEMA_VERSION = 4
-PROJECT_EXPORT_SCHEMA_VERSION = 1
+PROJECT_EXPORT_SCHEMA_VERSION = 2
+SUPPORTED_PROJECT_EXPORT_SCHEMA_VERSIONS = {1, PROJECT_EXPORT_SCHEMA_VERSION}
 CHECK_EXPORT_FIELDS = (
     "name",
     "type",
@@ -122,6 +124,8 @@ def export_project(project_id: int, redact: bool = True) -> dict[str, Any]:
             for policy in export_alerts.get("alert_tag_policies") or []
             if isinstance(policy, dict)
         ]
+    library = storage.get_project_library(project_id)
+    published_library = deepcopy(library.get("published")) if isinstance(library, dict) else None
     return {
         "schema": "pulseguard.project",
         "version": PROJECT_EXPORT_SCHEMA_VERSION,
@@ -137,6 +141,9 @@ def export_project(project_id: int, redact: bool = True) -> dict[str, Any]:
             _export_check(check, settings, redact=redact)
             for check in storage.list_checks(project_id=project_id)
         ],
+        # Project export carries the current published source snapshot only;
+        # historical versions and an unsaved draft remain local state.
+        "library": {"published": published_library},
     }
 
 
@@ -150,6 +157,13 @@ def preview_project_import(bundle: dict[str, Any], project_id: int) -> dict[str,
     conflicts = [check["name"] for check in parsed["checks"] if check["name"] in existing_names]
     for name in conflicts:
         warnings.append(f"当前项目已存在同名任务，导入时将自动改名：{name}")
+    library_conflicts = _project_library_conflicts(parsed.get("library"), project_id)
+    issues.extend(library_conflicts)
+    for diagnostic in _project_library_static_diagnostics(parsed.get("library"), parsed["checks"], project_id):
+        check_name = str(diagnostic.get("check_name") or diagnostic.get("check_id") or "")
+        code = str(diagnostic.get("code") or "static_validation")
+        message = str(diagnostic.get("message") or diagnostic.get("error") or "脚本静态校验失败")
+        issues.append(f"导入任务“{check_name}”公共方法引用无效（{code}）：{message}")
     _validate_project_references(parsed, issues)
     return {
         "valid": not issues,
@@ -159,6 +173,9 @@ def preview_project_import(bundle: dict[str, Any], project_id: int) -> dict[str,
             "checks": len(parsed["checks"]),
             "settings": len(parsed["alerts"]),
             "conflicts": len(conflicts),
+            "library_modules": len(
+                ((parsed.get("library") or {}).get("published") or {}).get("modules") or []
+            ),
         },
         "summary": {
             "schema": parsed["schema"],
@@ -188,6 +205,7 @@ def _apply_project_import(
     used_names = set(existing)
     created = updated = renamed = 0
     imported_checks: list[dict[str, Any]] = []
+    imported_library = storage.import_project_library_in_transaction(project_id, parsed.get("library"))
     for check in parsed["checks"]:
         payload = dict(check)
         existing_check = existing.get(payload["name"])
@@ -198,6 +216,8 @@ def _apply_project_import(
             if payload["name"] in used_names:
                 payload["name"] = _unique_import_name(payload["name"], used_names)
                 renamed += 1
+            if referenced_module_names(payload):
+                payload["enabled"] = False
             saved = storage.create_check(payload, project_id=project_id)
             created += 1
         used_names.add(payload["name"])
@@ -218,6 +238,7 @@ def _apply_project_import(
         "checks_updated": updated,
         "checks_renamed": renamed,
         "checks": imported_checks,
+        "library": imported_library,
     }
 
 
@@ -352,6 +373,7 @@ def _parse_project_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
             "version": None,
             "alerts": {},
             "checks": [],
+            "library": None,
             "issues": ["导入内容必须是 JSON Object"],
             "warnings": warnings,
         }
@@ -359,8 +381,10 @@ def _parse_project_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     version = bundle.get("version")
     if schema != "pulseguard.project":
         issues.append("项目配置包 schema 必须是 pulseguard.project")
-    if version != PROJECT_EXPORT_SCHEMA_VERSION:
-        issues.append(f"项目配置包版本必须是 v{PROJECT_EXPORT_SCHEMA_VERSION}")
+    if not isinstance(version, int) or version not in SUPPORTED_PROJECT_EXPORT_SCHEMA_VERSIONS:
+        issues.append(
+            f"项目配置包版本必须是 v{PROJECT_EXPORT_SCHEMA_VERSION}（仍支持导入旧 v1）"
+        )
     if "settings" in bundle or "runners" in bundle:
         issues.append("项目配置包不能包含全局设置或 Runner")
 
@@ -400,15 +424,115 @@ def _parse_project_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
                 warnings.append(f"导入文件内任务名称重复，导入时将自动改名：{normalized['name']}")
             seen_names.add(normalized["name"])
             checks.append(normalized)
+    library = _parse_project_library(bundle.get("library"), version, issues)
     return {
         "schema": schema,
         "version": version,
         "alerts": alerts,
         "variables": variables,
         "checks": checks,
+        "library": library,
         "issues": issues,
         "warnings": warnings,
     }
+
+
+def _parse_project_library(raw: Any, version: Any, issues: list[str]) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        issues.append("library 必须是 JSON Object")
+        return None
+    raw_published = raw.get("published")
+    if raw_published is None:
+        return {"published": None}
+    if not isinstance(raw_published, dict):
+        issues.append("library.published 必须是 JSON Object")
+        return None
+    raw_modules = raw_published.get("modules") or []
+    try:
+        modules = normalize_modules(raw_modules)
+    except ModuleLibraryError as exc:
+        issues.append(f"公共方法库无效：{exc}")
+        return None
+    try:
+        revision = int(raw_published.get("revision") or 0)
+    except (TypeError, ValueError):
+        issues.append("library.published.revision 必须是整数")
+        revision = 0
+    # Hashes and release ids are informational on import.  storage recalculates
+    # the executable bundle from source and does not trust transport metadata.
+    return {
+        "published": {
+            "revision": revision,
+            "modules": modules,
+        }
+    }
+
+
+def _project_library_conflicts(library: Any, project_id: int) -> list[str]:
+    if not isinstance(library, dict) or not isinstance(library.get("published"), dict):
+        return []
+    imported = library["published"].get("modules") or []
+    if not isinstance(imported, list):
+        return []
+    current = storage.get_project_library(project_id)
+    current_modules = list(current.get("modules") or []) if isinstance(current, dict) else []
+    if isinstance(current, dict) and isinstance(current.get("published"), dict):
+        current_modules.extend(current["published"].get("modules") or [])
+    existing_by_name: dict[str, set[str]] = {}
+    for item in current_modules:
+        if isinstance(item, dict) and item.get("name"):
+            existing_by_name.setdefault(str(item["name"]), set()).add(str(item.get("source") or ""))
+    conflicts: list[str] = []
+    for item in imported:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        name = str(item["name"])
+        if name in existing_by_name and any(source != str(item.get("source") or "") for source in existing_by_name[name]):
+            conflicts.append(f"导入公共方法与现有同名模块源码冲突：{name}")
+    return conflicts
+
+
+def _project_library_static_diagnostics(
+    library: Any,
+    checks: list[dict[str, Any]],
+    project_id: int,
+) -> list[dict[str, Any]]:
+    if not checks:
+        return []
+    current = storage.get_project_library(project_id)
+    current_published = []
+    if isinstance(current, dict) and isinstance(current.get("published"), dict):
+        current_published = list(current["published"].get("modules") or [])
+    incoming = []
+    if isinstance(library, dict) and isinstance(library.get("published"), dict):
+        incoming = list(library["published"].get("modules") or [])
+    by_name = {str(item.get("name")): item for item in current_published if isinstance(item, dict) and item.get("name")}
+    for item in incoming:
+        if isinstance(item, dict) and item.get("name"):
+            by_name.setdefault(str(item["name"]), item)
+    try:
+        modules = normalize_modules(list(by_name.values()))
+    except ModuleLibraryError:
+        return []
+    frozen_checks = [{**check, "id": int(check.get("id") or -(index + 1))} for index, check in enumerate(checks)]
+    diagnostics = static_reference_diagnostics(frozen_checks, modules)
+    seen: set[tuple[Any, ...]] = set()
+    result: list[dict[str, Any]] = []
+    for item in diagnostics:
+        key = (
+            item.get("check_id"),
+            item.get("code"),
+            item.get("line"),
+            item.get("column"),
+            item.get("message") or item.get("error"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
 
 
 def _validate_project_references(parsed: dict[str, Any], issues: list[str]) -> None:

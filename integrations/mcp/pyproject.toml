@@ -1,0 +1,26 @@
+[project]
+name = "pulseguard-mcp"
+version = "0.1.0"
+description = "Local stdio MCP adapter for the PulseGuard HTTP API."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "httpx[socks]==0.28.1",
+    "mcp==2.2.0",
+]
+
+[project.scripts]
+pulseguard-mcp = "pulseguard_mcp.server:main"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pulseguard_mcp"]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

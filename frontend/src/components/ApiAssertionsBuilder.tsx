@@ -1,22 +1,25 @@
 import {
   Alert,
   Button,
+  Descriptions,
   Empty,
   Input,
   InputNumber,
+  Modal,
   Select,
   Space,
   Switch,
   Table,
   Tag,
+  Tabs,
   Tooltip,
   Tree
 } from "antd";
 import type { TreeProps } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Braces, Clock3, CopyPlus, FileJson2, ListChecks, MousePointer2, Plus, Send, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
-import { api } from "../api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { api, ApiError } from "../api";
 import {
   API_ASSERTION_LABELS,
   API_JSON_VALUE_TYPE_LABELS,
@@ -26,7 +29,7 @@ import {
   parseApiAssertions,
   serializeApiAssertions
 } from "../apiAssertions";
-import { prepareApiInspectPayload, type BodyEditorMode } from "../checkPayload";
+import { apiInspectSignature, prepareApiInspectPayload, type BodyEditorMode } from "../checkPayload";
 import {
   buildJsonPathTree,
   buildJsonPathTreeFromOptions,
@@ -39,13 +42,15 @@ import {
   readJsonPath,
   type JsonPathNode
 } from "../jsonPath";
-import type { ApiAssertion, ApiAssertionType, ApiInspectResult, CheckPayload } from "../types";
+import type { ApiAssertion, ApiAssertionType, ApiInspectResult, ApiInspectionDiagnostics, CheckPayload } from "../types";
 import { formatDuration } from "../utils";
 import { StructuredViewer } from "./StructuredViewer";
 
 interface Props {
   bodyMode: BodyEditorMode;
   check: CheckPayload;
+  heading?: string;
+  projectId?: number | null;
   value: string;
   onChange: (value: string) => void;
 }
@@ -64,11 +69,19 @@ const SELECTED_FIELD_ACTIONS: Array<{ type: ApiAssertionType; label: string; nee
   { type: "json_path_length", label: "长度", needsLength: true }
 ];
 
-export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props) {
+export function ApiAssertionsBuilder({ bodyMode, check, heading = "健康判定规则", projectId, value, onChange }: Props) {
   const [inspectResult, setInspectResult] = useState<ApiInspectResult | null>(null);
+  const [inspectDiagnostics, setInspectDiagnostics] = useState<ApiInspectionDiagnostics | null>(null);
   const [selectedPath, setSelectedPath] = useState<string>("");
   const [inspecting, setInspecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const inspectSignature = useMemo(
+    () => `${apiInspectSignature(check, projectId)}|body_mode:${bodyMode}`,
+    [bodyMode, check.body, check.entry_url, check.headers_json, check.method, check.script, check.timeout_ms, projectId]
+  );
+  const inspectSignatureRef = useRef(inspectSignature);
+  const inspectRequestRef = useRef(0);
+  inspectSignatureRef.current = inspectSignature;
   const assertions = useMemo(() => parseApiAssertions(value), [value]);
   const parsedBody = useMemo(() => (inspectResult?.json_valid ? parseJsonValue(inspectResult.body) : { valid: false as const, value: null }), [inspectResult]);
   const pathTree = useMemo(() => (inspectResult?.json_valid ? buildJsonPathTreeFromOptions(inspectResult.json_paths) : []), [inspectResult]);
@@ -117,6 +130,15 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
     [assertions, selectedBaselineRuleTypes, selectedNode]
   );
 
+  useEffect(() => {
+    inspectRequestRef.current += 1;
+    setInspectResult(null);
+    setInspectDiagnostics(null);
+    setSelectedPath("");
+    setError(null);
+    setInspecting(false);
+  }, [inspectSignature]);
+
   function commit(next: ApiAssertion[]) {
     onChange(serializeApiAssertions(next));
   }
@@ -146,12 +168,20 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
   }
 
   async function inspect() {
+    const signature = inspectSignature;
+    const requestVersion = inspectRequestRef.current + 1;
+    inspectRequestRef.current = requestVersion;
     setInspecting(true);
     setError(null);
+    setInspectResult(null);
+    setInspectDiagnostics(null);
+    setSelectedPath("");
     try {
       const payload = prepareApiInspectPayload(check, { bodyMode });
       const result = await api.inspectApi(payload);
+      if (requestVersion !== inspectRequestRef.current || signature !== inspectSignatureRef.current) return;
       setInspectResult(result);
+      setInspectDiagnostics(result.diagnostics || null);
       if (result.json_valid) {
         const pathNodes = flattenJsonPathTree(buildJsonPathTreeFromOptions(result.json_paths));
         if (pathNodes.length) {
@@ -167,9 +197,11 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
         setSelectedPath("");
       }
     } catch (err) {
+      if (requestVersion !== inspectRequestRef.current || signature !== inspectSignatureRef.current) return;
       setError((err as Error).message);
+      setInspectDiagnostics(err instanceof ApiError ? asApiDiagnostics(err.diagnostics) || null : null);
     } finally {
-      setInspecting(false);
+      if (requestVersion === inspectRequestRef.current) setInspecting(false);
     }
   }
 
@@ -217,7 +249,7 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
     <section className="api-assertions-panel">
       <div className="section-title api-assertions-header">
         <div>
-          <h3>接口校验</h3>
+          <h3>{heading}</h3>
           <span>{assertions.filter((item) => item.enabled).length} 项启用</span>
         </div>
         <Space wrap>
@@ -232,7 +264,14 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
         </Space>
       </div>
 
-      {error && <Alert type="error" title={error} showIcon />}
+      {error && (
+        <Alert
+          type="error"
+          title={error}
+          showIcon
+          action={inspectDiagnostics ? <ApiInspectionDetails diagnostics={inspectDiagnostics} /> : undefined}
+        />
+      )}
 
       {inspectResult && (
         <div className="api-inspect-summary">
@@ -242,8 +281,14 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
           </span>
           <span>
             <Clock3 size={15} />
-            {formatDuration(inspectResult.duration_ms)}
+            目标请求 {formatDuration(inspectResult.duration_ms)}
           </span>
+          {inspectResult.timings?.task_ms !== undefined && (
+            <span>
+              <Clock3 size={15} />
+              全程探测 {formatDuration(inspectResult.timings.task_ms)}
+            </span>
+          )}
           <span>
             <FileJson2 size={15} />
             {inspectResult.json_valid ? `${flatNodes.length} 个 JSON 节点` : "非 JSON 响应"}
@@ -268,10 +313,10 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
                 onSelect={(keys) => setSelectedPath(String(keys[0] || ""))}
               />
             ) : (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="响应没有可选字段" />
             )
           ) : (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="执行请求后选择响应字段" />
           )}
         </section>
 
@@ -326,7 +371,7 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
               </Space>
             </>
           ) : (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="选择响应字段后添加规则" />
           )}
         </section>
       </div>
@@ -341,7 +386,7 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
         scroll={{ x: 820 }}
         locale={{
           emptyText: (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false}>
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无健康判定规则">
               <Button type="primary" size="small" icon={<Plus size={14} />} onClick={() => addAssertion("status_code")}>
                 添加状态码
               </Button>
@@ -353,7 +398,46 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
       {inspectResult && (
         <StructuredViewer title="最近响应" value={inspectResult.body} defaultMode={inspectResult.json_valid ? "json" : "text"} />
       )}
+      {!error && inspectDiagnostics && <ApiInspectionDetails diagnostics={inspectDiagnostics} />}
     </section>
+  );
+}
+
+function ApiInspectionDetails({ diagnostics }: { diagnostics: ApiInspectionDiagnostics }) {
+  const [open, setOpen] = useState(false);
+  const history = (diagnostics.http_requests || []).slice(-10);
+  return (
+    <>
+      <Button size="small" onClick={() => setOpen(true)}>
+        执行详情
+      </Button>
+      <Modal title="执行详情" open={open} onCancel={() => setOpen(false)} footer={null} width={860} destroyOnHidden>
+        <Tabs
+          items={[
+            {
+              key: "http",
+              label: "请求记录",
+              children: <StructuredViewer title="最近请求与响应（最多 10 条）" value={history} defaultMode="json" />
+            },
+            {
+              key: "timing",
+              label: "耗时",
+              children: (
+                <Descriptions bordered column={1} size="small">
+                  <Descriptions.Item label="目标请求耗时">{formatDuration(diagnostics.timings?.request_ms)}</Descriptions.Item>
+                  <Descriptions.Item label="全程探测耗时">{formatDuration(diagnostics.timings?.task_ms)}</Descriptions.Item>
+                </Descriptions>
+              )
+            },
+            {
+              key: "logs",
+              label: "日志",
+              children: <StructuredViewer title="本次执行" value={[diagnostics.message, diagnostics.logs].filter(Boolean).join("\n")} defaultMode="text" />
+            }
+          ]}
+        />
+      </Modal>
+    </>
   );
 }
 
@@ -441,6 +525,11 @@ function renderRuleEditor(
       )}
     </Space>
   );
+}
+
+function asApiDiagnostics(value: ApiError["diagnostics"]): ApiInspectionDiagnostics | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  return value as ApiInspectionDiagnostics;
 }
 
 function toTreeNode(node: JsonPathNode): NonNullable<TreeProps["treeData"]>[number] {

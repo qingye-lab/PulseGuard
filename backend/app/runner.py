@@ -1,21 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
-import re
 import traceback
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
-from types import MappingProxyType
 from typing import Any, AsyncIterator
 
 import httpx
 
-from .api_assertions import has_enabled_api_assertions, run_structured_api_check
+from .api_assertions import api_inspection_diagnostics, has_enabled_api_assertions, run_structured_api_check
 from .browser_installation import browser_capabilities, ensure_browser_types_installed
 from .browser_types import (
     DEFAULT_BROWSER_TYPE,
@@ -28,12 +25,20 @@ from .browser_types import (
 from .ui_assertions import has_enabled_ui_assertions, run_structured_ui_check
 from . import notifier, storage
 from .artifacts import ArtifactStore
-from .context import RunContext, RunFailure, RunnerEnvironmentFailure
+from .context import RunContext, RunFailure, RunnerEnvironmentFailure, compile_check_function
 from .monitoring import run_metadata
 from .resource_pool import ProbeResourcePool
+from .script_modules import (
+    ModuleBundleError,
+    analyze_script,
+    module_metadata,
+    normalize_module_bundle,
+)
 from .variables import mask_data, mask_text
 
 _TASK_DURATION_ATTR = "_pulseguard_task_duration_ms"
+API_SCRIPT_ASSERTIONS_CAPABILITY = "api_script_assertions_v1"
+SCRIPT_MODULES_CAPABILITY = "script_modules_v1"
 SYSTEM_ERROR_PATTERNS = (
     "Target crashed",
     "ERR_INSUFFICIENT_RESOURCES",
@@ -50,6 +55,14 @@ class MaintenanceBusyError(RuntimeError):
 
 class RuntimeSettingsReloadError(RuntimeError):
     """The database switched successfully, but execution must remain paused."""
+
+
+class ModulePreflightError(ValueError):
+    """A module preflight error that retains the bundle used for the check."""
+
+    def __init__(self, message: str, *, bundle: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.bundle = bundle
 
 
 @dataclass
@@ -169,6 +182,17 @@ class CheckRunner:
         project = storage.get_project(int(check["project_id"]))
         if not project or project.get("status") != "active":
             raise ValueError("归档项目不能执行任务")
+        try:
+            check = self._attach_frozen_module_bundle(check, require_published=True)
+        except ValueError as exc:
+            # Module resolution is a run precondition.  Keep the attempt
+            # observable through the normal failure path so scheduled runs do
+            # not disappear and manual callers do not turn a script error into
+            # a misleading 404 response.
+            bundle = getattr(exc, "bundle", None)
+            if isinstance(bundle, dict):
+                check = {**check, "_module_bundle": bundle}
+            return await self._run_module_preflight_failure(check, trigger, exc)
         if storage.is_deployment_window_active() and trigger != "post-deploy":
             return self._deployment_paused_result(check, trigger)
         runners = self._resolve_check_runners(check)
@@ -195,9 +219,20 @@ class CheckRunner:
 
     async def run_draft(self, check: dict[str, Any], trigger: str = "draft") -> dict[str, Any]:
         draft = dict(check)
+        original_check_id = int(draft.get("original_check_id") or draft.get("id") or 0)
+        if original_check_id > 0:
+            draft["original_check_id"] = original_check_id
+            draft["_original_check_id"] = original_check_id
         draft["id"] = 0
         if not draft.get("project_id"):
             raise ValueError("草稿调试缺少项目归属")
+        try:
+            draft = self._attach_frozen_module_bundle(draft, require_published=False)
+        except ValueError as exc:
+            bundle = getattr(exc, "bundle", None)
+            if isinstance(bundle, dict):
+                draft = {**draft, "_module_bundle": bundle}
+            draft = self._with_module_preflight_failure(draft, exc)
         settings = storage.get_settings()
         local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(settings)
         browser_type = self._first_runnable_browser_type(draft, local, settings) if self._uses_browser(draft) else ""
@@ -211,6 +246,152 @@ class CheckRunner:
             runner_metadata=storage.runner_metadata(local, browser_type=browser_type),
             manage_active=False,
         )
+
+    async def _run_module_preflight_failure(
+        self, check: dict[str, Any], trigger: str, error: ValueError
+    ) -> dict[str, Any]:
+        failed_check = self._with_module_preflight_failure(check, error)
+        return await self._submit(failed_check, trigger)
+
+    @classmethod
+    def _with_module_preflight_failure(
+        cls, check: dict[str, Any], error: ValueError
+    ) -> dict[str, Any]:
+        message = str(error).strip() or error.__class__.__name__
+        result = dict(check)
+        module_bundle = result.get("_module_bundle")
+        if module_bundle is None:
+            module_bundle = result.get("module_bundle")
+        result["_module_preflight_error"] = message
+        result["_module_preflight_stack"] = traceback.format_exc()
+        diagnostics: list[dict[str, Any]] = []
+        for entry, raw in (("check", result.get("script")), ("setup", result.get("setup_script"))):
+            source = str(raw or "")
+            if not source.strip():
+                continue
+            analysis = analyze_script(source, entry_points=(entry,), module_bundle=module_bundle)
+            diagnostics.extend(item for item in analysis.get("diagnostics") or [] if item.get("level") == "error")
+        if not diagnostics:
+            diagnostics.append(
+                {
+                    "level": "error",
+                    "code": "module_preflight",
+                    "message": message,
+                    "filename": f"<pulseguard:{'setup' if not str(result.get('script') or '').strip() else 'check'}>",
+                    "line": 0,
+                    "column": 1,
+                }
+            )
+        else:
+            # Keep the precise bundle/reference failure as the first report;
+            # the source analysis below may only describe the syntax shape.
+            diagnostics.insert(
+                0,
+                {
+                    "level": "error",
+                    "code": "module_preflight",
+                    "message": message,
+                    "filename": diagnostics[0].get("filename") or "<pulseguard:check>",
+                    "line": diagnostics[0].get("line") or 0,
+                    "column": diagnostics[0].get("column") or 1,
+                },
+            )
+        result["_module_preflight_diagnostics"] = diagnostics
+        return result
+
+    async def run_library_validation(
+        self,
+        check: dict[str, Any],
+        bundle: dict[str, Any],
+        *,
+        trigger: str = "library-validation",
+    ) -> dict[str, Any]:
+        """Run a candidate/published module bundle through real node dispatch.
+
+        Validation runs intentionally use the same target resolution, browser
+        pools, remote worker transport, retries, and last-response API path as a
+        normal check.  They are marked as non-observations so no health state,
+        trend rollup, or business/system notification is produced.
+        """
+        validation_check = dict(check)
+        original_check_id = int(
+            validation_check.get("original_check_id")
+            or validation_check.get("id")
+            or validation_check.get("check_id")
+            or 0
+        )
+        project_id = int(validation_check.get("project_id") or 0)
+        if project_id <= 0:
+            raise ValueError("公共方法验证缺少项目归属")
+        if original_check_id <= 0:
+            raise ValueError("公共方法验证缺少原始任务引用")
+        try:
+            normalized_bundle = normalize_module_bundle(bundle, expected_project_id=project_id)
+        except ModuleBundleError as exc:
+            raise ValueError(str(exc)) from exc
+        validation_check["_module_bundle"] = normalized_bundle
+        validation_check["_library_validation"] = True
+        validation_check["original_check_id"] = original_check_id
+        validation_check["_original_check_id"] = original_check_id
+        if "id" not in validation_check:
+            validation_check["id"] = original_check_id
+        self._validate_module_references(validation_check, normalized_bundle)
+
+        runners = self._resolve_check_runners(validation_check)
+        targets = self._resolve_browser_targets(validation_check, runners)
+        if self._uses_browser(validation_check):
+            if (
+                len(targets) == 1
+                and targets[0].runner.get("runner_id") == storage.LOCAL_RUNNER_ID
+                and not targets[0].skip_reason
+            ):
+                target = targets[0]
+                validation_check = self._with_browser_type(validation_check, target.browser_type)
+                run = await self._submit(
+                    validation_check,
+                    trigger,
+                    record_status=False,
+                    notify=False,
+                    runner_metadata=storage.runner_metadata(target.runner, browser_type=target.browser_type),
+                    manage_active=False,
+                )
+                runs = [run]
+            else:
+                aggregate = await self._run_distributed_check(validation_check, targets, trigger)
+                runs = list(aggregate.get("runs") or []) if isinstance(aggregate, dict) else []
+                if not runs and isinstance(aggregate, dict) and aggregate.get("id"):
+                    runs = [aggregate]
+        elif (
+            len(runners) == 1
+            and runners[0].get("runner_id") == storage.LOCAL_RUNNER_ID
+            and runners[0].get("enabled")
+            and runners[0].get("available")
+        ):
+            run = await self._submit(
+                validation_check,
+                trigger,
+                record_status=False,
+                notify=False,
+                runner_metadata=storage.runner_metadata(runners[0]),
+                manage_active=False,
+            )
+            runs = [run]
+        else:
+            aggregate = await self._run_distributed_check(validation_check, targets, trigger)
+            runs = list(aggregate.get("runs") or []) if isinstance(aggregate, dict) else []
+            if not runs and isinstance(aggregate, dict) and aggregate.get("id"):
+                runs = [aggregate]
+
+        statuses = [str(run.get("status") or "failed") for run in runs]
+        non_success = [item for item in statuses if item != "ok"]
+        status = "ok" if runs and not non_success else (non_success[0] if non_success else "skipped")
+        return {
+            "check_id": original_check_id,
+            "original_check_id": original_check_id,
+            "status": status,
+            "runs": runs,
+            "bundle": module_metadata(normalized_bundle),
+        }
 
     async def execute_worker_run(
         self,
@@ -261,10 +442,12 @@ class CheckRunner:
     async def _inspect_ui(self, payload: dict[str, Any], inspect_func: Any, name: str) -> dict[str, Any]:
         from .ui_diagnostics import UiInspectionFailure, inspection_diagnostics
 
+        payload = self._attach_frozen_module_bundle(payload, require_published=True)
         settings = storage.settings_for_project(storage.get_settings(), payload.get("project_id"))
         ctx = RunContext(
             {
                 "id": 0,
+                "project_id": payload.get("project_id"),
                 "name": name,
                 "type": "ui",
                 "entry_url": payload.get("entry_url") or "",
@@ -276,11 +459,13 @@ class CheckRunner:
                 "body": "",
                 "viewport_width": payload.get("viewport_width"),
                 "viewport_height": payload.get("viewport_height"),
+                "_module_bundle": payload.get("_module_bundle"),
             },
             0,
             settings,
             self.artifacts,
             resources=self.resources,
+            attempt=1,
         )
         setup_func = None
         failure: UiInspectionFailure | None = None
@@ -295,6 +480,7 @@ class CheckRunner:
                     function_name="setup",
                     expected_signature="async def setup(ctx, page)",
                     script_label="前置脚本",
+                    attempt=ctx.attempt,
                 )
             ctx.ui_stage = "queue"
             async def inspect_with_slot() -> dict[str, Any]:
@@ -420,6 +606,8 @@ class CheckRunner:
 
             settings = storage.get_settings()
             metadata = run_metadata(trigger)
+            if check.get("_library_validation"):
+                metadata.update({"trigger": trigger, "observation_kind": "library_validation", "affects_health": False})
             run_group_id = str(check.get("_run_group_id") or metadata.get("run_group_id") or "")
             run_metadata_payload = {**metadata, **({"run_group_id": run_group_id} if run_group_id else {})}
             runner_payload = runner_metadata or self._runner_metadata(settings, failure_kind="none")
@@ -437,8 +625,8 @@ class CheckRunner:
                 check=check,
                 trigger=trigger,
                 run_id=int(run["id"]),
-                record_status=record_status and bool(metadata["affects_health"]),
-                notify=notify and bool(metadata["affects_health"]),
+                record_status=record_status and bool(metadata["affects_health"]) and not bool(check.get("_library_validation")),
+                notify=notify and bool(metadata["affects_health"]) and not bool(check.get("_library_validation")),
                 future=loop.create_future(),
                 runner_metadata=runner_payload,
                 manage_active=manage_active,
@@ -468,26 +656,28 @@ class CheckRunner:
                     finish_exc,
                     status="timeout",
                 )
-            result = await self._notify_system_result(
-                job.check,
-                job.trigger,
-                job.run_id,
-                result,
-                self._settings_for_system_alert(),
-                source="watchdog",
-            )
+            if not job.check.get("_library_validation"):
+                result = await self._notify_system_result(
+                    job.check,
+                    job.trigger,
+                    job.run_id,
+                    result,
+                    self._settings_for_system_alert(),
+                    source="watchdog",
+                )
         except asyncio.CancelledError:
             result = self._finish_cancelled_job(job)
         except Exception as exc:
             result = self._finish_internal_error(job, exc)
-            result = await self._notify_system_result(
-                job.check,
-                job.trigger,
-                job.run_id,
-                result,
-                self._settings_for_system_alert(),
-                source="runner",
-            )
+            if not job.check.get("_library_validation"):
+                result = await self._notify_system_result(
+                    job.check,
+                    job.trigger,
+                    job.run_id,
+                    result,
+                    self._settings_for_system_alert(),
+                    source="runner",
+                )
         finally:
             await self._complete_job(job, result)
 
@@ -551,6 +741,7 @@ class CheckRunner:
         runner_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         settings = storage.settings_for_project(storage.get_settings(), check.get("project_id"))
+        library_validation = bool(check.get("_library_validation"))
         result_data = await self._execute_core(check, trigger, run_id, settings)
         if runner_metadata:
             result_data.update(
@@ -565,21 +756,23 @@ class CheckRunner:
             )
         if self._is_runner_system_result(result_data):
             result = self._finish_runner_result(check, trigger, run_id, result_data)
-            if notify:
+            if notify and not library_validation:
                 result = await self._notify_system_result(check, trigger, run_id, result, settings, source="runner")
             return result
+        if library_validation:
+            result_data = {**result_data, "affects_health": False}
         finished_run = storage.finish_run(run_id, result_data)
 
         if finished_run is None:
             raise RuntimeError("运行记录更新失败")
 
-        if not record_status:
+        if library_validation or not record_status:
             storage.update_run_notification(run_id, "not_required", channel=None, error=None, sent_at=None)
             return storage.get_run(run_id) or finished_run
 
         transition = storage.update_check_status(int(check["id"]), finished_run)
         transition["trigger"] = trigger
-        if notify:
+        if notify and not library_validation:
             await notifier.maybe_notify(check, finished_run, transition)
         return storage.get_run(run_id) or finished_run
 
@@ -597,13 +790,69 @@ class CheckRunner:
         error_stack: str | None = None
         failure_kind = "none"
         log_lines: list[str] = []
+        preflight_error = str(check.get("_module_preflight_error") or "").strip()
+        if preflight_error:
+            preflight_diagnostics = check.get("_module_preflight_diagnostics")
+            if not isinstance(preflight_diagnostics, list):
+                preflight_diagnostics = [
+                    {
+                        "level": "error",
+                        "code": "module_preflight",
+                        "message": preflight_error,
+                        "filename": "<pulseguard:check>",
+                        "line": 0,
+                        "column": 1,
+                    }
+                ]
+            request_snapshot = {
+                "type": str(check.get("type") or ""),
+                "url": str(check.get("entry_url") or ""),
+                "method": str(check.get("method") or "GET").upper(),
+                "timeout_ms": int(check.get("timeout_ms") or 0),
+                "diagnostics": {
+                    "modules": (
+                        module_metadata(
+                            check.get("_module_bundle")
+                            if check.get("_module_bundle") is not None
+                            else check.get("module_bundle")
+                        )
+                        if check.get("_module_bundle") is not None or check.get("module_bundle") is not None
+                        else None
+                    ),
+                    "compile": preflight_diagnostics,
+                },
+            }
+            settings_for_failure = settings
+            return {
+                "status": "failed",
+                "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "duration_ms": 0,
+                "error_message": mask_text(preflight_error, settings_for_failure),
+                "error_stack": mask_text(str(check.get("_module_preflight_stack") or ""), settings_for_failure) or None,
+                "logs": mask_text(preflight_error, settings_for_failure),
+                "screenshot_path": None,
+                "trace_path": None,
+                "response_path": None,
+                "request_snapshot": json.dumps(mask_data(request_snapshot, settings_for_failure), ensure_ascii=False),
+                "response_snapshot": None,
+                "affects_health": True,
+                **self._runner_metadata(settings_for_failure, failure_kind="target"),
+            }
         max_attempts = self._max_attempts(check, settings)
 
         for attempt in range(1, max_attempts + 1):
             ctx = None
             retrying = False
             try:
-                ctx = RunContext(check, run_id, settings, self.artifacts, resources=self.resources)
+                ctx = RunContext(
+                    check,
+                    run_id,
+                    settings,
+                    self.artifacts,
+                    resources=self.resources,
+                    module_bundle=check.get("_module_bundle") or check.get("module_bundle"),
+                    attempt=attempt,
+                )
                 ctx.log(f"触发方式：{trigger}")
                 ctx.log(f"任务入口：{check.get('entry_url')}")
                 if max_attempts > 1:
@@ -667,6 +916,7 @@ class CheckRunner:
                         error_message = mask_text(error_message, ctx.settings)
                     if error_stack is not None:
                         error_stack = mask_text(error_stack, ctx.settings)
+                    ctx.set_task_duration(duration_ms)
 
             if retrying:
                 continue
@@ -681,6 +931,15 @@ class CheckRunner:
 
             diagnostics = inspection_diagnostics(ctx, error=RunFailure(error_message) if error_message else None)
             ctx.request_snapshot = {**(ctx.request_snapshot or {}), "diagnostics": diagnostics}
+        elif ctx is not None and check.get("type") == "api":
+            diagnostics = api_inspection_diagnostics(ctx, error=RunFailure(error_message) if error_message else None)
+            request_snapshot = ctx.request_snapshot or {
+                "type": "api",
+                "url": check.get("entry_url") or "",
+                "method": str(check.get("method") or "GET").upper(),
+                "timeout_ms": ctx.timeout_ms,
+            }
+            ctx.request_snapshot = {**request_snapshot, "diagnostics": diagnostics}
         safe_request_snapshot = mask_data(ctx.request_snapshot, ctx.settings) if ctx and ctx.request_snapshot else None
         safe_response_snapshot = mask_data(ctx.response_snapshot, ctx.settings) if ctx and ctx.response_snapshot else None
         runner_metadata = self._runner_metadata(settings, ctx=ctx, failure_kind=failure_kind)
@@ -711,9 +970,37 @@ class CheckRunner:
         )
         uses_structured_api = self._uses_structured_api_check(check)
         uses_structured_ui = self._uses_structured_ui_check(check)
-        if uses_structured_api:
-            return await self._measure_task_duration(run_structured_api_check(ctx))
-        elif uses_structured_ui:
+        if check.get("type") == "api":
+            script = str(check.get("script") or "")
+            check_func = self._load_check_function(script, ctx) if script.strip() else None
+
+            async def run_api_flow() -> None:
+                response = None
+                if check_func is not None:
+                    ctx.api_stage = "script"
+                    await check_func(ctx)
+                    response = ctx.http.last_response
+                    if response is None:
+                        # Resolve the configured target after the script so a
+                        # runtime variable set by the script is honored while
+                        # still surfacing stale or missing task parameters.
+                        try:
+                            _ = ctx.entry_url
+                        except Exception as exc:
+                            raise RunFailure(str(exc)) from exc
+                if uses_structured_api:
+                    ctx.api_stage = "assertions"
+                    if check_func is not None and response is None:
+                        raise RunFailure("脚本未产生 HTTP 响应，无法执行接口校验项")
+                    if response is None:
+                        await run_structured_api_check(ctx)
+                    else:
+                        await run_structured_api_check(ctx, response=response)
+                elif check_func is None:
+                    raise RunFailure("请至少添加一个校验项，或填写高级脚本")
+
+            return await self._measure_task_duration(asyncio.wait_for(run_api_flow(), timeout=timeout_seconds))
+        if uses_structured_ui:
             setup_func = None
             setup_script = str(check.get("setup_script") or "")
             if setup_script.strip():
@@ -723,13 +1010,40 @@ class CheckRunner:
                     function_name="setup",
                     expected_signature="async def setup(ctx, page)",
                     script_label="前置脚本",
+                    attempt=ctx.attempt,
                 )
             return await self._measure_task_duration(asyncio.wait_for(
                 run_structured_ui_check(ctx, setup_func=setup_func), timeout=max_runtime_seconds,
             ))
         else:
-            check_func = self._load_check_function(check.get("script") or "", ctx)
-            return await self._measure_task_duration(asyncio.wait_for(check_func(ctx), timeout=timeout_seconds))
+            setup_func = None
+            setup_script = str(check.get("setup_script") or "")
+            if setup_script.strip():
+                setup_func = self._load_check_function(
+                    setup_script,
+                    ctx,
+                    function_name="setup",
+                    expected_signature="async def setup(ctx, page)",
+                    script_label="前置脚本",
+                    attempt=ctx.attempt,
+                )
+            check_func = self._load_check_function(
+                check.get("script") or "",
+                ctx,
+                attempt=ctx.attempt,
+            )
+
+            async def run_scripted_ui() -> None:
+                if setup_func is None:
+                    await check_func(ctx)
+                    return
+                from .ui_assertions import prepare_ui_target
+
+                await prepare_ui_target(ctx, setup_func=setup_func)
+                ctx.ui_stage = "script"
+                await check_func(ctx)
+
+            return await self._measure_task_duration(asyncio.wait_for(run_scripted_ui(), timeout=timeout_seconds))
 
     @staticmethod
     async def _measure_task_duration(awaitable: Any) -> int:
@@ -762,6 +1076,8 @@ class CheckRunner:
     def _create_skipped_run(self, check: dict[str, Any], message: str, trigger: str) -> dict[str, Any]:
         settings = self._settings_for_check(check, storage.settings_for_project(storage.get_settings(), check.get("project_id")))
         metadata = {**run_metadata(trigger), "affects_health": False}
+        if check.get("_library_validation"):
+            metadata.update({"trigger": trigger, "observation_kind": "library_validation", "affects_health": False})
         runner_payload = self._runner_metadata(settings, failure_kind="runner")
         run = storage.create_run(
             self._with_runner_metadata(check, settings, runner_payload, trigger=trigger, run_metadata_payload=metadata),
@@ -1201,6 +1517,8 @@ class CheckRunner:
         check_payload = self._with_browser_type({**check, "_run_group_id": run_group_id}, target.browser_type)
         runner_payload = storage.runner_metadata(runner, browser_type=target.browser_type)
         metadata = {**run_metadata(trigger), "run_group_id": run_group_id}
+        if check.get("_library_validation"):
+            metadata.update({"trigger": trigger, "observation_kind": "library_validation", "affects_health": False})
         runner_system_metadata = {**metadata, "affects_health": False}
         if target.skip_reason:
             run = storage.create_run(
@@ -1208,6 +1526,8 @@ class CheckRunner:
                 "pending",
             )
             unavailable = self._finish_runner_unavailable(int(run["id"]), check_payload, trigger, runner, target.skip_reason)
+            if check.get("_library_validation"):
+                return unavailable
             return await self._notify_system_result(
                 check_payload,
                 trigger,
@@ -1222,7 +1542,32 @@ class CheckRunner:
                 "pending",
             )
             unavailable = self._finish_runner_unavailable(int(run["id"]), check, trigger, runner, "执行节点不可用")
-            unavailable = await self._notify_system_result(
+            if not check.get("_library_validation"):
+                unavailable = await self._notify_system_result(
+                    check_payload,
+                    trigger,
+                    int(run["id"]),
+                    unavailable,
+                    self._settings_for_system_alert(),
+                    source="runner",
+                )
+            await self._notify_runner_unavailable_if_needed(runner, check)
+            return unavailable
+        if runner_id != storage.LOCAL_RUNNER_ID and self._uses_mixed_api_flow(check) and not self._runner_supports_mixed_api_flow(runner):
+            run = storage.create_run(
+                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
+                "pending",
+            )
+            unavailable = self._finish_runner_unavailable(
+                int(run["id"]),
+                check_payload,
+                trigger,
+                runner,
+                "执行节点不支持脚本后接口校验，请先更新执行节点",
+            )
+            if check.get("_library_validation"):
+                return unavailable
+            return await self._notify_system_result(
                 check_payload,
                 trigger,
                 int(run["id"]),
@@ -1230,8 +1575,28 @@ class CheckRunner:
                 self._settings_for_system_alert(),
                 source="runner",
             )
-            await self._notify_runner_unavailable_if_needed(runner, check)
-            return unavailable
+        if runner_id != storage.LOCAL_RUNNER_ID and self._uses_script_modules(check) and not self._runner_supports_script_modules(runner):
+            run = storage.create_run(
+                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
+                "pending",
+            )
+            unavailable = self._finish_runner_unavailable(
+                int(run["id"]),
+                check_payload,
+                trigger,
+                runner,
+                "执行节点不支持公共方法模块，请先更新执行节点",
+            )
+            if check.get("_library_validation"):
+                return unavailable
+            return await self._notify_system_result(
+                check_payload,
+                trigger,
+                int(run["id"]),
+                unavailable,
+                self._settings_for_system_alert(),
+                source="runner",
+            )
         if runner_id == storage.LOCAL_RUNNER_ID:
             return await self._submit(
                 check_payload,
@@ -1251,34 +1616,44 @@ class CheckRunner:
         try:
             result = await self._call_remote_runner(runner, check_payload, trigger, run_id)
         except Exception as exc:
-            storage.mark_probe_runner_unavailable(runner_id)
+            if not check.get("_library_validation"):
+                storage.mark_probe_runner_unavailable(runner_id)
             unavailable = self._finish_runner_unavailable(run_id, check, trigger, runner, f"执行节点调用失败：{exc}")
-            unavailable = await self._notify_system_result(
-                check_payload,
-                trigger,
-                run_id,
-                unavailable,
-                self._settings_for_system_alert(),
-                source="runner",
-            )
+            if not check.get("_library_validation"):
+                unavailable = await self._notify_system_result(
+                    check_payload,
+                    trigger,
+                    run_id,
+                    unavailable,
+                    self._settings_for_system_alert(),
+                    source="runner",
+                )
             latest_runner = storage.get_probe_runner(runner_id) or runner
             await self._notify_runner_unavailable_if_needed(latest_runner, check)
             return unavailable
         data = self._remote_result_to_finish_payload(result, run_id, runner)
         if self._is_runner_system_result(data):
-            latest_runner = storage.mark_probe_runner_unavailable(runner_id, status="unhealthy") or storage.get_probe_runner(runner_id) or runner
+            if check.get("_library_validation"):
+                latest_runner = runner
+            else:
+                latest_runner = storage.mark_probe_runner_unavailable(runner_id, status="unhealthy") or storage.get_probe_runner(runner_id) or runner
             system_result = self._finish_runner_result(check_payload, trigger, run_id, data)
-            system_result = await self._notify_system_result(
-                check_payload,
-                trigger,
-                run_id,
-                system_result,
-                self._settings_for_system_alert(),
-                source="runner",
-            )
+            if not check.get("_library_validation"):
+                system_result = await self._notify_system_result(
+                    check_payload,
+                    trigger,
+                    run_id,
+                    system_result,
+                    self._settings_for_system_alert(),
+                    source="runner",
+                )
             await self._notify_runner_unavailable_if_needed(latest_runner, check)
             return system_result
+        if check.get("_library_validation"):
+            data = {**data, "affects_health": False}
         finished = storage.finish_run(run_id, data)
+        if check.get("_library_validation"):
+            storage.update_run_notification(run_id, "not_required", channel=None, error=None, sent_at=None)
         return storage.get_run(run_id) or finished or run
 
     async def _call_remote_runner(self, runner: dict[str, Any], check: dict[str, Any], trigger: str, run_id: int) -> dict[str, Any]:
@@ -1407,8 +1782,23 @@ class CheckRunner:
 
     async def _finish_distributed_group(self, check: dict[str, Any], runs: list[dict[str, Any]], trigger: str) -> dict[str, Any]:
         if not runs:
-            return self._create_skipped_run(check, "没有可执行节点，本次已跳过", trigger)
+            skipped = self._create_skipped_run(check, "没有可执行节点，本次已跳过", trigger)
+            if check.get("_library_validation"):
+                return {**skipped, "runs": [skipped]}
+            return skipped
         status_run = self._aggregate_group_run(runs)
+        if check.get("_library_validation"):
+            # Keep the complete node matrix for candidate review.  The single
+            # status result remains useful to callers, while every child run is
+            # returned under runs and has already been marked non-observational.
+            return {
+                **status_run,
+                "check_id": int(check.get("id") or 0),
+                "original_check_id": int(check.get("original_check_id") or check.get("id") or 0),
+                "runs": runs,
+                "affects_health": False,
+                "observation_kind": "library_validation",
+            }
         if status_run.get("affects_health") and status_run.get("failure_kind") != "runner":
             transition = storage.update_check_status(int(check["id"]), status_run)
             transition["trigger"] = trigger
@@ -1420,16 +1810,91 @@ class CheckRunner:
         target_failures = [run for run in runs if run.get("failure_kind") == "target" and run.get("status") in {"failed", "timeout"}]
         if target_failures:
             return target_failures[0]
+        non_successes = [run for run in runs if run.get("status") != "ok"]
+        if non_successes:
+            return non_successes[0]
         successes = [run for run in runs if run.get("status") == "ok"]
         if successes:
             return successes[0]
         return runs[0]
 
     async def _notify_runner_unavailable_if_needed(self, runner: dict[str, Any], check: dict[str, Any]) -> None:
+        if check.get("_library_validation"):
+            return
         latest = storage.get_probe_runner(str(runner.get("runner_id") or "")) or runner
         if not storage.should_notify_probe_runner_unavailable(latest):
             return
         await notifier.notify_runner_unavailable(latest, [check])
+
+    @staticmethod
+    def _script_module_references(check: dict[str, Any]) -> set[str]:
+        references: set[str] = set()
+        sources = (("check", check.get("script")), ("setup", check.get("setup_script")))
+        for entry, raw in sources:
+            source = str(raw or "")
+            if not source.strip():
+                continue
+            analysis = analyze_script(source, entry_points=(entry,))
+            references.update(str(item) for item in analysis.get("references") or [])
+        return references
+
+    @classmethod
+    def _validate_module_references(cls, check: dict[str, Any], bundle: dict[str, Any]) -> None:
+        static_errors: list[dict[str, Any]] = []
+        for entry, raw in (("check", check.get("script")), ("setup", check.get("setup_script"))):
+            source = str(raw or "")
+            if not source.strip():
+                continue
+            analysis = analyze_script(source, entry_points=(entry,), module_bundle=bundle)
+            static_errors.extend(item for item in analysis.get("diagnostics") or [] if item.get("level") == "error")
+        if static_errors:
+            first = static_errors[0]
+            raise ValueError(str(first.get("message") or "公共方法引用校验失败"))
+
+    @classmethod
+    def _attach_frozen_module_bundle(
+        cls,
+        check: dict[str, Any],
+        *,
+        require_published: bool,
+    ) -> dict[str, Any]:
+        result = dict(check)
+        project_id = int(result.get("project_id") or 0) or None
+        explicit = result.get("_module_bundle")
+        if explicit is not None:
+            try:
+                bundle = normalize_module_bundle(explicit, expected_project_id=project_id)
+            except ModuleBundleError as exc:
+                raise ValueError(str(exc)) from exc
+            result["_module_bundle"] = bundle
+            try:
+                cls._validate_module_references(result, bundle)
+            except ValueError as exc:
+                raise ModulePreflightError(str(exc), bundle=bundle) from exc
+            return result
+
+        references = cls._script_module_references(result)
+        if not references:
+            return result
+        bundle: Any = None
+        if project_id is not None:
+            bundle = storage.get_published_library(project_id)
+        if bundle is None:
+            if require_published:
+                raise ValueError("任务引用公共方法，但当前项目没有已发布的方法版本")
+            # Drafts with references must be supplied a captured candidate bundle
+            # by the validation endpoint; ordinary debug payloads cannot inject one.
+            return result
+        try:
+            normalized = normalize_module_bundle(bundle, expected_project_id=project_id)
+        except ModuleBundleError as exc:
+            raise ValueError(str(exc)) from exc
+        result["_module_bundle"] = normalized
+        try:
+            cls._validate_module_references(result, normalized)
+        except ValueError as exc:
+            raise ModulePreflightError(str(exc), bundle=normalized) from exc
+        return result
 
     @staticmethod
     def _worker_check_payload(check: dict[str, Any]) -> dict[str, Any]:
@@ -1452,8 +1917,40 @@ class CheckRunner:
             "alert_policy_json",
             "browser_selection_mode",
             "browser_types",
+            "project_id",
+            "original_check_id",
+            "_library_validation",
         }
-        return {key: check.get(key) for key in allowed}
+        payload = {key: check.get(key) for key in allowed if key in check}
+        if check.get("_module_bundle") is not None:
+            # This is the frozen transport snapshot captured by the coordinator;
+            # a child never resolves module source from its own project database.
+            payload["module_bundle"] = check.get("_module_bundle")
+        return payload
+
+    @staticmethod
+    def _uses_mixed_api_flow(check: dict[str, Any]) -> bool:
+        return (
+            str(check.get("type") or "") == "api"
+            and bool(str(check.get("script") or "").strip())
+            and has_enabled_api_assertions(check.get("assertions_json"))
+        )
+
+    @staticmethod
+    def _runner_supports_mixed_api_flow(runner: dict[str, Any]) -> bool:
+        metadata = runner.get("metadata") if isinstance(runner.get("metadata"), dict) else {}
+        capabilities = metadata.get("capabilities") if isinstance(metadata, dict) else None
+        return isinstance(capabilities, list) and API_SCRIPT_ASSERTIONS_CAPABILITY in capabilities
+
+    @classmethod
+    def _uses_script_modules(cls, check: dict[str, Any]) -> bool:
+        return bool(check.get("_module_bundle") or check.get("module_bundle")) and bool(cls._script_module_references(check))
+
+    @staticmethod
+    def _runner_supports_script_modules(runner: dict[str, Any]) -> bool:
+        metadata = runner.get("metadata") if isinstance(runner.get("metadata"), dict) else {}
+        capabilities = metadata.get("capabilities") if isinstance(metadata, dict) else None
+        return isinstance(capabilities, list) and SCRIPT_MODULES_CAPABILITY in capabilities
 
     def _worker_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
         allowed = {
@@ -1550,50 +2047,18 @@ class CheckRunner:
         function_name: str = "check",
         expected_signature: str = "async def check(ctx)",
         script_label: str = "脚本",
+        *,
+        attempt: int | None = None,
     ) -> Any:
-        builtins = {
-            "AssertionError": AssertionError,
-            "Exception": Exception,
-            "RuntimeError": RuntimeError,
-            "ValueError": ValueError,
-            "TypeError": TypeError,
-            "bool": bool,
-            "dict": dict,
-            "float": float,
-            "int": int,
-            "isinstance": isinstance,
-            "len": len,
-            "list": list,
-            "max": max,
-            "min": min,
-            "range": range,
-            "set": set,
-            "str": str,
-            "sum": sum,
-            "tuple": tuple,
-            "print": lambda *args, **_: ctx.log(" ".join(str(arg) for arg in args)),
-        }
-        safe_globals = {
-            "__builtins__": MappingProxyType(builtins),
-            "asyncio": asyncio,
-            "json": json,
-            "re": re,
-        }
-        namespace: dict[str, Any] = {}
-        exec(compile(script, "<pulseguard-check>", "exec"), safe_globals, namespace)
-        check_func = namespace.get(function_name)
-        if check_func is None or not inspect.iscoroutinefunction(check_func):
-            raise RunFailure(f"{script_label}必须定义 {expected_signature}")
-        self._validate_function_signature(check_func, ctx, function_name, expected_signature, script_label)
-        return check_func
-
-    @staticmethod
-    def _validate_function_signature(func: Any, ctx: RunContext, function_name: str, expected_signature: str, script_label: str) -> None:
-        args = (ctx, None) if function_name == "setup" else (ctx,)
-        try:
-            inspect.signature(func).bind(*args)
-        except TypeError as exc:
-            raise RunFailure(f"{script_label}必须定义 {expected_signature}") from exc
+        return compile_check_function(
+            script,
+            ctx,
+            function_name,
+            expected_signature,
+            script_label,
+            module_bundle=getattr(ctx, "module_bundle", None),
+            attempt=attempt,
+        )
 
     @staticmethod
     def _max_concurrency(settings: dict[str, Any] | None = None) -> int:

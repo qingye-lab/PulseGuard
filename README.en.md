@@ -36,8 +36,19 @@ PulseGuard is not a public status-page service, a full E2E test-management platf
 
 - Scheduled, manual, batch, and rerun execution;
 - Structured UI steps, setup scripts, and multiple browser types;
-- API request configuration, field preview, assertions, and advanced scripts;
+- API request configuration, field preview, assertions, and advanced scripts; scripts can fetch tokens, signatures, or dynamic parameters before the target request, then visible health rules inspect the last response without repeating the request;
 - Draft runs that do not affect formal health or alert statistics.
+
+### Project script library
+
+Maintain shared Python functions under Project Management → Shared Methods. API checks, UI checks, and setup scripts in the same project reuse request preparation, signing, and parsing through `ctx.modules.use("module_name")`.
+
+- Create, edit, and save methods with module and function completion in the editor;
+- Check Python compilation, exports, and existing task references before saving, including protection against deleting methods still in use;
+- New runs use the latest saved source; in-flight runs and retries retain their captured source snapshot;
+- Project exports include the effective library, with source-conflict and reference checks on import.
+
+See the [project script library guide (Chinese)](./docs/project-script-library.md) and [API health rules guide (Chinese)](./docs/api-health-checks.md) for examples.
 
 ### Trustworthy health state
 
@@ -52,6 +63,7 @@ It also models unknown, stale observation, and disabled states. Browser crashes,
 ### Evidence and trends
 
 - Error summaries, screenshots, and response bodies;
+- Recent HTTP exchanges, rule results, and compilation diagnostics in API previews and run details, with separate target-request and full-task timings;
 - Optional Playwright Trace capture, disabled by default;
 - 24-hour, 7-day, 30-day, and custom-range trends;
 - Average successful latency, P95, P99, and failure counts;
@@ -78,6 +90,12 @@ Multi-runner and multi-browser runs share a run group and retain runner state, b
 - Cooldown and recovery notifications;
 - Project-scoped JSON, Prometheus, and token-protected read-only snapshots;
 - Separate system and project bundles with sanitized export and import preview.
+
+### Skill / MCP integration
+
+An independently installed local stdio MCP adapter lets AI clients query project checks and runs, diagnose failures, compare a failed run with a successful baseline, and read retained screenshots. The console's Skill / MCP page generates connection settings for the selected project and offers the operations Skill for download.
+
+Connections are read-only by default. Once execution is explicitly enabled, an AI client can run existing checks within the user's authorization. Real executions may update health and send alerts. See the [Skill + MCP guide (Chinese)](./docs/mcp.md) for setup and tools.
 
 ## Quick start
 
@@ -149,6 +167,9 @@ Relay uses self-signed TLS, server-fingerprint pinning, one-time deployment cred
 | Document | Contents |
 | --- | --- |
 | [Operations reference](./docs/operations-reference.en.md) | Local development, browser pools, runners, Relay, tokens, API, and troubleshooting |
+| [Project script library (Chinese)](./docs/project-script-library.md) | Python reuse, save validation, execution snapshots, and project transfer |
+| [API health rules (Chinese)](./docs/api-health-checks.md) | Dynamic requests, last-response assertions, and execution diagnostics |
+| [Skill + MCP integration (Chinese)](./docs/mcp.md) | AI project queries, failure diagnosis, screenshots and authorized probes |
 | [中文运维参考](./docs/operations-reference.md) | Full Chinese operations reference |
 | [China deployment](./docs/china-deployment.md) | Mirrors and dependency setup for mainland networks |
 | [Volcano deployment](./docs/volcano-deployment.md) | Main-node, local-worker, and migration workflow |
@@ -180,6 +201,8 @@ uv lock --check
 ```text
 backend/                    FastAPI backend, storage, runners, alerts, tests
 frontend/                   React application, components, and styles
+integrations/mcp/           independently installable stdio MCP adapter and contract tests
+.agents/skills/             distributable PulseGuard operations Skill
 data/                       SQLite data
 reports/                    screenshots, Trace, response bodies, summaries
 docs/                       deployment, design, and operations docs

@@ -12,8 +12,10 @@ const RunDetailPage = lazy(() => import("./pages/RunDetailPage").then((module) =
 const SettingsPage = lazy(() => import("./pages/SettingsPage").then((module) => ({ default: module.SettingsPage })));
 const MembersPage = lazy(() => import("./pages/MembersPage").then((module) => ({ default: module.MembersPage })));
 const ProjectsPage = lazy(() => import("./pages/ProjectsPage").then((module) => ({ default: module.ProjectsPage })));
+const ModulesPage = lazy(() => import("./pages/ModulesPage").then((module) => ({ default: module.ModulesPage })));
 const DebugPage = lazy(() => import("./pages/DebugPage").then((module) => ({ default: module.DebugPage })));
 const OperationsPage = lazy(() => import("./pages/OperationsPage").then((module) => ({ default: module.OperationsPage })));
+const IntegrationsPage = lazy(() => import("./pages/IntegrationsPage").then((module) => ({ default: module.IntegrationsPage })));
 
 function page(element: ReactNode) {
   return <Suspense fallback={<RouteLoading />}>{element}</Suspense>;
@@ -39,11 +41,13 @@ export default function App() {
         <Route path="/runs" element={page(<RunsPage />)} />
         <Route path="/runs/:runId" element={page(<RunDetailPage />)} />
         <Route path="/operations" element={page(<OperationsPage />)} />
+        <Route path="/integrations" element={page(<IntegrationsPage />)} />
         <Route path="/settings" element={<Navigate to="/settings/execution" replace />} />
         <Route path="/settings/alerts" element={<Navigate to="/projects/alerts" replace />} />
         <Route path="/settings/:tab" element={page(<SettingsPage />)} />
         <Route path="/members" element={page(<MembersPage />)} />
         <Route path="/projects" element={page(<ProjectsPage />)} />
+        <Route path="/projects/modules" element={page(<ModulesPage />)} />
         <Route path="/projects/alerts" element={page(<SettingsPage tabOverride="alerts" />)} />
         <Route path="/debug/:type/:checkId" element={page(<DebugPage />)} />
         <Route path="*" element={<Navigate to="/" replace />} />

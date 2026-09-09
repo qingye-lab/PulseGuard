@@ -1,5 +1,6 @@
 import type {
   AlertPreview,
+  ApiInspectionDiagnostics,
   ApiInspectPayload,
   ApiInspectResult,
   AuditEvent,
@@ -18,6 +19,7 @@ import type {
   DatabaseHealth,
   EnvironmentVariable,
   MonitoringTrends,
+  ModuleLibrary,
   NotificationStatus,
   Overview,
   ProbeRunner,
@@ -98,7 +100,11 @@ async function downloadFile(path: string, init?: RequestInit): Promise<ConfigExp
 }
 
 export class ApiError extends Error {
-  constructor(message: string, public readonly diagnostics?: UiInspectionDiagnostics) {
+  constructor(
+    message: string,
+    public readonly diagnostics?: UiInspectionDiagnostics | ApiInspectionDiagnostics,
+    public readonly status?: number
+  ) {
     super(message);
     this.name = "ApiError";
   }
@@ -106,7 +112,7 @@ export class ApiError extends Error {
 
 async function responseError(response: Response): Promise<Error> {
   let message = `请求失败：${response.status}`;
-  let diagnostics: UiInspectionDiagnostics | undefined;
+  let diagnostics: UiInspectionDiagnostics | ApiInspectionDiagnostics | undefined;
   try {
     const data = await response.json();
     message = formatErrorDetail(data.detail, message);
@@ -116,7 +122,7 @@ async function responseError(response: Response): Promise<Error> {
   } catch {
     // keep default message
   }
-  return new ApiError(message, diagnostics);
+  return new ApiError(message, diagnostics, response.status);
 }
 
 function downloadFilename(contentDisposition: string | null): string {
@@ -234,6 +240,14 @@ export const api = {
   archiveProject: (id: number) => request<Project>(`/api/projects/${id}/archive`, { method: "POST" }),
   restoreProject: (id: number) => request<Project>(`/api/projects/${id}/restore`, { method: "POST" }),
   deleteProject: (id: number) => request<{ ok: boolean }>(`/api/projects/${id}`, { method: "DELETE" }),
+  library: (projectId: number) => request<ModuleLibrary>(`/api/projects/${projectId}/library`),
+  saveLibrary: (
+    projectId: number,
+    payload: { expected_revision: number; modules: Array<{ name: string; source: string; description?: string | null }> }
+  ) => request<ModuleLibrary>(`/api/projects/${projectId}/library`, {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  }),
   overview: () => request<Overview>("/api/overview"),
   runtime: () => request<RuntimeStatus>("/api/runtime"),
   statusPage: () => request<StatusPageSnapshot>("/api/status-page"),

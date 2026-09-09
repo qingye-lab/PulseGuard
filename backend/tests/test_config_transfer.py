@@ -100,7 +100,7 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.assertNotIn("sign-secret", exported_text)
         self.assertNotIn("runner-secret", exported_text)
 
-    def test_project_export_v1_contains_only_selected_project_data(self) -> None:
+    def test_project_export_v2_contains_only_selected_project_data(self) -> None:
         other = storage.create_project("Other")
         storage.create_check(api_check_payload("Shared name"), project_id=self.project_id)
         storage.create_check(api_check_payload("Other only"), project_id=int(other["id"]))
@@ -126,7 +126,7 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         exported = response.json()
         self.assertEqual(exported["schema"], "pulseguard.project")
-        self.assertEqual(exported["version"], 1)
+        self.assertEqual(exported["version"], 2)
         self.assertIn("Shared name", [check["name"] for check in exported["checks"]])
         self.assertNotIn("settings", exported)
         self.assertNotIn("runners", exported)

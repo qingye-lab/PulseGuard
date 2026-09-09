@@ -1,0 +1,44 @@
+name: MCP integration
+
+on:
+  pull_request:
+    paths:
+      - "integrations/mcp/**"
+      - ".agents/skills/pulseguard-operations/**"
+      - "backend/app/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/mcp.yml"
+  push:
+    branches: [main, "codex/**"]
+    paths:
+      - "integrations/mcp/**"
+      - ".agents/skills/pulseguard-operations/**"
+      - "backend/app/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/mcp.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.30"
+      - name: Install locked backend and adapter environments
+        run: |
+          uv sync --frozen --no-dev --no-install-project
+          uv sync --locked --project integrations/mcp
+      - name: Verify protocol and real API contract
+        run: uv run --locked --project integrations/mcp python -m unittest discover -s integrations/mcp/tests -p 'test_*.py' -v
+      - name: Build adapter distribution
+        run: uv build --project integrations/mcp

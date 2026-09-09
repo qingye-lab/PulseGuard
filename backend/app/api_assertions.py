@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import time
 from typing import Any
 
 import httpx
 
-from .context import RunContext, RunFailure
+from .artifacts import ArtifactStore
+from .context import RunContext, RunFailure, compile_check_function
 from .resource_pool import ProbeResourcePool
-from .variables import mask_data, mask_text, resolve_data, resolve_text
+from .variables import VARIABLE_PLACEHOLDER_PATTERN, mask_data, mask_text, resolve_data, variable_lookup
 
 
 ASSERTION_TYPES = {
@@ -31,6 +34,58 @@ JSON_ASSERTION_TYPES = {
 }
 JSON_VALUE_TYPES = {"string", "number", "boolean", "object", "array", "null"}
 LENGTH_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte"}
+
+
+class ApiInspectionFailure(RunFailure):
+    """Expected API preview failure with attempt-owned diagnostics."""
+
+    def __init__(self, message: str, diagnostics: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def api_inspection_diagnostics(ctx: Any, *, error: Exception | None = None) -> dict[str, Any]:
+    """Return bounded, masked API execution evidence for preview and run details."""
+    settings = getattr(ctx, "settings", {}) or {}
+    check = getattr(ctx, "check", {}) or {}
+    available = variable_lookup(settings)
+    template = str(check.get("entry_url") or "")
+    timings: dict[str, Any] = {}
+    request_ms = getattr(ctx, "last_request_duration_ms", None)
+    task_ms = getattr(ctx, "task_duration_ms", None)
+    if request_ms is not None:
+        timings["request_ms"] = int(request_ms)
+    if task_ms is not None:
+        timings["task_ms"] = int(task_ms)
+    result = {
+        "stage": getattr(ctx, "api_stage", "prepare"),
+        "status": "failed" if error else "ok",
+        "error_type": type(error).__name__ if error else None,
+        "message": str(error) if error else None,
+        "url_variables": {
+            name: "available" if name in available else "missing"
+            for name in sorted(set(VARIABLE_PLACEHOLDER_PATTERN.findall(template)))
+        },
+        "variables": ctx.vars.snapshot() if getattr(ctx, "vars", None) is not None else {},
+        "request": getattr(ctx, "request_snapshot", None),
+        "response": getattr(ctx, "response_snapshot", None),
+        "http_requests": _history_snapshot(ctx),
+        "timings": timings,
+        "modules": getattr(ctx, "library_metadata", None),
+        "compile": list(getattr(ctx, "compile_diagnostics", []) or []),
+        "logs": "\n".join(getattr(ctx, "logs", [])[-50:]),
+    }
+    return _bounded(mask_data(result, settings))
+
+
+def _history_snapshot(ctx: Any) -> list[dict[str, Any]]:
+    history = getattr(ctx, "http_exchanges", [])
+    if not isinstance(history, list):
+        return []
+    try:
+        return copy.deepcopy(history[-10:])
+    except Exception:
+        return []
 
 
 def normalize_api_assertions(raw: str | None) -> list[dict[str, Any]]:
@@ -77,7 +132,11 @@ def has_enabled_api_assertions(raw: str | None) -> bool:
     return any(assertion.get("enabled", True) for assertion in normalize_api_assertions(raw))
 
 
-async def run_structured_api_check(ctx: RunContext) -> None:
+async def run_structured_api_check(
+    ctx: RunContext,
+    response: httpx.Response | None = None,
+    request_ms: int | None = None,
+) -> None:
     assertions = [
         resolve_data(item, ctx.settings)
         for item in normalize_api_assertions(ctx.check.get("assertions_json"))
@@ -86,9 +145,15 @@ async def run_structured_api_check(ctx: RunContext) -> None:
     if not assertions:
         raise RunFailure("请至少添加一个启用的接口校验项")
 
-    started = time.perf_counter()
-    response = await ctx.request()
-    elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
+    if response is None:
+        started = time.perf_counter()
+        response = await ctx.request()
+        elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
+    else:
+        elapsed_ms = request_ms
+        if elapsed_ms is None:
+            elapsed_ms = getattr(ctx, "last_request_duration_ms", None)
+        elapsed_ms = max(0, int(elapsed_ms or 0))
     ctx.log(f"HTTP {response.status_code} · {elapsed_ms} ms")
     if ctx.response_snapshot is None or ctx.settings.get("success_response_artifacts_enabled"):
         ctx.save_response(response)
@@ -128,29 +193,85 @@ async def inspect_api_response(
     config: dict[str, Any],
     settings: dict[str, Any] | None = None,
     resources: ProbeResourcePool | None = None,
+    script_loader: Any | None = None,
 ) -> dict[str, Any]:
     settings = settings or {}
-    method = str(config.get("method") or "GET").upper()
-    url = resolve_text(config.get("entry_url") or "", settings).strip()
-    if not url:
+    entry_url = str(config.get("entry_url") or "").strip()
+    if not entry_url:
         raise ValueError("目标 URL 不能为空")
 
     timeout_ms = int(config.get("timeout_ms") or 10000)
-    headers = _parse_headers(resolve_text(config.get("headers_json") or "{}", settings))
-    request_kwargs = _configured_body_kwargs(resolve_text(config.get("body") or "", settings))
-    if headers:
-        request_kwargs["headers"] = headers
-    request_kwargs.setdefault("timeout", timeout_ms / 1000)
-
+    check = {
+        "id": 0,
+        "project_id": config.get("project_id"),
+        "name": "接口预览",
+        "type": "api",
+        "entry_url": entry_url,
+        "method": str(config.get("method") or "GET").upper(),
+        "headers_json": config.get("headers_json") or "{}",
+        "body": config.get("body") or "",
+        "timeout_ms": timeout_ms,
+        "assertions_json": "[]",
+        "script": config.get("script") or "",
+        "_module_bundle": config.get("_module_bundle") or config.get("module_bundle"),
+    }
+    ctx = RunContext(check, 0, settings, ArtifactStore(), resources=resources)
+    runtime_settings = ctx.settings
+    script = str(config.get("script") or "")
+    max_runtime_seconds = max(0.001, float(settings.get("max_task_runtime_seconds", 60) or 60))
+    timeout_seconds = min(timeout_ms / 1000, max_runtime_seconds)
     started = time.perf_counter()
-    if resources is not None:
-        async with resources.http_client() as client:
-            response = await client.request(method, url, **request_kwargs)
-    else:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.request(method, url, **request_kwargs)
-    elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
-    body_text = response.text
+    response: httpx.Response | None = None
+    failure: Exception | None = None
+    try:
+        async def execute() -> httpx.Response:
+            nonlocal response
+            if script.strip():
+                ctx.api_stage = "script"
+                loader = script_loader or compile_check_function
+                check_func = loader(script, ctx)
+                await check_func(ctx)
+                response = ctx.http.last_response
+                if response is None:
+                    try:
+                        _ = ctx.entry_url
+                    except Exception as exc:
+                        raise RunFailure(str(exc)) from exc
+                    raise RunFailure("脚本未产生 HTTP 响应，无法预览接口结果")
+                return response
+            ctx.api_stage = "request"
+            response = await ctx.request()
+            return response
+
+        response = await asyncio.wait_for(execute(), timeout=timeout_seconds)
+    except asyncio.CancelledError:
+        try:
+            await ctx.close(False)
+        except Exception as cleanup_error:
+            ctx.log(f"运行清理失败：{cleanup_error}")
+        raise
+    except asyncio.TimeoutError:
+        failure = asyncio.TimeoutError(f"执行超过超时限制：{timeout_ms}ms")
+    except Exception as exc:
+        failure = exc
+    task_ms = max(0, int((time.perf_counter() - started) * 1000))
+    ctx.set_task_duration(task_ms)
+    if failure is not None:
+        diagnostics = api_inspection_diagnostics(ctx, error=failure)
+        try:
+            await ctx.close(False)
+        except Exception as cleanup_error:
+            ctx.log(f"运行清理失败：{cleanup_error}")
+        safe_message = mask_text(str(failure) or type(failure).__name__, runtime_settings)
+        raise ApiInspectionFailure(safe_message, diagnostics) from None
+    assert response is not None
+    request_ms = int(ctx.last_request_duration_ms or 0)
+    body_text = mask_text(response.text, runtime_settings)
+    try:
+        body_text = json.dumps(mask_data(response.json(), runtime_settings), ensure_ascii=False)
+    except ValueError:
+        pass
+    body_text = mask_text(body_text, runtime_settings)
     body_preview = body_text if len(body_text) <= 50000 else body_text[:50000] + "\n... 响应体已截断"
 
     json_value: Any = None
@@ -161,14 +282,21 @@ async def inspect_api_response(
     except ValueError:
         json_valid = False
 
-    return {
+    result = {
         "status_code": response.status_code,
-        "duration_ms": elapsed_ms,
-        "headers": mask_data(dict(response.headers), settings),
-        "body": mask_text(body_preview, settings),
+        "duration_ms": request_ms,
+        "headers": mask_data(dict(response.headers), runtime_settings),
+        "body": mask_text(body_preview, runtime_settings),
         "json_valid": json_valid,
-        "json_paths": mask_data(extract_json_paths(json_value), settings) if json_valid else [],
+        "json_paths": mask_data(extract_json_paths(json_value), runtime_settings) if json_valid else [],
+        "timings": {"request_ms": request_ms, "task_ms": task_ms},
+        "diagnostics": api_inspection_diagnostics(ctx),
     }
+    try:
+        await ctx.close(False)
+    except Exception as cleanup_error:
+        ctx.log(f"运行清理失败：{cleanup_error}")
+    return result
 
 
 def extract_json_paths(value: Any, max_paths: int = 240) -> list[dict[str, Any]]:
@@ -380,26 +508,6 @@ def _enum(value: Any, allowed: set[str], label: str) -> str:
     return text
 
 
-def _parse_headers(raw: str) -> dict[str, str]:
-    try:
-        parsed = json.loads(raw or "{}")
-    except json.JSONDecodeError as exc:
-        raise ValueError("Headers 必须是合法 JSON") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("Headers 必须是 JSON Object")
-    return {str(key): str(value) for key, value in parsed.items()}
-
-
-def _configured_body_kwargs(raw: str) -> dict[str, Any]:
-    body = raw.strip()
-    if not body:
-        return {}
-    try:
-        return {"json": json.loads(body)}
-    except json.JSONDecodeError:
-        return {"content": raw}
-
-
 def _expected_value(raw: str) -> Any:
     text = str(raw)
     try:
@@ -518,3 +626,20 @@ def _preview(value: Any) -> str:
     else:
         text = json.dumps(value, ensure_ascii=False)
     return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _bounded(value: Any, depth: int = 0) -> Any:
+    if depth > 12:
+        return "… 已截断"
+    if isinstance(value, str):
+        return value[:8000] + ("\n… 已截断" if len(value) > 8000 else "")
+    if isinstance(value, dict):
+        result = {str(key): _bounded(item, depth + 1) for key, item in list(value.items())[:200]}
+        if len(value) > 200:
+            result["…"] = "已截断"
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_bounded(item, depth + 1) for item in value[:50]] + (["… 已截断"] if len(value) > 50 else [])
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return str(value)[:8000]

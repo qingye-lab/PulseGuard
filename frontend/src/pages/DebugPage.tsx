@@ -1,6 +1,6 @@
 import { Alert, Button, Card, Collapse, Empty, Form, Input, InputNumber, Segmented, Select, Skeleton, Space, Switch, Tag, Tooltip } from "antd";
 import { ArrowLeft, Play, Save } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { useProject } from "../ProjectContext";
@@ -19,11 +19,13 @@ import { RunResultPanel } from "../components/RunResultPanel";
 import { UiAssertionsBuilder } from "../components/UiAssertionsBuilder";
 import { UiScriptSections } from "../components/UiScriptSections";
 import { ViewportModeControl } from "../components/ViewportModeControl";
-import type { Check, CheckPayload, Run } from "../types";
+import { moduleCompletionItems } from "../moduleLibrary";
+import type { Check, CheckPayload, ModuleLibrary, Run } from "../types";
 import { dirtyTagColor } from "../utils";
 
 export function DebugPage() {
   const { currentProject } = useProject();
+  const projectId = currentProject.id;
   const readOnly = currentProject.status === "archived";
   const { type, checkId } = useParams();
   const navigate = useNavigate();
@@ -36,13 +38,27 @@ export function DebugPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<"saved-run" | "draft-run" | "save" | null>(null);
   const [bodyMode, setBodyMode] = useState<BodyEditorMode>("json");
+  const [moduleLibrary, setModuleLibrary] = useState<ModuleLibrary | null>(null);
+  const requestGenerationRef = useRef(0);
+  const activeProjectIdRef = useRef(projectId);
 
   const isDirty = useMemo(() => Boolean(form && baseline && !sameCheckPayload(form, baseline)), [baseline, form]);
+  const moduleCompletions = useMemo(() => moduleCompletionItems(moduleLibrary), [moduleLibrary]);
 
   useEffect(() => {
+    activeProjectIdRef.current = projectId;
+    const generation = ++requestGenerationRef.current;
+    let cancelled = false;
+    setBusy(null);
+    setCheck(null);
+    setForm(null);
+    setBaseline(null);
+    setRun(null);
+    setError(null);
     api
       .check(id)
       .then((data) => {
+        if (cancelled || requestGenerationRef.current !== generation || activeProjectIdRef.current !== projectId) return;
         const payload = checkToPayload(data);
         setCheck(data);
         setForm(payload);
@@ -50,14 +66,36 @@ export function DebugPage() {
         setBodyMode(detectBodyMode(payload.body));
         setError(null);
       })
-      .catch((err: Error) => setError(err.message));
-  }, [id]);
+      .catch((err: Error) => {
+        if (!cancelled && requestGenerationRef.current === generation && activeProjectIdRef.current === projectId) setError(err.message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, projectId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setModuleLibrary(null);
+    api.library(projectId)
+      .then((value) => {
+        if (!cancelled) setModuleLibrary(value);
+      })
+      .catch(() => {
+        if (!cancelled) setModuleLibrary(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, id]);
 
   async function save(): Promise<Check | null> {
     if (!form) return null;
+    const generation = requestGenerationRef.current;
     try {
       const payload = prepareCheckPayload(form, { bodyMode });
       const saved = await api.updateCheck(id, payload);
+      if (requestGenerationRef.current !== generation || activeProjectIdRef.current !== projectId) return null;
       const savedPayload = checkToPayload(saved);
       setCheck(saved);
       setForm(savedPayload);
@@ -65,43 +103,50 @@ export function DebugPage() {
       setError(null);
       return saved;
     } catch (err) {
-      setError((err as Error).message);
+      if (requestGenerationRef.current === generation && activeProjectIdRef.current === projectId) setError((err as Error).message);
       return null;
     }
   }
 
   async function saveOnly() {
+    const generation = requestGenerationRef.current;
     setBusy("save");
     try {
       await save();
     } finally {
-      setBusy(null);
+      if (requestGenerationRef.current === generation && activeProjectIdRef.current === projectId) setBusy(null);
     }
   }
 
   async function runSaved() {
+    const generation = requestGenerationRef.current;
     setBusy("saved-run");
     try {
-      setRun(await api.runCheck(id));
+      const result = await api.runCheck(id);
+      if (requestGenerationRef.current !== generation || activeProjectIdRef.current !== projectId) return;
+      setRun(result);
       setError(null);
     } catch (err) {
-      setError((err as Error).message);
+      if (requestGenerationRef.current === generation && activeProjectIdRef.current === projectId) setError((err as Error).message);
     } finally {
-      setBusy(null);
+      if (requestGenerationRef.current === generation && activeProjectIdRef.current === projectId) setBusy(null);
     }
   }
 
   async function runDraft() {
     if (!form) return;
+    const generation = requestGenerationRef.current;
     setBusy("draft-run");
     try {
       const payload = prepareCheckPayload(form, { bodyMode });
-      setRun(await api.debugCheck(payload));
+      const result = await api.debugCheck(payload);
+      if (requestGenerationRef.current !== generation || activeProjectIdRef.current !== projectId) return;
+      setRun(result);
       setError(null);
     } catch (err) {
-      setError((err as Error).message);
+      if (requestGenerationRef.current === generation && activeProjectIdRef.current === projectId) setError((err as Error).message);
     } finally {
-      setBusy(null);
+      if (requestGenerationRef.current === generation && activeProjectIdRef.current === projectId) setBusy(null);
     }
   }
 
@@ -253,12 +298,6 @@ export function DebugPage() {
                     }
                   />
                 </div>
-                <ApiAssertionsBuilder
-                  bodyMode={bodyMode}
-                  check={form}
-                  value={form.assertions_json}
-                  onChange={(assertions_json) => patchForm({ assertions_json })}
-                />
               </>
             )}
             {checkType === "ui" ? (
@@ -267,6 +306,8 @@ export function DebugPage() {
                 <UiScriptSections
                   setupScript={form.setup_script}
                   script={form.script}
+                  moduleCompletions={moduleCompletions}
+                  completionScopeKey={`project:${currentProject.id}:library:${moduleLibrary?.effective_revision ?? "none"}`}
                   setupHeight="320px"
                   scriptHeight="360px"
                   onSetupScriptChange={(value) => patchForm({ setup_script: value })}
@@ -274,31 +315,46 @@ export function DebugPage() {
                 />
               </>
             ) : (
-              <Collapse
-                className="advanced-script-collapse"
-                items={[
-                  {
-                    key: "script",
-                    label: "高级探测脚本",
-                    children: (
-                      <CodeEditorPanel
-                        title="Python 脚本"
-                        language="python"
-                        value={form.script}
-                        height="360px"
-                        onChange={(value) => patchForm({ script: value })}
-                        extra={
-                          !form.script.trim() && (
-                            <Button size="small" onClick={() => patchForm({ script: apiScriptTemplate })}>
-                              使用模板
-                            </Button>
-                          )
-                        }
-                      />
-                    )
-                  }
-                ]}
-              />
+              <>
+                <Collapse
+                  className="advanced-script-collapse"
+                  items={[
+                    {
+                      key: "script",
+                      label: form.script.trim() ? (
+                        <Tooltip title="脚本可准备并发请求，规则检查最后一次响应">
+                          <span>高级探测脚本（可发起请求）</span>
+                        </Tooltip>
+                      ) : "高级探测脚本（可发起请求）",
+                      children: (
+                        <CodeEditorPanel
+                          title="Python 脚本"
+                          language="python"
+                          value={form.script}
+                          height="360px"
+                          onChange={(value) => patchForm({ script: value })}
+                          moduleCompletions={moduleCompletions}
+                          completionScopeKey={`project:${currentProject.id}:library:${moduleLibrary?.effective_revision ?? "none"}`}
+                          extra={
+                            !form.script.trim() && (
+                              <Button size="small" onClick={() => patchForm({ script: apiScriptTemplate })}>
+                                使用模板
+                              </Button>
+                            )
+                          }
+                        />
+                      )
+                    }
+                  ]}
+                />
+                <ApiAssertionsBuilder
+                  bodyMode={bodyMode}
+                  check={form}
+                  projectId={currentProject.id}
+                  value={form.assertions_json}
+                  onChange={(assertions_json) => patchForm({ assertions_json })}
+                />
+              </>
             )}
           </Space>
         </Card>

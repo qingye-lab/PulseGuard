@@ -1,0 +1,26 @@
+.integrations-page .integrations-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+  gap: var(--space-md);
+  align-items: start;
+}
+
+.integrations-page .integrations-stack {
+  display: grid;
+  gap: var(--space-md);
+}
+
+.integrations-page .integrations-config {
+  max-height: none;
+  margin-bottom: var(--space-md);
+}
+
+.integrations-page .ant-card {
+  min-width: 0;
+}
+
+@media (max-width: 1100px) {
+  .integrations-page .integrations-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

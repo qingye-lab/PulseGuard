@@ -2,8 +2,10 @@ import { Alert, Button, Collapse, Drawer, Form, Input, InputNumber, Modal, Segme
 import { Play, Save } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
+import { parseApiAssertions } from "../apiAssertions";
 import { checkToPayload, detectBodyMode, normalizeCheckPayload, prepareCheckPayload, sameCheckPayload, type BodyEditorMode } from "../checkPayload";
 import { apiScriptTemplate, blankCheck, checkFromTemplate, checkTemplatesForType } from "../defaults";
+import { useProject } from "../ProjectContext";
 import type {
   AlertPolicy,
   BrowserSelectionMode,
@@ -12,6 +14,7 @@ import type {
   CheckPayload,
   CheckType,
   Member,
+  ModuleLibrary,
   NotificationChannel,
   ProbeRunner,
   Run,
@@ -24,6 +27,7 @@ import { RunResultPanel } from "./RunResultPanel";
 import { UiAssertionsBuilder } from "./UiAssertionsBuilder";
 import { UiScriptSections } from "./UiScriptSections";
 import { ViewportModeControl } from "./ViewportModeControl";
+import { moduleCompletionItems } from "../moduleLibrary";
 
 const BROWSER_TYPES: BrowserType[] = ["chromium", "firefox", "webkit"];
 
@@ -36,6 +40,7 @@ interface Props {
 }
 
 export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props) {
+  const { currentProject } = useProject();
   const [form, setForm] = useState<CheckPayload>(() => blankCheck(type));
   const [activeCheck, setActiveCheck] = useState<Check | null>(check);
   const [baseline, setBaseline] = useState<CheckPayload>(() => normalizeCheckPayload(blankCheck(type)));
@@ -50,8 +55,13 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   const [runners, setRunners] = useState<ProbeRunner[]>([]);
   const [enabledBrowserTypes, setEnabledBrowserTypes] = useState<BrowserType[]>(["chromium"]);
   const [selectedTemplateId, setSelectedTemplateId] = useState(() => checkTemplatesForType(type)[0]?.id || "");
+  const [moduleLibrary, setModuleLibrary] = useState<ModuleLibrary | null>(null);
 
   const templates = useMemo(() => checkTemplatesForType(type), [type]);
+  const enabledApiAssertionCount = useMemo(
+    () => type === "api" ? parseApiAssertions(form.assertions_json).filter((item) => item.enabled).length : 0,
+    [form.assertions_json, type]
+  );
   const isDirty = useMemo(() => !sameCheckPayload(form, baseline), [baseline, form]);
   const debugStale = useMemo(() => Boolean(debugRun && debugSnapshot && !sameCheckPayload(form, debugSnapshot)), [debugRun, debugSnapshot, form]);
   const alertPolicy = useMemo(() => parseCheckAlertPolicy(form.alert_policy_json), [form.alert_policy_json]);
@@ -110,6 +120,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     }));
   }, [enabledBrowserTypes, runnerList, selectedBrowserTypes]);
   const running = Boolean(runningMode);
+  const moduleCompletions = useMemo(() => moduleCompletionItems(moduleLibrary), [moduleLibrary]);
 
   useEffect(() => {
     if (!open) return;
@@ -123,6 +134,22 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     setBodyMode(detectBodyMode(next.body));
     setSelectedTemplateId(checkTemplatesForType(type)[0]?.id || "");
   }, [check, open, type]);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setModuleLibrary(null);
+    api.library(currentProject.id)
+      .then((value) => {
+        if (!cancelled) setModuleLibrary(value);
+      })
+      .catch(() => {
+        if (!cancelled) setModuleLibrary(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentProject.id, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -576,23 +603,6 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
                 }
               />
             </div>
-            <Collapse
-              className="advanced-script-collapse"
-              items={[
-                {
-                  key: "health-rules",
-                  label: "健康判定规则",
-                  children: (
-                    <ApiAssertionsBuilder
-                      bodyMode={bodyMode}
-                      check={form}
-                      value={form.assertions_json}
-                      onChange={(assertions_json) => patchForm({ assertions_json })}
-                    />
-                  )
-                }
-              ]}
-            />
           </>
         )}
 
@@ -613,36 +623,66 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
             <UiScriptSections
               setupScript={form.setup_script}
               script={form.script}
+              moduleCompletions={moduleCompletions}
+              completionScopeKey={`project:${currentProject.id}:library:${moduleLibrary?.effective_revision ?? "none"}`}
               onSetupScriptChange={(value) => patchForm({ setup_script: value })}
               onScriptChange={(value) => patchForm({ script: value })}
             />
           </>
         ) : (
-          <Collapse
-            className="advanced-script-collapse"
-            items={[
-              {
-                key: "script",
-                label: "高级探测脚本",
-                children: (
-                  <CodeEditorPanel
-                    title="Python 脚本"
-                    language="python"
-                    value={form.script}
-                    height="320px"
-                    onChange={(value) => patchForm({ script: value })}
-                    extra={
-                      !form.script.trim() && (
-                        <Button size="small" onClick={() => patchForm({ script: apiScriptTemplate })}>
-                          使用模板
-                        </Button>
-                      )
-                    }
-                  />
-                )
-              }
-            ]}
-          />
+          <>
+            <Collapse
+              className="advanced-script-collapse"
+              items={[
+                {
+                  key: "script",
+                  label: form.script.trim() ? (
+                    <Tooltip title="脚本可准备并发请求，规则检查最后一次响应">
+                      <span>高级探测脚本（可发起请求）</span>
+                    </Tooltip>
+                  ) : "高级探测脚本（可发起请求）",
+                  children: (
+                    <CodeEditorPanel
+                      title="Python 脚本"
+                      language="python"
+                      value={form.script}
+                      height="320px"
+                      onChange={(value) => patchForm({ script: value })}
+                      moduleCompletions={moduleCompletions}
+                      completionScopeKey={`project:${currentProject.id}:library:${moduleLibrary?.effective_revision ?? "none"}`}
+                      extra={
+                        !form.script.trim() && (
+                          <Button size="small" onClick={() => patchForm({ script: apiScriptTemplate })}>
+                            使用模板
+                          </Button>
+                        )
+                      }
+                    />
+                  )
+                }
+              ]}
+            />
+            <Collapse
+              className="advanced-script-collapse"
+              defaultActiveKey="health-rules"
+              items={[
+                {
+                  key: "health-rules",
+                  label: `健康判定规则（${enabledApiAssertionCount} 项启用）`,
+                  children: (
+                    <ApiAssertionsBuilder
+                      bodyMode={bodyMode}
+                      check={form}
+                      heading="接口校验"
+                      projectId={currentProject.id}
+                      value={form.assertions_json}
+                      onChange={(assertions_json) => patchForm({ assertions_json })}
+                    />
+                  )
+                }
+              ]}
+            />
+          </>
         )}
 
         {error && <Alert type="error" title={error} showIcon />}

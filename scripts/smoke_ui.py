@@ -17,6 +17,182 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def smoke_project_module_library_simple(page, context, base: str, output: Path, first_project: dict, second_project: dict) -> None:
+    """Exercise the current project library through the real compact UI."""
+    from playwright.sync_api import expect
+
+    project_id = int(first_project["id"])
+    headers = {"X-PulseGuard-Project-Id": str(project_id)}
+    module_name = "smoke_methods"
+    module_source = (
+        "def marker(ctx):\n"
+        "    return 'ok'\n"
+    )
+    module_source_v2 = module_source.replace("'ok'", "'updated'")
+
+    def library_response(response):
+        return response.url.endswith(f"/api/projects/{project_id}/library") and response.request.method == "PUT"
+
+    page.goto(f"{base}/projects/modules?project_id={project_id}")
+    expect(page.get_by_role("heading", name="公共方法", exact=True)).to_be_visible()
+    page.get_by_role("button", name="新建脚本", exact=True).click()
+    editor = page.get_by_role("dialog", name="新建脚本", exact=True)
+    editor.locator("input").nth(0).fill(module_name)
+    editor.locator("input").nth(1).fill("Smoke helper")
+    set_monaco_source(page, module_source, context, base)
+    with page.expect_response(library_response) as create_response:
+        editor.get_by_role("button", name="保存", exact=True).click()
+    created = create_response.value.json()
+    assert create_response.value.ok, created
+    assert created["effective_modules"][0]["name"] == module_name, created
+    expect(page.get_by_role("row").filter(has_text=module_name)).to_be_visible()
+
+    row = page.get_by_role("row").filter(has_text=module_name).first
+    row.get_by_role("button", name="复制引用", exact=True).click()
+    expect(page.get_by_text("引用已复制", exact=True)).to_be_visible()
+    copied = page.evaluate("navigator.clipboard.readText()")
+    assert copied == f'ctx.modules.use("{module_name}")', copied
+
+    row.get_by_role("button", name="编辑", exact=True).click()
+    editor = page.get_by_role("dialog", name="编辑脚本", exact=True)
+    set_monaco_source(page, "def broken(:\n    pass\n", context, base)
+    with page.expect_response(library_response) as invalid_response:
+        editor.get_by_role("button", name="保存", exact=True).click()
+    assert invalid_response.value.status == 400, invalid_response.value.text()
+    expect(editor.locator(".ant-alert")).to_be_visible()
+    set_monaco_source(page, module_source_v2, context, base)
+    editor.locator("input").nth(1).fill("Smoke helper updated")
+    set_monaco_source(page, module_source_v2, context, base)
+    with page.expect_response(library_response) as update_response:
+        editor.get_by_role("button", name="保存", exact=True).click()
+    updated = update_response.value.json()
+    assert update_response.value.ok, updated
+    assert updated["effective_modules"][0]["description"] == "Smoke helper updated", updated
+    expect(page.get_by_text("Smoke helper updated", exact=True)).to_be_visible()
+    page.screenshot(path=str(output / "module-library-list.png"), full_page=True)
+    row = page.get_by_role("row").filter(has_text=module_name).first
+    row.get_by_role("button", name="编辑", exact=True).click()
+    editor = page.get_by_role("dialog", name="编辑脚本", exact=True)
+    expect(editor).to_be_visible()
+    page.screenshot(path=str(output / "module-library-editor.png"), full_page=True)
+    page.locator(".module-editor-drawer .ant-drawer-footer button").first.click()
+
+    # Seed real task references through the temporary API. Both API script and
+    # UI setup/script use the same saved module, so deletion exercises the
+    # server-owned static reference guard rather than a UI-only check.
+    api_payload = {
+        "name": "Smoke Module API",
+        "type": "api",
+        "enabled": False,
+        "interval_seconds": 300,
+        "timeout_ms": 15000,
+        "entry_url": f"{base}/__smoke/api-seed",
+        "method": "GET",
+        "headers_json": "{}",
+        "body": "",
+        "assertions_json": "[]",
+        "setup_script": "",
+        "script": f'async def check(ctx):\n    helper = ctx.modules.use("{module_name}")\n    helper.marker(ctx)\n    await ctx.request()\n',
+        "tags": "",
+        "alert_policy_json": "{}",
+        "runner_selection_mode": "selected_parallel",
+        "runner_ids": ["local"],
+        "browser_selection_mode": "selected_parallel",
+        "browser_types": [],
+    }
+    ui_payload = {
+        "name": "Smoke Module UI",
+        "type": "ui",
+        "enabled": False,
+        "interval_seconds": 300,
+        "timeout_ms": 15000,
+        "entry_url": f"{base}/artifacts/responses/smoke.html",
+        "viewport_mode": "web",
+        "method": "",
+        "headers_json": "{}",
+        "body": "",
+        "assertions_json": "[]",
+        "setup_script": f'async def setup(ctx, page):\n    helper = ctx.modules.use("{module_name}")\n    helper.marker(ctx)\n',
+        "script": f'async def check(ctx):\n    helper = ctx.modules.use("{module_name}")\n    helper.marker(ctx)\n',
+        "tags": "",
+        "alert_policy_json": "{}",
+        "runner_selection_mode": "selected_parallel",
+        "runner_ids": ["local"],
+        "browser_selection_mode": "selected_parallel",
+        "browser_types": ["chromium"],
+    }
+    created_api = context.request.post(f"{base}/api/checks", data=api_payload, headers=headers)
+    assert created_api.ok, created_api.text()
+    created_ui = context.request.post(f"{base}/api/checks", data=ui_payload, headers=headers)
+    assert created_ui.ok, created_ui.text()
+
+    page.reload()
+    row = page.get_by_role("row").filter(has_text=module_name).first
+    expect(row).to_be_visible()
+    row.get_by_role("button", name="删除", exact=True).click()
+    confirm_delete = page.locator(".ant-popconfirm-buttons .ant-btn-primary").last
+    expect(confirm_delete).to_be_visible()
+    with page.expect_response(library_response) as delete_response:
+        confirm_delete.click()
+    assert delete_response.value.status == 400, delete_response.value.text()
+    expect(page.get_by_role("row").filter(has_text=module_name)).to_be_visible()
+    expect(page.get_by_text(re.compile(f"模块不存在.*{re.escape(module_name)}"))).to_be_visible()
+    page.keyboard.press("Escape")
+    page.screenshot(path=str(output / "module-library-delete-blocked.png"), full_page=True)
+
+    page.get_by_role("button", name=re.compile("当前项目：")).click()
+    page.get_by_role("menuitem", name=second_project["name"], exact=True).click()
+    expect(page.get_by_role("button", name=re.compile(f"当前项目：{re.escape(second_project['name'])}"))).to_be_visible()
+    expect(page.get_by_role("row").filter(has_text=module_name)).to_have_count(0)
+    page.screenshot(path=str(output / "module-library-project-switch.png"), full_page=True)
+
+    # Delay a real delete response while switching projects. The old request
+    # must neither keep the new project busy nor overwrite its library.
+    second_url = f"{base}/api/projects/{second_project['id']}/library"
+    second_headers = {"X-PulseGuard-Project-Id": str(second_project["id"])}
+    second_library = context.request.get(second_url, headers=second_headers).json()
+    seeded = context.request.put(second_url, headers=second_headers, data={
+        "expected_revision": second_library["effective_revision"],
+        "modules": [{"name": "delete_pending", "source": module_source}],
+    })
+    assert seeded.ok, seeded.text()
+    page.goto(f"{base}/projects/modules?project_id={second_project['id']}")
+    pending = []
+
+    def delay_delete(route):
+        if route.request.method == "PUT":
+            pending.append(route)
+        else:
+            route.continue_()
+
+    page.route(second_url, delay_delete)
+    page.get_by_role("row").filter(has_text="delete_pending").get_by_role("button", name="删除", exact=True).click()
+    page.locator(".ant-popconfirm-buttons .ant-btn-primary").last.click()
+    expect(page.get_by_role("button", name="新建脚本", exact=True)).to_be_disabled()
+    page.get_by_role("button", name=re.compile("当前项目：")).click()
+    page.get_by_role("menuitem", name=first_project["name"], exact=True).click()
+    expect(page.get_by_role("button", name="新建脚本", exact=True)).to_be_enabled()
+    expect(page.get_by_role("row").filter(has_text=module_name)).to_be_visible()
+    assert pending, "delete request was not intercepted"
+    for route in pending:
+        route.fulfill(response=route.fetch())
+    page.unroute(second_url, delay_delete)
+    expect(page.get_by_role("button", name="新建脚本", exact=True)).to_be_enabled()
+    expect(page.get_by_role("row").filter(has_text=module_name)).to_be_visible()
+    expect(page.get_by_role("row").filter(has_text="delete_pending")).to_have_count(0)
+    page.screenshot(path=str(output / "module-library-pending-switch.png"), full_page=True)
+
+
+def set_monaco_source(page, source: str, context, base: str) -> None:
+    """Replace a Monaco model through its input area without auto-indent drift."""
+    context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base)
+    page.evaluate("async (text) => navigator.clipboard.writeText(text)", source)
+    editor = page.locator(".module-editor-drawer .monaco-editor").first
+    editor.click()
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Control+V")
+
+
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
@@ -49,10 +225,27 @@ def main() -> int:
         storage.init_db()
         for check in storage.list_checks():
             storage.update_check(check["id"], {**check, "enabled": False})
-        storage.update_settings({"prewarmed_browser_types": [], "system_alerts_enabled": False})
+        storage.update_settings({"prewarmed_browser_types": [], "system_alerts_enabled": False, "api_retry_attempts": 0})
         first_project = storage.get_project(storage.default_project_id())
         second_project = storage.create_project("Smoke Other")
         from backend.app.main import app
+        api_requests: list[str] = []
+
+        @app.get('/__smoke/api-seed')
+        def api_seed():
+            api_requests.append('seed')
+            return {'id': 'fresh'}
+
+        @app.get('/__smoke/api-target/{item_id}')
+        def api_target(item_id: str):
+            api_requests.append('target:' + item_id)
+            return {'returncode': 17 if item_id == 'bad' else 0, 'result': {'records': [{'id': item_id}]}}
+
+        # The app's SPA fallback is already registered; fixtures must precede it.
+        fixture_routes = app.router.routes[-2:]
+        del app.router.routes[-2:]
+        app.router.routes[0:0] = fixture_routes
+
         (root / "reports" / "responses" / "smoke.html").write_text(
             '<!doctype html><html lang="en"><title>Smoke target</title>'
             '<body><button id="smoke-save">Save item</button></body></html>', encoding="utf-8"
@@ -131,6 +324,89 @@ def main() -> int:
                     page.wait_for_function("document.documentElement.scrollWidth <= window.innerWidth", timeout=5000)
                     page.screenshot(path=str(output / "monitoring-1280.png"), full_page=True)
 
+                    # A real dependency request supplies the configured target URL. Visible
+                    # rules must evaluate that last response without repeating the request.
+                    chain_name = 'Smoke dynamic API'
+                    chain_script = (
+                        'async def check(ctx):\n'
+                        f'    response = await ctx.http.get("{base}/__smoke/api-seed")\n'
+                        '    ctx.assert_status(response, 200)\n'
+                        '    ctx.vars.set("SMOKE_ITEM", response.json()["id"])\n'
+                        '    await ctx.request()\n'
+                    )
+                    chain_payload = {
+                        'name': chain_name, 'type': 'api', 'enabled': False,
+                        'entry_url': base + '/__smoke/api-target/${SMOKE_ITEM}',
+                        'method': 'GET', 'script': chain_script,
+                        'assertions_json': json.dumps([
+                            {'id': 'http', 'type': 'status_code', 'expected_status': 200},
+                            {'id': 'business', 'type': 'json_path_equals', 'path': '$.returncode', 'expected_value': '0'},
+                            {'id': 'records', 'type': 'json_path_type', 'path': '$.result.records', 'expected_type': 'array'},
+                        ]),
+                    }
+                    project_headers = {'X-PulseGuard-Project-Id': str(first_project['id'])}
+                    created_chain = context.request.post(f'{base}/api/checks', data=chain_payload, headers=project_headers)
+                    assert created_chain.ok, created_chain.text()
+                    chain_check = created_chain.json()
+                    page.goto(f'{base}/api-checks')
+                    page.get_by_role('button', name=f'{chain_name} 编辑', exact=True).click()
+                    chain_drawer = page.get_by_role('dialog', name='编辑任务', exact=True)
+                    if not chain_drawer.get_by_role('button', name='执行请求', exact=True).is_visible():
+                        chain_drawer.get_by_text('健康判定规则', exact=True).first.click()
+                    expect(chain_drawer.get_by_text('3 项启用', exact=True).first).to_be_visible()
+                    before_requests = len(api_requests)
+                    with page.expect_response(lambda r: r.url.endswith('/api/checks/inspect-api')) as inspected_chain:
+                        chain_drawer.get_by_role('button', name='执行请求', exact=True).click()
+                    assert inspected_chain.value.ok, inspected_chain.value.text()
+                    inspected = inspected_chain.value.json()
+                    assert any(item['path'] == '$.result.records' for item in inspected['json_paths']), inspected
+                    assert api_requests[before_requests:] == ['seed', 'target:fresh'], api_requests
+                    before_requests = len(api_requests)
+                    with page.expect_response(lambda r: r.url.endswith('/api/checks/debug')) as debug_chain_response:
+                        chain_drawer.get_by_role('button', name='试运行当前配置', exact=True).click()
+                    chain_run = debug_chain_response.value.json()
+                    assert debug_chain_response.value.ok and chain_run['status'] == 'ok', chain_run
+                    assert api_requests[before_requests:] == ['seed', 'target:fresh'], api_requests
+                    response_snapshot = json.loads(chain_run['response_snapshot'])
+                    assert len(response_snapshot['assertions']) == 3, response_snapshot
+                    expect(chain_drawer.get_by_role('heading', name='调试结果', exact=True)).to_be_visible()
+                    chain_drawer.get_by_role('button', name='删除校验项', exact=True).last.scroll_into_view_if_needed()
+                    page.screenshot(path=str(output / 'api-dynamic-rules.png'), full_page=True, animations='disabled')
+                    chain_drawer.get_by_role('tab', name='执行信息', exact=True).click()
+                    chain_drawer.get_by_text('接口请求链', exact=True).scroll_into_view_if_needed()
+                    expect(chain_drawer.get_by_text('目标请求耗时', exact=True).first).to_be_visible()
+                    expect(chain_drawer.get_by_text('全程探测耗时', exact=True).first).to_be_visible()
+                    expect(chain_drawer.get_by_text('最近 2 条', exact=True)).to_be_visible()
+                    page.screenshot(path=str(output / 'api-request-history.png'), full_page=True, animations='disabled')
+                    failed_payload = {**chain_payload, 'script': chain_script.replace('response.json()["id"]', '"bad"')}
+                    before_requests = len(api_requests)
+                    negative = context.request.post(f'{base}/api/checks/debug', data=failed_payload, headers=project_headers)
+                    assert negative.ok, negative.text()
+                    negative_run = negative.json()
+                    assert negative_run['status'] == 'failed', negative_run
+                    assert api_requests[before_requests:] == ['seed', 'target:bad'], api_requests
+                    failed_assertions = json.loads(negative_run['response_snapshot'])['assertions']
+                    assert any(item.get('path') == '$.returncode' and item['status'] == 'failed' for item in failed_assertions), failed_assertions
+
+                    dependency_payload = {**chain_payload, 'script': chain_script.replace('ctx.assert_status(response, 200)', 'ctx.assert_status(response, 503)')}
+                    updated = context.request.put(f'{base}/api/checks/{chain_check["id"]}', data=dependency_payload, headers=project_headers)
+                    assert updated.ok, updated.text()
+                    page.goto(f'{base}/api-checks')
+                    page.get_by_role('button', name=f'{chain_name} 编辑', exact=True).click()
+                    chain_drawer = page.get_by_role('dialog', name='编辑任务', exact=True)
+                    before_requests = len(api_requests)
+                    with page.expect_response(lambda r: r.url.endswith('/api/checks/inspect-api')) as failed_preview:
+                        chain_drawer.get_by_role('button', name='执行请求', exact=True).click()
+                    assert failed_preview.value.status == 400, failed_preview.value.text()
+                    assert api_requests[before_requests:] == ['seed'], api_requests
+                    chain_drawer.get_by_role('button', name='执行详情', exact=True).click()
+                    evidence_dialog = page.get_by_role('dialog', name='执行详情', exact=True)
+                    expect(evidence_dialog.get_by_role('tab', name='请求记录', exact=True)).to_be_visible()
+                    expect(evidence_dialog.get_by_text('最近请求与响应（最多 10 条）', exact=True)).to_be_visible()
+                    page.screenshot(path=str(output / 'api-preview-failure.png'), full_page=True, animations='disabled')
+                    page.keyboard.press('Escape')
+                    expect(evidence_dialog).not_to_be_visible()
+
                     page.goto(f"{base}/api-checks")
                     page.get_by_role("button", name=re.compile("当前项目：")).click()
                     with page.expect_response(lambda response: "/api/checks" in response.url and response.request.headers.get("x-pulseguard-project-id") == str(second_project["id"])):
@@ -166,6 +442,7 @@ def main() -> int:
                     expect(picker).not_to_be_visible()
                     expect(drawer.get_by_text("1 项启用", exact=True)).to_be_visible()
                     expect(drawer.get_by_placeholder("CSS / text= / role= Playwright 选择器…")).to_have_value("#smoke-save")
+                    smoke_project_module_library_simple(page, context, base, output, first_project, second_project)
                     assert not errors, errors
                     (output / "result.json").write_text(json.dumps({"status": "ok", "check_id": saved["id"], "run_id": run["id"], "page_errors": errors}, indent=2), encoding="utf-8")
                     print(f"PASS browser smoke: create, debug, history, trend/candidate keyboard access and project persistence — {output}")
