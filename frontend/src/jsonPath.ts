@@ -137,15 +137,15 @@ export function jsonLiteral(value: unknown): string {
 
 function buildChildren(value: unknown, parentPath: string): JsonPathNode[] | undefined {
   if (Array.isArray(value)) {
-    return value.slice(0, 80).map((item, index) => node(String(index), `${parentPath}[${index}]`, item));
+    return value.slice(0, 80).map((item, index) => node(`${parentPath}[${index}]`, item));
   }
   if (value && typeof value === "object") {
-    return Object.entries(value as Record<string, unknown>).map(([key, item]) => node(key, childPath(parentPath, key), item));
+    return Object.entries(value as Record<string, unknown>).map(([key, item]) => node(childPath(parentPath, key), item));
   }
   return undefined;
 }
 
-function node(key: string, path: string, value: unknown): JsonPathNode {
+function node(path: string, value: unknown): JsonPathNode {
   return {
     key: path,
     path,

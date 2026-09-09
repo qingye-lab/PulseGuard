@@ -86,7 +86,7 @@ The system rejects AI dashboard cliches: decorative gradients, glass cards, gene
 - Quiet surfaces with restrained accent usage.
 - Clear separation between page title, task title, metadata, and numeric status.
 - Existing product controls from Ant Design, constrained by project tokens.
-- Tailwind v4 plus shadcn/ui `radix-nova` for new code-owned primitives where AntD is too heavy.
+- Tailwind v4 remains available for layout and code-owned surfaces; Ant Design remains the primary control system.
 - Data and timestamps use tabular numeric treatment.
 
 ## 2. Colors
@@ -146,8 +146,7 @@ PulseGuard uses tonal layering and borders first. Shadows are reserved for overl
 ### Implementation Boundary
 - Ant Design remains the product design-system substrate for existing work surfaces.
 - Tailwind v4 is available for layout and code-owned surfaces. Prefer semantic CSS variables over one-off colors.
-- shadcn/ui uses `radix-nova` and writes source components under `frontend/src/components/ui`.
-- Do not mix AntD and shadcn primitives inside the same small control cluster unless a migration step requires it.
+- Do not introduce local primitive wrappers when an AntD control covers the interaction; reserve code-owned components for real product workflows or data transformation.
 - Import mature AntD primitives directly: `Button`, `Menu`, `Typography`, `Tag`, `Card`, `Statistic`, `Table`, `Form`, `Drawer`, `Modal`, `Tooltip`, `message`, and `notification`.
 - Do not create local wrapper components for primitive controls such as Button, Tag, Card, Typography, or Menu.
 - Shared design code is limited to tokens, CSS constraints, and business status mapping helpers. Reusable React components should encapsulate real product workflows, not restyle AntD primitives.

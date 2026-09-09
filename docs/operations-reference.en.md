@@ -228,25 +228,33 @@ After rotating a direct-worker token, update the credential in the main console 
 
 ## Validation
 
-Backend:
+Quick verification (backend tests, frontend behavior tests and type checks):
 
 ```bash
-uv run python -m unittest discover -s backend/tests -p 'test_*.py' -v
+uv run --frozen python scripts/verify.py quick
+uv run --frozen python scripts/verify.py quick --backend-pattern test_runner.py
 ```
 
-Frontend:
+Full verification (also builds production assets, checks bundle budgets and runs a real browser smoke workflow):
 
 ```bash
-cd frontend
-npm run build
+uv run --frozen python -m playwright install chromium
+uv run --frozen python scripts/verify.py full
 ```
 
-Docker and lockfile:
+Backend-only checks use `uv run --frozen python scripts/test_backend.py`, optionally with `--pattern test_runner.py`. This entry point isolates data, database, reports and backups before importing the app, initializes a temporary database, and discards inherited instance paths, tokens and node roles. Tests must never read the live `data/pulseguard.db`.
+
+Full verification requires browser tests to execute; missing Chromium is a failure. Quick verification only skips browser tests when the executable is absent, and still fails for other launch errors. Each step reports its duration, result and log location. The `ui` mode runs only the build and browser smoke test. The smoke workflow starts a temporary instance, creates and debugs a check, inspects run history, switches projects and exercises trend and candidate selection with the keyboard, retaining screenshots and a trace. It needs no live instance or external probe target.
+
+CI runs full verification for pull requests and existing push branches. Pull requests do not publish images. Use targeted checks during development and full verification before submitting changes.
+
+Lockfile check:
 
 ```powershell
 uv lock --check
-.\scripts\deploy.ps1
 ```
+
+Deployment changes the running instance. Run `.\scripts\deploy.ps1` separately; it is not a validation command.
 
 ## Script entry points
 

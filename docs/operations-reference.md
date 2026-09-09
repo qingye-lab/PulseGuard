@@ -305,25 +305,33 @@ uv run python -m backend.app.worker --rotate-token --token-file data/worker-toke
 
 ## 验证命令
 
-后端：
+快速验证（后端测试、前端行为测试、类型检查）：
 
 ```powershell
-uv run python -m unittest discover -s backend/tests -p 'test_*.py' -v
+uv run --frozen python scripts/verify.py quick
+uv run --frozen python scripts/verify.py quick --backend-pattern test_runner.py
 ```
 
-前端：
+完整验证（另含生产构建、包体预算、真实浏览器业务冒烟）：
 
 ```powershell
-cd frontend
-npm run build
+uv run --frozen python -m playwright install chromium
+uv run --frozen python scripts/verify.py full
 ```
 
-Docker：
+后端单独验证使用 `uv run --frozen python scripts/test_backend.py`，支持 `--pattern test_runner.py`。入口会在导入应用前隔离数据、数据库、报告和备份目录，并初始化临时数据库；不会继承运行实例的路径、令牌或节点角色。不要直接让测试读取 `data/pulseguard.db`。
+
+完整验证要求浏览器测试实际执行，缺少 Chromium 会失败；快速验证仅在浏览器可执行文件缺失时跳过相关测试，其他启动错误仍失败。日志记录每个步骤的耗时、结果及失败详情，目录会打印到终端。`ui` 模式只运行前端构建与浏览器冒烟。浏览器冒烟启动临时实例，通过页面完成创建、调试、运行历史、项目切换，以及趋势和候选元素的键盘操作，并保存截图与 Trace；不依赖生产实例或外部探测目标。
+
+CI 在 PR 和既有 push 分支上运行完整验证；PR 不发布镜像。后端或前端的定向验证用于开发反馈，提交前运行完整验证。
+
+锁文件检查：
 
 ```powershell
 uv lock --check
-.\scripts\deploy.ps1
 ```
+
+部署会修改运行实例，单独使用 `.\scripts\deploy.ps1`，不属于验证命令。
 
 中国网络环境部署见 [china-deployment.md](./china-deployment.md)；火山主节点和本地子节点接入见 [volcano-deployment.md](./volcano-deployment.md)。
 

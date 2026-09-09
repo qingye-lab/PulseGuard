@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
+from backend.app import artifacts, storage
 from backend.app.runner import BrowserRunTarget, CheckRunner, RunFailure, RunnerEnvironmentFailure, _TASK_DURATION_ATTR
 
 
@@ -24,8 +27,23 @@ def local_runner_stub(available: bool = True) -> dict[str, object]:
     }
 
 
-class DraftRunnerTests(unittest.TestCase):
+class RunnerTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(storage, "DB_PATH", root / "pulseguard.db"))
+        self.enterContext(patch.object(storage, "BACKUPS_DIR", root / "backups"))
+        # The runner owns no directory initialization in these unit tests.
+        self.enterContext(patch.object(storage, "ensure_runtime_dirs"))
+        directories = {name: root / name.lower() for name in ("SCREENSHOTS_DIR", "TRACES_DIR", "RESPONSES_DIR")}
+        for directory in directories.values():
+            directory.mkdir()
+        self.enterContext(patch.multiple(artifacts, **directories))
+        storage.init_db()
+
+
+class DraftRunnerTests(RunnerTestCase):
+    def setUp(self) -> None:
+        super().setUp()
         self._runner_state_patch = patch.multiple(
             "backend.app.runner.storage",
             get_probe_runner=Mock(return_value=None),
@@ -793,7 +811,7 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertEqual(inspect_ui_page.call_args.kwargs["ctx"].entry_url, payload["entry_url"])
 
 
-class RunnerQueueTests(unittest.TestCase):
+class RunnerQueueTests(RunnerTestCase):
     def test_queue_capacity_skips_excess_submissions(self) -> None:
         async def scenario() -> list[dict[str, object]]:
             first_started = asyncio.Event()
@@ -1097,8 +1115,9 @@ class RunnerQueueTests(unittest.TestCase):
         self.assertEqual(max_active_ui, 1)
 
 
-class DistributedRunnerTests(unittest.TestCase):
+class DistributedRunnerTests(RunnerTestCase):
     def setUp(self) -> None:
+        super().setUp()
         self._project_patch = patch(
             "backend.app.runner.storage.get_project", return_value={"id": 1, "status": "active"}
         )

@@ -43,10 +43,6 @@ def normalize_browser_types(value: Any, *, default: list[str] | None = None, all
     return normalized
 
 
-def normalize_enabled_browser_types(value: Any) -> list[str]:
-    return normalize_browser_types(value, default=[DEFAULT_BROWSER_TYPE])
-
-
 def normalize_browser_selection_mode(value: Any) -> str:
     mode = str(value or "selected_parallel").strip()
     return mode if mode in {"selected_parallel", "round_robin_all"} else "selected_parallel"

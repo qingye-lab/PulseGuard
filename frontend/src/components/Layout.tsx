@@ -24,7 +24,6 @@ import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { ProjectCreateModal } from "./ProjectCreateModal";
-import { Button as UiButton } from "./ui/button";
 import type { StatusPageSnapshot } from "../types";
 import { formatDate } from "../utils";
 import { useProject } from "../ProjectContext";
@@ -221,11 +220,10 @@ export function Layout() {
           {mobilePrimaryItems.map((item) => {
             const active = selectedPath === item.to;
             return (
-              <UiButton
+              <Button
                 key={item.to}
-                type="button"
-                variant="ghost"
-                size="nav"
+                type="text"
+                htmlType="button"
                 className={`mobile-nav-item ${active ? "is-active" : ""}`}
                 aria-label={item.label}
                 aria-current={active ? "page" : undefined}
@@ -233,7 +231,7 @@ export function Layout() {
               >
                 <span className="mobile-nav-item-icon">{item.icon}</span>
                 <span className="mobile-nav-item-label">{item.shortLabel}</span>
-              </UiButton>
+              </Button>
             );
           })}
           <Dropdown
@@ -245,10 +243,9 @@ export function Layout() {
               onClick: ({ key }) => navigate(String(key))
             }}
           >
-            <UiButton
-              type="button"
-              variant="ghost"
-              size="nav"
+            <Button
+              type="text"
+              htmlType="button"
               className={`mobile-nav-item ${mobileMoreActive ? "is-active" : ""}`}
               aria-label="更多导航"
               aria-current={mobileMoreActive ? "page" : undefined}
@@ -257,7 +254,7 @@ export function Layout() {
                 <MoreHorizontal size={16} />
               </span>
               <span className="mobile-nav-item-label">更多</span>
-            </UiButton>
+            </Button>
           </Dropdown>
         </div>
         <div className="sidebar-project-dock">

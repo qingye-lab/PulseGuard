@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -743,7 +744,7 @@ class RunnerRouteTests(unittest.TestCase):
             "backend.app.main.storage.regenerate_probe_runner_provision", return_value=runner
         ), patch("backend.app.main._revoke_relay_session") as revoke_relay_session, patch(
             "backend.app.main.storage.record_audit_event"
-        ), patch(
+        ) as record_audit_event, patch(
             "backend.app.main.storage.get_settings", return_value={}
         ):
             response = TestClient(app).post(
@@ -762,54 +763,9 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(payload["deployment"]["compose_url"], "https://deploy.example.com/custom-relay-worker.yml")
         self.assertIn("https://deploy.example.com/custom-relay-worker.yml", payload["deployment"]["command"])
         self.assertNotIn("codex/github-publish", payload["deployment"]["command"])
+        self.assertEqual(payload["relay_token_version"], 2)
         revoke_relay_session.assert_not_called()
-
-    def test_regenerate_runner_provision_does_not_revoke_existing_relay_session(self) -> None:
-        runner = {
-            "runner_id": "edge-1",
-            "name": "Edge Runner",
-            "address": "http://pulseguard-relay:18001",
-            "network_region": "edge",
-            "status": "pending_deployment",
-            "enabled": True,
-            "role": "child",
-            "connection_mode": "relay",
-            "available": False,
-            "token_set": True,
-            "token_hint": "abc123",
-            "relay_token": "pgrl_rotated-token",
-            "worker_token": "pgrn_worker-token",
-            "relay_token_version": 2,
-            "deploy_command_expires_at": "2026-06-19T00:00:00+08:00",
-        }
-
-        with patch("backend.app.main.RELAY_ENABLED", True), patch(
-            "backend.app.main.RELAY_CONTROL_URL", "http://pulseguard-relay:18000"
-        ), patch("backend.app.main.RELAY_PUBLIC_HOST", "203.0.113.10"), patch(
-            "backend.app.main.RELAY_PUBLIC_PORT", 9443
-        ), patch("backend.app.main.relay_fingerprint", return_value="abc" * 21 + "a"), patch(
-            "backend.app.main.relay_control_token", return_value="pgrc_secret"
-        ), patch("backend.app.main.httpx.Client") as httpx_client, patch(
-            "backend.app.main.storage.regenerate_probe_runner_provision", return_value=runner
-        ), patch(
-            "backend.app.main.storage.record_audit_event"
-        ) as record_audit_event, patch(
-            "backend.app.main.storage.get_settings", return_value={}
-        ):
-            response = TestClient(app).post(
-                "/api/runners/edge-1/provision/regenerate",
-                json={
-                    "name": "Edge Runner",
-                    "network_region": "edge",
-                    "target_platform": "linux",
-                    "compose_url": "https://deploy.example.com/custom-relay-worker.yml",
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["relay_token_version"], 2)
         self.assertEqual(record_audit_event.call_args.args[5], {"relay_control_revoked": False})
-        httpx_client.assert_not_called()
 
     def test_update_child_runner_normalizes_bare_address(self) -> None:
         current = {"runner_id": "office-1", "name": "Office Runner", "role": "child"}
@@ -1102,6 +1058,294 @@ class RunnerRouteTests(unittest.TestCase):
         list_probe_runners.assert_called_once_with(limit=10)
 
 
+class RunnerHealthPollingTests(unittest.TestCase):
+    @staticmethod
+    def _runner(runner_id: str) -> dict[str, object]:
+        return {"runner_id": runner_id, "role": "child", "address": f"http://{runner_id}:8788"}
+
+    @staticmethod
+    def _health() -> dict[str, object]:
+        return {"ok": True, "status": "ok", "installed_browser_types": ["chromium"]}
+
+    def test_slow_runner_does_not_block_following_health_check(self) -> None:
+        async def scenario() -> None:
+            slow = self._runner("slow")
+            fast = self._runner("fast")
+            slow_started = asyncio.Event()
+            fast_finished = asyncio.Event()
+            release_slow = asyncio.Event()
+
+            async def fetch(runner: dict[str, object]) -> dict[str, object]:
+                if runner["runner_id"] == "slow":
+                    slow_started.set()
+                    await release_slow.wait()
+                else:
+                    fast_finished.set()
+                return self._health()
+
+            with patch.object(main_module.storage, "list_enabled_probe_runners", return_value=[slow, fast]), patch.object(
+                main_module.storage, "get_settings", return_value={}
+            ), patch.object(main_module.storage, "mark_probe_runner_available"), patch.object(
+                main_module.storage, "mark_probe_runner_unavailable"
+            ) as mark_unavailable, patch.object(main_module, "_fetch_runner_health", side_effect=fetch), patch.object(
+                main_module, "RUNNER_HEALTH_POLL_SECONDS", 60
+            ):
+                poll_task = asyncio.create_task(main_module._runner_health_poll_loop())
+                try:
+                    await asyncio.wait_for(slow_started.wait(), 1)
+                    await asyncio.wait_for(fast_finished.wait(), 1)
+                    mark_unavailable.assert_not_called()
+                finally:
+                    release_slow.set()
+                    poll_task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await poll_task
+
+        asyncio.run(scenario())
+
+    def test_health_checks_respect_bounded_concurrency(self) -> None:
+        async def scenario() -> None:
+            runners = [self._runner(f"runner-{index}") for index in range(6)]
+            finished = asyncio.Event()
+            active = 0
+            max_active = 0
+            finished_count = 0
+
+            async def fetch(_: dict[str, object]) -> dict[str, object]:
+                nonlocal active, max_active, finished_count
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.02)
+                active -= 1
+                finished_count += 1
+                if finished_count == len(runners):
+                    finished.set()
+                return self._health()
+
+            with patch.object(main_module.storage, "list_enabled_probe_runners", return_value=runners), patch.object(
+                main_module.storage, "get_settings", return_value={}
+            ), patch.object(main_module.storage, "mark_probe_runner_available"), patch.object(
+                main_module, "_fetch_runner_health", side_effect=fetch
+            ), patch.object(main_module, "RUNNER_HEALTH_MAX_CONCURRENCY", 2), patch.object(
+                main_module, "RUNNER_HEALTH_POLL_SECONDS", 60
+            ):
+                poll_task = asyncio.create_task(main_module._runner_health_poll_loop())
+                try:
+                    await asyncio.wait_for(finished.wait(), 2)
+                    self.assertEqual(max_active, 2)
+                finally:
+                    poll_task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await poll_task
+
+        asyncio.run(scenario())
+
+    def test_browser_install_is_deduplicated_and_does_not_mark_healthy_runner_offline(self) -> None:
+        async def scenario() -> None:
+            runner = self._runner("install-1")
+            install_started = asyncio.Event()
+            release_install = asyncio.Event()
+            install_failed = asyncio.Event()
+            fetch_count = 0
+            install_calls = 0
+
+            async def fetch(_: dict[str, object]) -> dict[str, object]:
+                nonlocal fetch_count
+                fetch_count += 1
+                return self._health()
+
+            async def install(_: dict[str, object], __: dict[str, object]) -> None:
+                nonlocal install_calls
+                install_calls += 1
+                install_started.set()
+                await release_install.wait()
+                install_failed.set()
+                raise RuntimeError("browser install failed")
+
+            with patch.object(main_module.storage, "list_enabled_probe_runners", return_value=[runner]), patch.object(
+                main_module.storage,
+                "get_settings",
+                return_value={"enabled_browser_types": ["chromium", "firefox"]},
+            ), patch.object(main_module.storage, "mark_probe_runner_available") as mark_available, patch.object(
+                main_module.storage, "mark_probe_runner_unavailable"
+            ) as mark_unavailable, patch.object(main_module, "_fetch_runner_health", side_effect=fetch), patch.object(
+                main_module, "_install_missing_enabled_browser_types_on_runner", side_effect=install
+            ), patch.object(main_module, "logger") as logger, patch.object(
+                main_module, "RUNNER_HEALTH_POLL_SECONDS", 0.01
+            ):
+                poll_task = asyncio.create_task(main_module._runner_health_poll_loop())
+                try:
+                    await asyncio.wait_for(install_started.wait(), 1)
+                    await asyncio.sleep(0.05)
+                    self.assertEqual(install_calls, 1)
+                    self.assertGreaterEqual(fetch_count, 2)
+                    self.assertGreaterEqual(mark_available.call_count, 2)
+                    mark_unavailable.assert_not_called()
+                    release_install.set()
+                    await asyncio.wait_for(install_failed.wait(), 1)
+                    await asyncio.sleep(0)
+                    mark_unavailable.assert_not_called()
+                    logger.exception.assert_called_once()
+                finally:
+                    release_install.set()
+                    poll_task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await poll_task
+
+        asyncio.run(scenario())
+
+    def test_browser_install_respects_bounded_concurrency(self) -> None:
+        async def scenario() -> None:
+            runners = [self._runner(f"install-{index}") for index in range(6)]
+            finished = asyncio.Event()
+            active = 0
+            max_active = 0
+            finished_count = 0
+
+            async def fetch(_: dict[str, object]) -> dict[str, object]:
+                return {"ok": True, "status": "ok", "installed_browser_types": []}
+
+            async def install(_: dict[str, object], __: dict[str, object]) -> None:
+                nonlocal active, max_active, finished_count
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.02)
+                active -= 1
+                finished_count += 1
+                if finished_count == len(runners):
+                    finished.set()
+
+            with patch.object(main_module.storage, "list_enabled_probe_runners", return_value=runners), patch.object(
+                main_module.storage,
+                "get_settings",
+                return_value={"enabled_browser_types": ["chromium"]},
+            ), patch.object(main_module.storage, "mark_probe_runner_available"), patch.object(
+                main_module,
+                "_fetch_runner_health",
+                side_effect=fetch,
+            ), patch.object(
+                main_module,
+                "_install_missing_enabled_browser_types_on_runner",
+                side_effect=install,
+            ), patch.object(main_module, "RUNNER_BROWSER_INSTALL_MAX_CONCURRENCY", 2), patch.object(
+                main_module, "RUNNER_HEALTH_POLL_SECONDS", 60
+            ):
+                poll_task = asyncio.create_task(main_module._runner_health_poll_loop())
+                try:
+                    await asyncio.wait_for(finished.wait(), 2)
+                    self.assertEqual(max_active, 2)
+                finally:
+                    poll_task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await poll_task
+
+        asyncio.run(scenario())
+
+    def test_poll_cancellation_cleans_pending_browser_install_tasks(self) -> None:
+        async def scenario() -> None:
+            runner = self._runner("cancel-1")
+            install_started = asyncio.Event()
+            install_cancelled = asyncio.Event()
+
+            async def install(_: dict[str, object], __: dict[str, object]) -> None:
+                install_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    install_cancelled.set()
+                    raise
+
+            with patch.object(main_module.storage, "list_enabled_probe_runners", return_value=[runner]), patch.object(
+                main_module.storage,
+                "get_settings",
+                return_value={"enabled_browser_types": ["chromium", "firefox"]},
+            ), patch.object(main_module.storage, "mark_probe_runner_available"), patch.object(
+                main_module, "_fetch_runner_health", new=AsyncMock(return_value=self._health())
+            ), patch.object(main_module, "_install_missing_enabled_browser_types_on_runner", side_effect=install), patch.object(
+                main_module, "RUNNER_HEALTH_POLL_SECONDS", 60
+            ):
+                poll_task = asyncio.create_task(main_module._runner_health_poll_loop())
+                await asyncio.wait_for(install_started.wait(), 1)
+                poll_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await poll_task
+                await asyncio.wait_for(install_cancelled.wait(), 1)
+                leftovers = [
+                    task
+                    for task in asyncio.all_tasks()
+                    if task is not asyncio.current_task()
+                    and not task.done()
+                    and task.get_name().startswith("pulseguard-runner-browser-install-")
+                ]
+                self.assertEqual(leftovers, [])
+
+        asyncio.run(scenario())
+
+    def test_lifespan_waits_for_tracked_background_tasks_on_shutdown(self) -> None:
+        async def scenario() -> None:
+            install_started = asyncio.Event()
+            poll_started = asyncio.Event()
+            install_cancelled = asyncio.Event()
+            poll_cancelled = asyncio.Event()
+
+            async def blocked_install(_: dict[str, object]) -> None:
+                install_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    install_cancelled.set()
+                    raise
+
+            async def blocked_poll() -> None:
+                poll_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    poll_cancelled.set()
+                    raise
+
+            runner = AsyncMock()
+            scheduler = unittest.mock.Mock()
+            with patch.object(main_module, "CheckRunner", return_value=runner), patch.object(
+                main_module, "PulseScheduler", return_value=scheduler
+            ), patch.object(main_module, "NODE_ROLE", "main"), patch.object(
+                main_module, "_sync_enabled_browser_type_installation", side_effect=blocked_install
+            ), patch.object(main_module, "_runner_health_poll_loop", side_effect=blocked_poll), patch.object(
+                main_module.storage, "get_settings", return_value={}
+            ), patch.object(main_module.storage, "is_deployment_window_active", return_value=False), patch.object(
+                main_module, "shutdown_browser_installation", new_callable=AsyncMock
+            ) as shutdown_installation:
+                async with main_module.lifespan(main_module.app):
+                    await asyncio.wait_for(install_started.wait(), 1)
+                    await asyncio.wait_for(poll_started.wait(), 1)
+
+            self.assertTrue(install_cancelled.is_set())
+            self.assertTrue(poll_cancelled.is_set())
+            self.assertEqual(main_module.app.state.background_tasks, set())
+            runner.shutdown.assert_awaited_once_with(record_cancelled=True)
+            scheduler.shutdown.assert_called_once()
+            shutdown_installation.assert_awaited_once_with()
+
+        asyncio.run(scenario())
+
+    def test_tracked_background_task_records_unexpected_failure(self) -> None:
+        async def scenario() -> None:
+            async def fail() -> None:
+                raise RuntimeError("background failure")
+
+            tracked_app = SimpleNamespace(state=SimpleNamespace())
+            with patch.object(main_module, "logger") as logger:
+                task = main_module._track_background_task(tracked_app, fail())
+                with self.assertRaisesRegex(RuntimeError, "background failure"):
+                    await task
+                await asyncio.sleep(0)
+
+            self.assertEqual(tracked_app.state.background_tasks, set())
+            logger.error.assert_called_once()
+
+        asyncio.run(scenario())
+
+
 class RunRouteTests(ProjectScopedRouteTests):
     def test_run_detail_uses_ui_snapshot_request_info_without_loading_current_check(self) -> None:
         run = {
@@ -1297,30 +1541,6 @@ class OperationsRouteTests(ProjectScopedRouteTests):
         self.assertNotIn("headers_json", payload_text)
         self.assertNotIn("script", payload_text)
         self.assertNotIn("error_stack", payload_text)
-
-    def test_status_page_excludes_manual_verification_failures(self) -> None:
-        runs = [
-            {
-                "id": 2,
-                "check_id": 1,
-                "check_name": "API",
-                "check_type": "api",
-                "status": "failed",
-                "started_at": "2026-06-08T12:00:00+08:00",
-                "failure_kind": "target",
-                "affects_health": False,
-            }
-        ]
-
-        with patch("backend.app.main.storage.get_settings", return_value={}), patch(
-            "backend.app.main.storage.get_overview", return_value={}
-        ), patch("backend.app.main.storage.list_checks", return_value=[]), patch(
-            "backend.app.main.storage.list_recent_business_incidents", return_value=[]
-        ):
-            response = TestClient(app).get("/api/status-page")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["recent_incidents"], [])
 
     def test_read_only_snapshot_requires_configured_token(self) -> None:
         with patch("backend.app.main.storage.validate_read_only_token", return_value=False):

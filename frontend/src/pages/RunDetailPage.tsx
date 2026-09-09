@@ -3,7 +3,7 @@ import { ArrowLeft, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
-import { RunDetailContent } from "../components/RunDetailContent";
+import { RunResultPanel } from "../components/RunResultPanel";
 import { useProject } from "../ProjectContext";
 import type { Run } from "../types";
 
@@ -68,7 +68,7 @@ export function RunDetailPage() {
       {error && <Alert type="error" title={error} showIcon />}
 
       <Card className="run-detail-card">
-        {loading ? <Skeleton active paragraph={{ rows: 8 }} /> : <RunDetailContent run={run} />}
+        {loading ? <Skeleton active paragraph={{ rows: 8 }} /> : <RunResultPanel run={run} mode="detail" />}
       </Card>
     </div>
   );

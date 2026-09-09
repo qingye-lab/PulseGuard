@@ -24,7 +24,6 @@ import { Activity, Calendar, Maximize2, RefreshCw, RotateCcw, SlidersHorizontal 
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
-import { Button as UiButton } from "../components/ui/button";
 import { palette } from "../designSystem";
 import type {
   CheckTrend,
@@ -32,8 +31,7 @@ import type {
   MonitoringTrendSummary,
   MonitoringTrendTask,
   MonitoringTrends,
-  TrendPeriod,
-  TrendPoint
+  TrendPeriod
 } from "../types";
 import { formatDuration } from "../utils";
 
@@ -752,9 +750,9 @@ function TaskTrendRow({
 
   return (
     <article className={`monitoring-task-row${isOverridden ? " is-overridden" : ""}`}>
-      <UiButton
-        type="button"
-        variant="ghost"
+      <Button
+        type="text"
+        htmlType="button"
         className="monitoring-task-row-main"
         onClick={onOpen}
         aria-label={`查看「${task.name}」趋势详情`}
@@ -785,7 +783,7 @@ function TaskTrendRow({
           )}
           <Suspense fallback={<Skeleton active paragraph={{ rows: 3 }} />}><LatencyChart points={points} variant="sparkline" /></Suspense>
         </div>
-      </UiButton>
+      </Button>
       <div className="monitoring-task-sidecar">
         <div className="monitoring-task-meta" title={dimensionSummary(activeDimension)}>
           <span className="monitoring-task-meta-time">{periodLabel}</span>

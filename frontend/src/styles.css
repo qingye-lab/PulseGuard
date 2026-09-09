@@ -1,6 +1,5 @@
 @import "tailwindcss";
 @import "tw-animate-css";
-@import "shadcn/tailwind.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -523,7 +522,8 @@ button svg {
   display: none;
 }
 
-.mobile-nav-item {
+.mobile-nav-item,
+.mobile-nav-item.ant-btn {
   min-width: 0;
   min-height: 46px;
   border: 1px solid transparent;
@@ -558,7 +558,9 @@ button svg {
 }
 
 .mobile-nav-item:hover,
-.mobile-nav-item.is-active {
+.mobile-nav-item.is-active,
+.mobile-nav-item.ant-btn:hover,
+.mobile-nav-item.ant-btn.is-active {
   border-color: var(--line);
   background: var(--panel-strong);
   color: var(--ink);
@@ -1471,7 +1473,8 @@ button svg {
   padding: 10px 12px;
 }
 
-.monitoring-task-row-main {
+.monitoring-task-row-main,
+.monitoring-task-row-main.ant-btn {
   height: auto;
   min-height: 0;
   min-width: 0;
@@ -1491,7 +1494,8 @@ button svg {
   white-space: normal;
 }
 
-.monitoring-task-row-main:hover {
+.monitoring-task-row-main:hover,
+.monitoring-task-row-main.ant-btn:hover {
   color: inherit;
 }
 
@@ -3330,7 +3334,8 @@ tr:last-child td {
   height: 30px;
 }
 
-.ui-candidate-main {
+.ui-candidate-main,
+.ui-candidate-main.ant-btn {
   min-width: 0;
   width: 100%;
   height: auto;
@@ -3369,6 +3374,12 @@ tr:last-child td {
 .ui-candidate-main:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--pg-accent) 54%, transparent);
   outline-offset: 2px;
+}
+
+.ui-candidate-main.ant-btn:hover {
+  border-color: var(--line);
+  background: var(--panel-strong);
+  color: var(--ink);
 }
 
 .ui-candidate-main strong {

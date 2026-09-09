@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -26,7 +27,7 @@ from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_
 from .relay_cert import relay_fingerprint
 from .runner import CheckRunner, MaintenanceBusyError, RuntimeSettingsReloadError
 from .scheduler import PulseScheduler
-from .browser_installation import browser_capabilities, schedule_browser_install
+from .browser_installation import browser_capabilities, schedule_browser_install, shutdown_browser_installation
 from .browser_types import enabled_browser_types, normalize_browser_types
 from .schemas import ApiInspectRequest, BrowserInstallRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ProjectAlertSettingsUpdate, ProjectCreate, ProjectUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, RunnerProvisionRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
 from .variables import mask_data, mask_text
@@ -34,6 +35,10 @@ from .variables import mask_data, mask_text
 
 HEARTBEAT_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$")
 APP_DISPLAY_NAME = "PulseGuard"
+RUNNER_HEALTH_MAX_CONCURRENCY = 4
+RUNNER_BROWSER_INSTALL_MAX_CONCURRENCY = 2
+
+logger = logging.getLogger(__name__)
 
 VALIDATION_FIELD_LABELS = {
     "name": "任务名称",
@@ -91,30 +96,69 @@ VALIDATION_FIELD_LABELS = {
 }
 
 
+def _track_background_task(app: FastAPI, awaitable: Any) -> asyncio.Task[Any]:
+    task = asyncio.create_task(awaitable)
+    tasks = getattr(app.state, "background_tasks", None)
+    if tasks is None:
+        tasks = set()
+        app.state.background_tasks = tasks
+    tasks.add(task)
+    task.add_done_callback(lambda completed: _finish_background_task(tasks, completed))
+    return task
+
+
+def _finish_background_task(tasks: set[asyncio.Task[Any]], task: asyncio.Task[Any]) -> None:
+    tasks.discard(task)
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error is not None:
+        logger.error(
+            "Background task %s failed: %s",
+            task.get_name(),
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
+async def _cancel_background_tasks(tasks: set[asyncio.Task[Any]]) -> None:
+    pending = [task for task in tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    tasks.clear()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     storage.init_db()
     runner = CheckRunner()
     app.state.runner = runner
     await runner.start()
-    asyncio.create_task(_sync_enabled_browser_type_installation(storage.get_settings()))
+    background_tasks: set[asyncio.Task[Any]] = set()
+    app.state.background_tasks = background_tasks
     scheduler = None
-    health_poll_task = None
-    if NODE_ROLE != "worker":
-        scheduler = PulseScheduler(runner)
-        app.state.scheduler = scheduler
-        scheduler.start()
-        health_poll_task = asyncio.create_task(_runner_health_poll_loop())
-    else:
-        app.state.scheduler = None
-        _log_worker_startup_info()
-    yield
-    if health_poll_task is not None:
-        health_poll_task.cancel()
-        await asyncio.gather(health_poll_task, return_exceptions=True)
-    if scheduler is not None:
-        scheduler.shutdown()
-    await runner.shutdown(record_cancelled=not storage.is_deployment_window_active())
+    try:
+        _track_background_task(app, _sync_enabled_browser_type_installation(storage.get_settings()))
+        if NODE_ROLE != "worker":
+            scheduler = PulseScheduler(runner)
+            app.state.scheduler = scheduler
+            scheduler.start()
+            _track_background_task(app, _runner_health_poll_loop())
+        else:
+            app.state.scheduler = None
+            _log_worker_startup_info()
+        yield
+    finally:
+        await _cancel_background_tasks(background_tasks)
+        await shutdown_browser_installation()
+        if scheduler is not None:
+            scheduler.shutdown()
+        await runner.shutdown(record_cancelled=not storage.is_deployment_window_active())
 
 
 ensure_runtime_dirs()
@@ -1226,7 +1270,7 @@ async def update_settings(payload: SettingsUpdate, request: Request) -> dict[str
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await request.app.state.runner.reload_settings()
     if "enabled_browser_types" in payload.values:
-        asyncio.create_task(_sync_enabled_browser_type_installation(settings))
+        _track_background_task(request.app, _sync_enabled_browser_type_installation(settings))
     request.app.state.scheduler.refresh_all()
     storage.record_audit_event("updated", "settings", summary="更新系统设置", payload={"fields": sorted(payload.values)})
     return storage.get_public_settings()
@@ -1782,31 +1826,130 @@ def _http_response_detail(response: httpx.Response) -> str:
     return text[:500] if text else "远程服务返回错误"
 
 
+async def _poll_runner_health(
+    runner: dict[str, Any],
+    health_semaphore: asyncio.Semaphore,
+    install_semaphore: asyncio.Semaphore,
+    install_tasks: dict[str, asyncio.Task[Any]],
+) -> None:
+    runner_id = str(runner.get("runner_id") or "")
+    if not runner_id:
+        return
+    try:
+        async with health_semaphore:
+            health = await _fetch_runner_health(runner)
+            storage.mark_probe_runner_available(runner_id, health)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        storage.mark_probe_runner_unavailable(runner_id)
+        return
+
+    try:
+        _schedule_runner_browser_install(runner, health, install_semaphore, install_tasks)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Unable to schedule browser installation for runner %s", runner_id)
+
+
+async def _poll_runner_health_round(
+    runners: list[dict[str, Any]],
+    health_semaphore: asyncio.Semaphore,
+    install_semaphore: asyncio.Semaphore,
+    install_tasks: dict[str, asyncio.Task[Any]],
+) -> None:
+    tasks = {
+        asyncio.create_task(
+            _poll_runner_health(runner, health_semaphore, install_semaphore, install_tasks),
+            name=f"pulseguard-runner-health-{runner.get('runner_id') or 'unknown'}",
+        )
+        for runner in runners
+        if str(runner.get("runner_id") or "")
+    }
+    try:
+        if tasks:
+            await asyncio.gather(*tasks)
+    finally:
+        await _cancel_background_tasks(tasks)
+
+
+def _schedule_runner_browser_install(
+    runner: dict[str, Any],
+    health: dict[str, Any],
+    semaphore: asyncio.Semaphore,
+    install_tasks: dict[str, asyncio.Task[Any]],
+) -> None:
+    missing = _missing_enabled_browser_types(health, storage.get_settings())
+    if not missing:
+        return
+    runner_id = str(runner.get("runner_id") or "")
+    if not runner_id:
+        return
+    existing = install_tasks.get(runner_id)
+    if existing is not None:
+        if not existing.done():
+            return
+        install_tasks.pop(runner_id, None)
+    task = asyncio.create_task(
+        _run_runner_browser_install(runner, health, semaphore),
+        name=f"pulseguard-runner-browser-install-{runner_id}",
+    )
+    install_tasks[runner_id] = task
+    task.add_done_callback(
+        lambda completed, runner_id=runner_id: _finish_runner_browser_install(install_tasks, runner_id, completed)
+    )
+
+
+async def _run_runner_browser_install(
+    runner: dict[str, Any], health: dict[str, Any], semaphore: asyncio.Semaphore
+) -> None:
+    runner_id = str(runner.get("runner_id") or "")
+    try:
+        async with semaphore:
+            await _install_missing_enabled_browser_types_on_runner(runner, health)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Browser installation failed for runner %s", runner_id)
+
+
+def _finish_runner_browser_install(
+    install_tasks: dict[str, asyncio.Task[Any]], runner_id: str, task: asyncio.Task[Any]
+) -> None:
+    if install_tasks.get(runner_id) is task:
+        install_tasks.pop(runner_id, None)
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error is not None:
+        logger.error("Unexpected browser installation task failure for runner %s: %s", runner_id, error)
+
+
 async def _runner_health_poll_loop() -> None:
-    while True:
-        try:
-            runners = [
-                runner
-                for runner in storage.list_enabled_probe_runners()
-                if str(runner.get("role") or "") == "child"
-            ]
-            for runner in runners:
-                runner_id = str(runner.get("runner_id") or "")
-                if not runner_id:
-                    continue
-                try:
-                    health = await _fetch_runner_health(runner)
-                    storage.mark_probe_runner_available(runner_id, health)
-                    await _install_missing_enabled_browser_types_on_runner(runner, health)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    storage.mark_probe_runner_unavailable(runner_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-        await asyncio.sleep(RUNNER_HEALTH_POLL_SECONDS)
+    health_semaphore = asyncio.Semaphore(RUNNER_HEALTH_MAX_CONCURRENCY)
+    install_semaphore = asyncio.Semaphore(RUNNER_BROWSER_INSTALL_MAX_CONCURRENCY)
+    install_tasks: dict[str, asyncio.Task[Any]] = {}
+    try:
+        while True:
+            try:
+                runners = [
+                    runner
+                    for runner in storage.list_enabled_probe_runners()
+                    if str(runner.get("role") or "") == "child"
+                ]
+                await _poll_runner_health_round(runners, health_semaphore, install_semaphore, install_tasks)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Runner health poll failed")
+            await asyncio.sleep(RUNNER_HEALTH_POLL_SECONDS)
+    finally:
+        await _cancel_background_tasks(set(install_tasks.values()))
+        install_tasks.clear()
 
 
 def _log_worker_startup_info() -> None:

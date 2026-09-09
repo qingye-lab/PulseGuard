@@ -237,6 +237,47 @@ class OverviewStorageTests(unittest.TestCase):
         self.assertEqual(trend_7d["ui"]["duration_p50_ms"], 220)
         self.assertEqual(trend_7d["ui"]["duration_p95_ms"], 620)
 
+    def test_overview_trends_use_one_seven_day_scan_and_preserve_project_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            clear_checks()
+            project_id = storage.default_project_id()
+            check = storage.create_check(api_check_data("Scoped trend API"), project_id=project_id)
+            other_project = storage.create_project("Other trend project")
+            other_check = storage.create_check(api_check_data("Other trend API"), project_id=other_project["id"])
+            now = datetime.now().astimezone().replace(microsecond=0)
+
+            insert_trend_run(int(check["id"]), "api", "ok", now - timedelta(days=7), 10)
+            insert_trend_run(int(check["id"]), "api", "ok", now - timedelta(hours=24), 20)
+            insert_trend_run(int(check["id"]), "api", "ok", now - timedelta(hours=1), 30)
+            insert_trend_run(int(check["id"]), "api", "failed", now - timedelta(hours=2), None)
+            insert_trend_run(int(check["id"]), "api", "ok", now - timedelta(days=7, seconds=1), 999)
+            insert_trend_run(int(other_check["id"]), "api", "ok", now - timedelta(hours=1), 1000)
+
+            statements: list[str] = []
+            with storage._connect(read_only=True) as conn:
+                conn.set_trace_callback(statements.append)
+                trends = storage._overview_trends(conn, now=now, project_id=project_id)
+                conn.set_trace_callback(None)
+
+        trend_queries = [statement for statement in statements if "FROM runs" in statement]
+        self.assertEqual(len(trend_queries), 1)
+        by_period = {item["key"]: item for item in trends}
+        recent = {item["check_type"]: item for item in by_period["24h"]["series"]}["api"]
+        weekly = {item["check_type"]: item for item in by_period["7d"]["series"]}["api"]
+        self.assertEqual(recent["runs"], 3)
+        self.assertEqual(recent["success_count"], 2)
+        self.assertEqual(recent["failure_count"], 1)
+        self.assertEqual(recent["duration_p50_ms"], 20)
+        self.assertEqual(recent["duration_p95_ms"], 30)
+        self.assertEqual(weekly["runs"], 4)
+        self.assertEqual(weekly["success_count"], 3)
+        self.assertEqual(weekly["failure_count"], 1)
+        self.assertEqual(weekly["duration_p50_ms"], 20)
+        self.assertEqual(weekly["duration_p95_ms"], 30)
+
     def test_overview_trends_return_empty_metrics_without_duration_samples(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
@@ -1357,11 +1398,13 @@ class RunnerStorageTests(unittest.TestCase):
 
         self.assertEqual(pending["connection_mode"], "relay")
         self.assertEqual(pending["status"], "pending_deployment")
+        self.assertIsNotNone(pending["deploy_command_expires_at"])
         self.assertFalse(storage.can_schedule_runner(pending))
         self.assertIsNotNone(verified)
         self.assertEqual(connecting["status"], "connecting")
         self.assertFalse(storage.can_schedule_runner(connecting))
         self.assertEqual(healthy["status"], "available")
+        self.assertIsNone(healthy["deploy_command_expires_at"])
         self.assertTrue(storage.can_schedule_runner(healthy))
         self.assertEqual(healthy["address"], "http://pulseguard-relay:19001")
 
@@ -1420,21 +1463,6 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(runner["status"], "connecting")
         self.assertTrue(runner["was_available"])
         self.assertTrue(runner["relay_token_set"])
-
-    def test_relay_runner_health_success_clears_deploy_command_expiration(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
-            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
-        ):
-            storage.init_db()
-            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
-            runner_id = provisioned["runner_id"]
-            storage.mark_probe_runner_relay_connected(runner_id, token_version=int(provisioned["relay_token_version"]))
-            healthy = storage.mark_probe_runner_available(runner_id, {"status": "ok"})
-
-        self.assertIsNotNone(healthy)
-        assert healthy is not None
-        self.assertEqual(healthy["status"], "available")
-        self.assertIsNone(healthy["deploy_command_expires_at"])
 
     def test_relay_available_status_is_derived_from_fresh_heartbeat_and_health(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
