@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +15,7 @@ from .browser_types import BROWSER_TYPES, browser_type_status, normalize_browser
 _install_lock = asyncio.Lock()
 _install_tasks: dict[str, asyncio.Task[None]] = {}
 _install_status: dict[str, dict[str, Any]] = {}
+_PROCESS_TERMINATE_TIMEOUT_SECONDS = 5.0
 
 
 def installed_browser_types() -> list[str]:
@@ -119,9 +122,75 @@ async def ensure_browser_types_installed(browser_types: list[str]) -> dict[str, 
     return {"requested_browser_types": requested, "missing_browser_types": missing, "scheduled": missing}
 
 
-async def _install_one(browser_type: str) -> None:
-    async with _install_lock:
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+
+    pid = process.pid
+    if sys.platform == "win32":
+        await _taskkill_process_tree(pid)
+    elif os.name == "posix":
         try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    else:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
+
+    try:
+        await asyncio.wait_for(process.wait(), timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS)
+    except ProcessLookupError:
+        return
+    except asyncio.TimeoutError:
+        if sys.platform == "win32":
+            await _taskkill_process_tree(pid)
+        elif os.name == "posix":
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+        else:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            return
+
+
+async def _taskkill_process_tree(pid: int) -> None:
+    try:
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/PID",
+            str(pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        await asyncio.wait_for(killer.communicate(), timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS)
+    except (FileNotFoundError, ProcessLookupError, asyncio.TimeoutError):
+        return
+
+
+def _installer_process_kwargs() -> dict[str, Any]:
+    if sys.platform == "win32":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return {"creationflags": creationflags}
+    return {"start_new_session": True}
+
+
+async def _install_one(browser_type: str) -> None:
+    process: asyncio.subprocess.Process | None = None
+    try:
+        async with _install_lock:
             process = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-m",
@@ -130,6 +199,7 @@ async def _install_one(browser_type: str) -> None:
                 browser_type,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **_installer_process_kwargs(),
             )
             stdout, stderr = await process.communicate()
             output = "\n".join(
@@ -141,8 +211,30 @@ async def _install_one(browser_type: str) -> None:
                 _install_status[browser_type] = {"status": "installed", "message": output[-1000:], "updated_at": ""}
             else:
                 _install_status[browser_type] = {"status": "failed", "message": output[-1000:], "updated_at": ""}
-        except Exception as exc:
-            _install_status[browser_type] = {"status": "failed", "message": str(exc), "updated_at": ""}
+    except asyncio.CancelledError:
+        if process is not None:
+            await _terminate_process(process)
+        _install_status.pop(browser_type, None)
+        raise
+    except Exception as exc:
+        if process is not None:
+            await _terminate_process(process)
+        _install_status[browser_type] = {"status": "failed", "message": str(exc), "updated_at": ""}
+
+
+async def shutdown_browser_installation() -> None:
+    """Cancel and drain local browser installers before the application stops."""
+    tasks = list(_install_tasks.values())
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    for browser_type, task in list(_install_tasks.items()):
+        if task.cancelled() or _install_status.get(browser_type, {}).get("status") == "installing":
+            _install_status.pop(browser_type, None)
+    _install_tasks.clear()
 
 
 def _merge_install_status(status: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:

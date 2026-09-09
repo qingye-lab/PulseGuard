@@ -2907,19 +2907,6 @@ def _update_anomaly_cycle(
         )
 
 
-def get_status_transition(check_id: int, current_status: str) -> dict[str, Any]:
-    with _connect(read_only=True) as conn:
-        row = conn.execute("SELECT * FROM check_status WHERE check_id = ?", (check_id,)).fetchone()
-    previous = dict(row) if row else {}
-    return {
-        "previous_status": previous.get("current_status"),
-        "current_status": current_status,
-        "previous_consecutive_failures": previous.get("consecutive_failures", 0),
-        "consecutive_failures": previous.get("consecutive_failures", 0),
-        "last_notified_at": previous.get("last_notified_at"),
-    }
-
-
 def update_last_notified(check_id: int, notified_at: str | None = None) -> None:
     with _connect() as conn:
         conn.execute(
@@ -3682,51 +3669,86 @@ def _overview_trends(
     conn: sqlite3.Connection, now: datetime | None = None, project_id: int | None = None
 ) -> list[dict[str, Any]]:
     now = now or datetime.now().astimezone()
-    periods = [
-        ("24h", "近 24 小时", now - timedelta(hours=24)),
-        ("7d", "近 7 天", now - timedelta(days=7)),
-    ]
+    cutoff_24h = now - timedelta(hours=24)
+    cutoff_7d = now - timedelta(days=7)
+    cutoff_24h_text = cutoff_24h.isoformat(timespec="seconds")
+    cutoff_7d_text = cutoff_7d.isoformat(timespec="seconds")
+    now_text = now.isoformat(timespec="seconds")
     trend_types = [("ui", "UI"), ("api", "API")]
-    trends: list[dict[str, Any]] = []
     run_scope_sql, run_scope_params = _project_scope_sql(project_id)
-    for key, label, cutoff in periods:
-        rows = conn.execute(
-            f"""
-            SELECT check_type, status, duration_ms
-            FROM runs
-            WHERE check_id > 0
-              AND affects_health = 1
-              AND started_at >= ?
-              AND started_at <= ?
-              AND check_type IN ('ui', 'api')
-              AND status IN ('ok', 'failed', 'timeout')
-              AND (status = 'ok' OR failure_kind IS NULL OR failure_kind = 'target')
-              {run_scope_sql}
-            """,
-            (
-                cutoff.isoformat(timespec="seconds"),
-                now.isoformat(timespec="seconds"),
-                *run_scope_params,
-            ),
-        ).fetchall()
-        rows_by_type: dict[str, list[sqlite3.Row]] = {check_type: [] for check_type, _ in trend_types}
-        for row in rows:
-            rows_by_type[str(row["check_type"])].append(row)
-        trends.append(
-            {
-                "key": key,
-                "label": label,
-                "series": [
-                    {
-                        "check_type": check_type,
-                        "label": type_label,
-                        **_overview_trend_metrics(rows_by_type[check_type]),
-                    }
-                    for check_type, type_label in trend_types
-                ],
-            }
-        )
-    return trends
+    rows = conn.execute(
+        f"""
+        SELECT check_type, status, duration_ms,
+               CASE WHEN started_at >= ? THEN 1 ELSE 0 END AS in_24h
+        FROM runs
+        WHERE check_id > 0
+          AND affects_health = 1
+          AND started_at >= ?
+          AND started_at <= ?
+          AND check_type IN ('ui', 'api')
+          AND status IN ('ok', 'failed', 'timeout')
+          AND (status = 'ok' OR failure_kind IS NULL OR failure_kind = 'target')
+          {run_scope_sql}
+        """,
+        (cutoff_24h_text, cutoff_7d_text, now_text, *run_scope_params),
+    )
+    metrics_by_type: dict[str, dict[str, Any]] = {
+        check_type: {
+            "runs": 0,
+            "successes": 0,
+            "failures": 0,
+            "durations": [],
+            "recent_runs": 0,
+            "recent_successes": 0,
+            "recent_failures": 0,
+            "recent_durations": [],
+        }
+        for check_type, _ in trend_types
+    }
+    for row in rows:
+        metrics = metrics_by_type[row[0]]
+        status = row[1]
+        in_24h = row[3]
+        metrics["runs"] += 1
+        if status == "ok":
+            metrics["successes"] += 1
+            if row[2] is not None:
+                metrics["durations"].append(int(row[2]))
+        else:
+            metrics["failures"] += 1
+        if in_24h:
+            metrics["recent_runs"] += 1
+            if status == "ok":
+                metrics["recent_successes"] += 1
+                if row[2] is not None:
+                    metrics["recent_durations"].append(int(row[2]))
+            else:
+                metrics["recent_failures"] += 1
+
+    for metrics in metrics_by_type.values():
+        metrics["durations"].sort()
+        metrics["recent_durations"].sort()
+
+    return [
+        {
+            "key": key,
+            "label": label,
+            "series": [
+                {
+                    "check_type": check_type,
+                    "label": type_label,
+                    **_overview_trend_metrics(
+                        metrics_by_type[check_type]["recent_runs" if key == "24h" else "runs"],
+                        metrics_by_type[check_type]["recent_successes" if key == "24h" else "successes"],
+                        metrics_by_type[check_type]["recent_failures" if key == "24h" else "failures"],
+                        metrics_by_type[check_type]["recent_durations" if key == "24h" else "durations"],
+                    ),
+                }
+                for check_type, type_label in trend_types
+            ],
+        }
+        for key, label in (("24h", "近 24 小时"), ("7d", "近 7 天"))
+    ]
 
 
 def _project_scope_sql(project_id: int | None, column: str = "project_id") -> tuple[str, tuple[int, ...]]:
@@ -3735,11 +3757,9 @@ def _project_scope_sql(project_id: int | None, column: str = "project_id") -> tu
     return f" AND {column} = ?", (int(project_id),)
 
 
-def _overview_trend_metrics(rows: list[sqlite3.Row]) -> dict[str, Any]:
-    total = len(rows)
-    successes = sum(1 for row in rows if row["status"] == "ok")
-    failures = sum(1 for row in rows if row["status"] in {"failed", "timeout"})
-    durations = sorted(int(row["duration_ms"]) for row in rows if row["status"] == "ok" and row["duration_ms"] is not None)
+def _overview_trend_metrics(
+    total: int, successes: int, failures: int, durations: list[int]
+) -> dict[str, Any]:
     return {
         "runs": total,
         "success_count": successes,

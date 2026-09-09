@@ -20,7 +20,6 @@ import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import { api, ApiError } from "../api";
 import { useProject } from "../ProjectContext";
 import { UiInspectionFeedback } from "./UiInspectionFeedback";
-import { Button as UiButton } from "./ui/button";
 import type { CheckPayload, UiAssertion, UiAssertionType, UiElementCandidate, UiInspectResult, UiRuleInspectItem, UiRuleInspectResult, UiSelectorOption } from "../types";
 import { createUiAssertion, parseUiAssertions, serializeUiAssertions, UI_ASSERTION_LABELS } from "../uiAssertions";
 import { VIEWPORT_PRESETS } from "./ViewportModeControl";
@@ -657,16 +656,17 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                           .join(" ")}
                       >
                         <div className="ui-candidate-content">
-                          <UiButton
+                          <Button
+                            type="text"
+                            htmlType="button"
                             className="ui-candidate-main"
-                            variant="ghost"
                             onClick={() => selectCandidate(candidate, "candidate")}
                             aria-label={`选择候选元素 ${candidateDisplayName(candidate)}`}
                           >
                             <strong className="ui-candidate-name" title={candidateDisplayName(candidate)}>
                               {candidateDisplayName(candidate)}
                             </strong>
-                          </UiButton>
+                          </Button>
                           <Select
                             className="ui-candidate-selector"
                             size="small"

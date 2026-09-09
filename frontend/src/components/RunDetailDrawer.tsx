@@ -5,7 +5,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import type { Run } from "../types";
 import { checkListPath } from "../utils";
-import { RunDetailContent } from "./RunDetailContent";
+import { RunResultPanel } from "./RunResultPanel";
 
 interface Props {
   runId: number | null;
@@ -80,7 +80,7 @@ export function RunDetailDrawer({ runId, onClose, onRerun, returnTo }: Props) {
     >
       {loading && <Skeleton active paragraph={{ rows: 8 }} />}
       {error && <Alert type="error" title={error} showIcon />}
-      {!loading && !error && <RunDetailContent run={run} />}
+      {!loading && !error && <RunResultPanel run={run} mode="detail" />}
     </Drawer>
   );
 }

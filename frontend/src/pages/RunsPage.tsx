@@ -109,7 +109,6 @@ export function RunsPage() {
   const checkId = searchParams.get("check_id");
   const normalizedQ = q.trim();
   const hasFilters = Boolean(type || status || notificationStatus || runnerId || normalizedQ || dateRange?.[0] || dateRange?.[1] || checkId);
-  const scopedCheckName = checkId ? runs.find((run) => String(run.check_id) === checkId)?.check_name : null;
 
   async function load() {
     setLoading(true);

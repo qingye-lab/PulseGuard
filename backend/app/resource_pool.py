@@ -471,16 +471,6 @@ async def _close_http_clients(clients: list[httpx.AsyncClient]) -> None:
         await client.aclose()
 
 
-def settings_from_config(config: BrowserLaunchConfig | None) -> dict[str, Any]:
-    if config is None:
-        return {}
-    return {
-        "browser_type": config.browser_type,
-        "browser_headless": config.headless,
-        "browser_proxy": config.proxy_url,
-    }
-
-
 def default_context_options_from_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return browser_context_options("web", browser_viewport(settings))
 

@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 import { api } from "../api";
 import { RunnerExecutionTag, failureKindTag } from "./shared/businessTags";
 import type { Run, RunCheckRequestInfo, RunComparison, RunComparisonAssertion, RunComparisonField, RunFailureSummary } from "../types";
-import { artifactHref, formatDate, formatDuration, parseSnapshot, runnerExecutionMeta, runnerSummary, runStatusLabel, runStatusTagColor } from "../utils";
+import { artifactHref, formatDate, formatDuration, parseSnapshot, runnerSummary, runStatusLabel, runStatusTagColor } from "../utils";
 import { StructuredViewer } from "./StructuredViewer";
 
 type RunResultMode = "detail" | "debug";

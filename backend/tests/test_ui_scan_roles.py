@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 
 from playwright.async_api import async_playwright
@@ -11,16 +12,17 @@ from backend.app.ui_assertions import _wait_for_selector_collection
 class UiScanRoleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.playwright = await async_playwright().start()
+        self.addAsyncCleanup(self.playwright.stop)
         try:
             self.browser = await self.playwright.chromium.launch()
         except Exception as exc:
-            await self.playwright.stop()
-            self.skipTest(f"Chromium unavailable: {exc}")
+            missing_browser = "Executable doesn't exist" in str(exc)
+            required = os.getenv("PULSEGUARD_REQUIRE_BROWSER_TESTS") == "1"
+            if missing_browser and not required:
+                self.skipTest("Chromium missing; run: uv run python -m playwright install chromium")
+            raise
+        self.addAsyncCleanup(self.browser.close)
         self.page = await self.browser.new_page()
-
-    async def asyncTearDown(self) -> None:
-        await self.browser.close()
-        await self.playwright.stop()
 
     async def fixture(self, count: int, module: bool = True, suffix: str = "abc") -> None:
         def cls(role: str) -> str:

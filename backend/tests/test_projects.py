@@ -25,72 +25,68 @@ class FakeScheduler:
 
 
 class ProjectStorageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.db_patch = patch.object(storage, "DB_PATH", Path(self.temp_dir.name) / "pulseguard.db")
+        self.db_patch.start()
+        self.addCleanup(self.db_patch.stop)
+        self.addCleanup(self.temp_dir.cleanup)
+        storage.init_db()
+
     def test_project_lifecycle_preserves_one_active_project_and_allows_only_empty_delete(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
-            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
-        ):
-            storage.init_db()
-            default_id = storage.default_project_id()
-            second = storage.create_project("  Payments  ")
+        default_id = storage.default_project_id()
+        second = storage.create_project("  Payments  ")
 
-            self.assertEqual(second["name"], "Payments")
-            with self.assertRaisesRegex(ValueError, "项目名称已存在"):
-                storage.create_project("payments")
+        self.assertEqual(second["name"], "Payments")
+        with self.assertRaisesRegex(ValueError, "项目名称已存在"):
+            storage.create_project("payments")
 
-            archived = storage.archive_project(int(second["id"]))
-            self.assertEqual(archived["status"], "archived")
-            with self.assertRaisesRegex(ValueError, "至少需要保留一个活跃项目"):
-                storage.archive_project(default_id)
+        archived = storage.archive_project(int(second["id"]))
+        self.assertEqual(archived["status"], "archived")
+        with self.assertRaisesRegex(ValueError, "至少需要保留一个活跃项目"):
+            storage.archive_project(default_id)
 
-            restored = storage.restore_project(int(second["id"]))
-            self.assertEqual(restored["status"], "active")
-            self.assertTrue(storage.delete_empty_project(int(second["id"])))
+        restored = storage.restore_project(int(second["id"]))
+        self.assertEqual(restored["status"], "active")
+        self.assertTrue(storage.delete_empty_project(int(second["id"])))
 
-            nonempty = storage.create_project("Nonempty")
-            storage.create_check(api_check_payload("Owned"), project_id=int(nonempty["id"]))
-            with self.assertRaisesRegex(ValueError, "空项目"):
-                storage.delete_empty_project(int(nonempty["id"]))
+        nonempty = storage.create_project("Nonempty")
+        storage.create_check(api_check_payload("Owned"), project_id=int(nonempty["id"]))
+        with self.assertRaisesRegex(ValueError, "空项目"):
+            storage.delete_empty_project(int(nonempty["id"]))
 
     def test_checks_runs_and_scheduler_queries_are_project_scoped(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
-            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
-        ):
-            storage.init_db()
-            first_id = storage.default_project_id()
-            second_id = int(storage.create_project("Second")["id"])
-            first = storage.create_check(api_check_payload("Same name"), project_id=first_id)
-            second = storage.create_check(api_check_payload("Same name"), project_id=second_id)
-            first_run = storage.create_run(first)
-            second_run = storage.create_run(second)
+        first_id = storage.default_project_id()
+        second_id = int(storage.create_project("Second")["id"])
+        first = storage.create_check(api_check_payload("Same name"), project_id=first_id)
+        second = storage.create_check(api_check_payload("Same name"), project_id=second_id)
+        first_run = storage.create_run(first)
+        second_run = storage.create_run(second)
 
-            self.assertIsNone(storage.get_check(int(first["id"]), project_id=second_id))
-            self.assertIsNone(storage.get_run(int(first_run["id"]), project_id=second_id))
-            self.assertEqual(
-                [run["id"] for run in storage.list_runs({"project_id": second_id})],
-                [second_run["id"]],
-            )
+        self.assertIsNone(storage.get_check(int(first["id"]), project_id=second_id))
+        self.assertIsNone(storage.get_run(int(first_run["id"]), project_id=second_id))
+        self.assertEqual(
+            [run["id"] for run in storage.list_runs({"project_id": second_id})],
+            [second_run["id"]],
+        )
 
-            storage.archive_project(second_id)
-            active_checks = storage.list_checks(enabled_only=True, active_projects_only=True)
-            self.assertNotIn(int(second["id"]), [int(check["id"]) for check in active_checks])
-            self.assertIn(int(first["id"]), [int(check["id"]) for check in active_checks])
+        storage.archive_project(second_id)
+        active_checks = storage.list_checks(enabled_only=True, active_projects_only=True)
+        self.assertNotIn(int(second["id"]), [int(check["id"]) for check in active_checks])
+        self.assertIn(int(first["id"]), [int(check["id"]) for check in active_checks])
 
     def test_empty_project_with_read_only_token_cannot_be_deleted(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
-            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
-        ):
-            storage.init_db()
-            project = storage.create_project("Token scoped")
-            project_id = int(project["id"])
-            token = storage.create_read_only_token("Token scoped", [project_id])
+        project = storage.create_project("Token scoped")
+        project_id = int(project["id"])
+        token = storage.create_read_only_token("Token scoped", [project_id])
 
-            with self.assertRaisesRegex(ValueError, "只读令牌"):
-                storage.delete_empty_project(project_id)
+        with self.assertRaisesRegex(ValueError, "只读令牌"):
+            storage.delete_empty_project(project_id)
 
-            self.assertIsNotNone(storage.get_project(project_id))
-            self.assertTrue(storage.validate_read_only_token(str(token["token"]), project_id))
-            storage.delete_read_only_token(str(token["id"]))
-            self.assertTrue(storage.delete_empty_project(project_id))
+        self.assertIsNotNone(storage.get_project(project_id))
+        self.assertTrue(storage.validate_read_only_token(str(token["token"]), project_id))
+        storage.delete_read_only_token(str(token["id"]))
+        self.assertTrue(storage.delete_empty_project(project_id))
 
 
 class ProjectApiBoundaryTests(unittest.TestCase):

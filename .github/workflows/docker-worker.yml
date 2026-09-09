@@ -1,6 +1,7 @@
 name: Docker Worker Image
 
 on:
+  pull_request:
   push:
     branches:
       - main
@@ -13,11 +14,6 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    env:
-      PULSEGUARD_DB_PATH: ${{ runner.temp }}/pulseguard-test/pulseguard.db
-      PULSEGUARD_DATA_DIR: ${{ runner.temp }}/pulseguard-test/data
-      PULSEGUARD_REPORTS_DIR: ${{ runner.temp }}/pulseguard-test/reports
-      PULSEGUARD_BACKUPS_DIR: ${{ runner.temp }}/pulseguard-test/backups
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,11 +32,8 @@ jobs:
       - name: Sync locked backend dependencies
         run: uv sync --frozen --no-dev --no-install-project
 
-      - name: Initialize isolated test database
-        run: uv run python -c "from backend.app import storage; storage.init_db()"
-
-      - name: Run backend tests
-        run: uv run python -m unittest discover -s backend/tests -p 'test_*.py' -v
+      - name: Install test browser
+        run: uv run --frozen python -m playwright install --with-deps chromium
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -53,12 +46,20 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Build frontend
-        working-directory: frontend
-        run: npm run build
+      - name: Verify backend, frontend and browser workflow
+        run: uv run --frozen python scripts/verify.py full
+
+      - name: Upload verification logs and browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification
+          path: ${{ runner.temp }}/pulseguard-verify-*
+          if-no-files-found: ignore
 
   build-worker:
     needs: verify
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read

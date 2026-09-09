@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hmac
 import json
@@ -34,7 +35,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         with patch.object(notifier.storage, "get_settings", return_value=settings), patch.object(
             notifier.storage, "update_run_notification"
         ) as update_run_notification:
-            self.run_async(notifier.maybe_notify({"id": 1, "type": "api", "name": "接口"}, run, transition))
+            asyncio.run(notifier.maybe_notify({"id": 1, "type": "api", "name": "接口"}, run, transition))
 
         update_run_notification.assert_called_once_with(42, "disabled", channel=None, error=None, sent_at=None)
 
@@ -57,7 +58,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         with patch.object(notifier.storage, "get_settings", return_value=settings), patch.object(
             notifier.storage, "update_run_notification"
         ) as update_run_notification:
-            self.run_async(notifier.maybe_notify({"id": 1, "type": "api", "name": "接口"}, run, transition))
+            asyncio.run(notifier.maybe_notify({"id": 1, "type": "api", "name": "接口"}, run, transition))
 
         update_run_notification.assert_called_once_with(43, "not_required", channel=None, error=None, sent_at=None)
 
@@ -104,7 +105,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:00:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ) as update_run_notification, patch.object(notifier.storage, "update_last_notified") as update_last_notified:
-            self.run_async(
+            asyncio.run(
                 notifier.maybe_notify({"id": 11, "project_id": 7, "type": "api", "name": "接口"}, run, transition)
             )
 
@@ -153,7 +154,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:00:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ), patch.object(notifier.storage, "update_last_notified"):
-            self.run_async(notifier.maybe_notify({"id": 11, "project_id": 7, "type": "api", "name": "接口"}, run, transition))
+            asyncio.run(notifier.maybe_notify({"id": 11, "project_id": 7, "type": "api", "name": "接口"}, run, transition))
 
         get_project_alert_settings.assert_called_once_with(7)
         send_webhook_alert.assert_awaited_once()
@@ -171,7 +172,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         }
 
         with patch.object(notifier, "send_webhook_alert", new_callable=AsyncMock) as send_webhook_alert:
-            result = self.run_async(
+            result = asyncio.run(
                 notifier.notify_system_error(
                     {
                         "source": "runner",
@@ -202,7 +203,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         }
 
         with patch.object(notifier, "send_webhook_alert", new_callable=AsyncMock) as send_webhook_alert:
-            result = self.run_async(
+            result = asyncio.run(
                 notifier.notify_system_error(
                     {
                         "source": "runner",
@@ -247,7 +248,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:05:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ) as update_run_notification, patch.object(notifier.storage, "update_last_notified") as update_last_notified:
-            self.run_async(notifier.maybe_notify({"id": 11, "type": "ui", "name": "商品详情"}, run, transition))
+            asyncio.run(notifier.maybe_notify({"id": 11, "type": "ui", "name": "商品详情"}, run, transition))
 
         send_webhook_alert.assert_not_awaited()
         update_last_notified.assert_not_called()
@@ -282,7 +283,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:06:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ) as update_run_notification, patch.object(notifier.storage, "update_last_notified") as update_last_notified:
-            self.run_async(notifier.maybe_notify({"id": 11, "type": "ui", "name": "商品详情"}, run, transition))
+            asyncio.run(notifier.maybe_notify({"id": 11, "type": "ui", "name": "商品详情"}, run, transition))
 
         send_webhook_alert.assert_not_awaited()
         update_last_notified.assert_not_called()
@@ -319,7 +320,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "update_run_notification") as update_run_notification, patch.object(
             notifier.storage, "update_last_notified"
         ) as update_last_notified:
-            self.run_async(notifier.maybe_notify({"id": 11, "type": "ui", "name": "商品详情"}, run, transition))
+            asyncio.run(notifier.maybe_notify({"id": 11, "type": "ui", "name": "商品详情"}, run, transition))
 
         send_webhook_alert.assert_not_awaited()
         update_last_notified.assert_not_called()
@@ -377,7 +378,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:20:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ) as update_run_notification, patch.object(notifier.storage, "update_last_notified") as update_last_notified:
-            self.run_async(notifier.maybe_notify(check, run, transition))
+            asyncio.run(notifier.maybe_notify(check, run, transition))
 
         send_webhook_alert.assert_awaited_once()
         channel = send_webhook_alert.await_args.args[0]
@@ -424,7 +425,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "update_run_notification") as update_run_notification, patch.object(
             notifier.storage, "update_last_notified"
         ) as update_last_notified:
-            self.run_async(notifier.maybe_notify(check, run, transition))
+            asyncio.run(notifier.maybe_notify(check, run, transition))
 
         send_webhook_alert.assert_not_awaited()
         update_last_notified.assert_not_called()
@@ -477,7 +478,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:22:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ) as update_run_notification, patch.object(notifier.storage, "update_last_notified") as update_last_notified:
-            self.run_async(notifier.maybe_notify(check, run, transition))
+            asyncio.run(notifier.maybe_notify(check, run, transition))
 
         send_webhook_alert.assert_awaited_once()
         self.assertEqual(send_webhook_alert.await_args.args[0]["id"], "tag")
@@ -522,7 +523,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "update_run_notification") as update_run_notification, patch.object(
             notifier.storage, "update_last_notified"
         ) as update_last_notified:
-            self.run_async(notifier.maybe_notify(check, run, transition))
+            asyncio.run(notifier.maybe_notify(check, run, transition))
 
         send_webhook_alert.assert_not_awaited()
         update_last_notified.assert_not_called()
@@ -589,7 +590,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:24:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ) as update_run_notification, patch.object(notifier.storage, "update_last_notified") as update_last_notified:
-            self.run_async(notifier.maybe_notify(check, run, transition))
+            asyncio.run(notifier.maybe_notify(check, run, transition))
 
         send_webhook_alert.assert_awaited_once()
         self.assertEqual(send_webhook_alert.await_args.args[0]["id"], "task")
@@ -646,7 +647,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:25:01+08:00"), patch.object(
             notifier.storage, "update_run_notification"
         ), patch.object(notifier.storage, "update_last_notified"):
-            self.run_async(notifier.maybe_notify(check, run, transition))
+            asyncio.run(notifier.maybe_notify(check, run, transition))
 
         channels = {call.args[0]["id"]: call.args[0] for call in send_webhook_alert.await_args_list}
         self.assertEqual(channels["fei"]["mentions"], [{"name": "Alice", "user_id": "ou_alice"}])
@@ -791,7 +792,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         ), patch.object(notifier.storage, "update_run_notification") as update_run_notification, patch.object(
             notifier.storage, "update_last_notified"
         ) as update_last_notified:
-            self.run_async(notifier.maybe_notify({"id": 11, "type": "api", "name": "API"}, run, transition))
+            asyncio.run(notifier.maybe_notify({"id": 11, "type": "api", "name": "API"}, run, transition))
 
         update_last_notified.assert_not_called()
         update_run_notification.assert_called_once()
@@ -835,12 +836,6 @@ class DingtalkNotifierTests(unittest.TestCase):
         error = notifier._robot_error("feishu", response)
 
         self.assertEqual(error, "飞书返回 999：token expired")
-
-    @staticmethod
-    def run_async(awaitable):
-        import asyncio
-
-        return asyncio.run(awaitable)
 
 
 def variable_settings(token: str, secret: str) -> dict[str, object]:

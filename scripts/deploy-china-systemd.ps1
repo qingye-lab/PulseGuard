@@ -96,7 +96,7 @@ try {
     Push-Location $repoRoot
     try {
         if (-not $SkipTests) {
-            Invoke-Native -File "uv" -Arguments @("run", "python", "-m", "unittest", "discover", "-s", "backend/tests", "-p", "test_*.py", "-v")
+            Invoke-Native -File "uv" -Arguments @("run", "--frozen", "python", "scripts/test_backend.py", "--require-browser")
         }
         if (-not $SkipFrontendBuild) {
             Push-Location "frontend"
