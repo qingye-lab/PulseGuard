@@ -40,12 +40,49 @@ from .config import (
 )
 from .defaults import DEFAULT_PROJECT_ALERT_SETTINGS, DEFAULT_SETTINGS, DEMO_CHECKS
 from .monitoring import HEALTH_STATES, next_health_state, run_metadata
+from .script_library import (
+    ModuleLibraryError,
+    build_bundle,
+    modules_for_api,
+    normalize_modules,
+    referenced_module_names,
+    scan_check_references,
+    source_hash,
+    static_reference_diagnostics,
+)
 from .schemas import normalize_project_alert_settings_values, normalize_settings_values
 from .variables import is_sensitive_variable_name
 
 
 class DatabaseRestoreRecoveryError(RuntimeError):
     """Restore and its safety-backup recovery both failed; execution must stay paused."""
+
+
+class LibraryRevisionConflict(ValueError):
+    """The caller attempted to edit a stale library draft."""
+
+    def __init__(self, expected: int, actual: int) -> None:
+        self.expected = int(expected)
+        self.actual = int(actual)
+        super().__init__(f"项目公共方法草稿已更新，请刷新后重试（当前修订号：{self.actual}）")
+
+
+class LibraryValidationConflict(ValueError):
+    """A validation result no longer describes the current candidate state."""
+
+
+class LibraryStaticReferenceConflict(ModuleLibraryError):
+    """The saved module set would break an existing project task reference."""
+
+    def __init__(self, diagnostics: list[dict[str, Any]]) -> None:
+        self.diagnostics = [dict(item) for item in diagnostics]
+        first = self.diagnostics[0] if self.diagnostics else {}
+        message = str(
+            first.get("error")
+            or first.get("message")
+            or "公共方法保存会破坏现有任务引用"
+        )
+        super().__init__(message)
 
 
 class _DatabaseAccess:
@@ -189,6 +226,7 @@ TREND_PERIOD_SECONDS = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 TREND_DISPLAY_BUCKET_SECONDS = (300, 900, 1800, 3600, 7200, 14400, 21600, 43200, 86400, 172800, 604800, 1209600, 2592000)
 TREND_SUMMARY_CHECK_IDS = {"ui": -1, "api": -2}
 PROJECT_SCHEMA_VERSION = 2
+SCRIPT_LIBRARY_SCHEMA_VERSION = 3
 DEFAULT_PROJECT_NAME = "默认项目"
 PROJECT_SCOPED_TABLES = (
     "checks",
@@ -198,10 +236,38 @@ PROJECT_SCOPED_TABLES = (
     "run_archives",
     "anomaly_cycles",
 )
+# The project migration predates the script-library tables.  Keep the legacy
+# tuple stable because it is also the migration contract, while using the
+# complete set for lifecycle operations on an initialized database.
+LIBRARY_PROJECT_TABLES = (
+    "script_library_drafts",
+    "script_library_versions",
+    "script_library_published",
+    "script_library_validations",
+    "script_library_validation_checks",
+    "script_library_validation_meta",
+)
+ALL_PROJECT_SCOPED_TABLES = (*PROJECT_SCOPED_TABLES, *LIBRARY_PROJECT_TABLES)
 
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _next_edit_timestamp(conn: sqlite3.Connection, table: str, column: str = "updated_at") -> str:
+    """Return a persisted edit marker that cannot repeat a prior row value."""
+
+    candidate = datetime.now().astimezone()
+    row = conn.execute(f"SELECT MAX({column}) FROM {table}").fetchone()
+    previous_value = row[0] if row else None
+    if previous_value:
+        try:
+            previous = datetime.fromisoformat(str(previous_value))
+        except ValueError:
+            previous = None
+        if previous is not None and candidate <= previous:
+            candidate = previous + timedelta(microseconds=1)
+    return candidate.isoformat(timespec="microseconds")
 
 
 def _legacy_project_schema_detected() -> bool:
@@ -572,6 +638,73 @@ def _init_db() -> None:
             CREATE TABLE IF NOT EXISTS project_variables (
                 project_id INTEGER PRIMARY KEY,
                 variables_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS script_library_drafts (
+                project_id INTEGER PRIMARY KEY,
+                revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                modules_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS script_library_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision >= 0),
+                release_hash TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                modules_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(project_id, revision),
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS script_library_published (
+                project_id INTEGER PRIMARY KEY,
+                version_id INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(version_id) REFERENCES script_library_versions(id) ON DELETE RESTRICT
+            );
+
+            CREATE TABLE IF NOT EXISTS script_library_validations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                candidate_revision INTEGER NOT NULL CHECK(candidate_revision >= 0),
+                candidate_release_hash TEXT NOT NULL,
+                candidate_content_hash TEXT NOT NULL,
+                candidate_modules_json TEXT NOT NULL,
+                dependency_fingerprint_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+                include_disabled INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                diagnostics_json TEXT NOT NULL DEFAULT '[]',
+                started_at TEXT,
+                finished_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS script_library_validation_checks (
+                validation_id INTEGER NOT NULL,
+                project_id INTEGER NOT NULL,
+                check_id INTEGER NOT NULL,
+                check_json TEXT NOT NULL,
+                PRIMARY KEY(validation_id, check_id),
+                FOREIGN KEY(validation_id) REFERENCES script_library_validations(id) ON DELETE CASCADE,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS script_library_validation_meta (
+                validation_id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                changed_modules_json TEXT NOT NULL DEFAULT '[]',
+                FOREIGN KEY(validation_id) REFERENCES script_library_validations(id) ON DELETE CASCADE,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
 
@@ -801,6 +934,11 @@ def _init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_checks_type ON checks(type);
             CREATE INDEX IF NOT EXISTS idx_checks_project_type ON checks(project_id, type);
+            CREATE INDEX IF NOT EXISTS idx_script_library_versions_project_created ON script_library_versions(project_id, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_script_library_validations_project_created ON script_library_validations(project_id, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_script_library_validations_project_status ON script_library_validations(project_id, status, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_script_library_validation_checks_project ON script_library_validation_checks(project_id, validation_id);
+            CREATE INDEX IF NOT EXISTS idx_script_library_validation_meta_project ON script_library_validation_meta(project_id, validation_id);
             CREATE INDEX IF NOT EXISTS idx_runs_check_id ON runs(check_id);
             CREATE INDEX IF NOT EXISTS idx_runs_project_started ON runs(project_id, started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
@@ -821,6 +959,7 @@ def _init_db() -> None:
         _ensure_trend_rollup_columns(conn)
         _ensure_check_status_columns(conn)
         _ensure_probe_runner_columns(conn)
+        _ensure_project_variables_columns(conn)
         _create_project_indexes(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_probe_runners_relay_port ON probe_runners(allocated_internal_port)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_observation ON runs(affects_health, started_at DESC)")
@@ -830,10 +969,15 @@ def _init_db() -> None:
             "INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (?, ?)",
             (PROJECT_SCHEMA_VERSION, now_iso()),
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (?, ?)",
+            (SCRIPT_LIBRARY_SCHEMA_VERSION, now_iso()),
+        )
         _ensure_default_settings(conn)
         _migrate_read_only_tokens(conn)
         _ensure_local_probe_runner(conn)
         _mark_interrupted_runs(conn)
+        _mark_interrupted_library_validations(conn)
         _seed_demo_checks(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_health_started_check ON runs(affects_health, started_at DESC, check_id)")
         conn.execute(
@@ -961,7 +1105,7 @@ def delete_empty_project(project_id: int) -> bool:
         active_count = int(conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'active'").fetchone()[0])
         if project["status"] == "active" and active_count <= 1:
             raise ValueError("至少需要保留一个活跃项目")
-        for table in PROJECT_SCOPED_TABLES:
+        for table in ALL_PROJECT_SCOPED_TABLES:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is None:
                 continue
             if conn.execute(f"SELECT 1 FROM {table} WHERE project_id = ? LIMIT 1", (int(project_id),)).fetchone():
@@ -977,6 +1121,1122 @@ def delete_empty_project(project_id: int) -> bool:
         conn.execute("DELETE FROM project_alert_settings WHERE project_id = ?", (int(project_id),))
         cursor = conn.execute("DELETE FROM projects WHERE id = ?", (int(project_id),))
         return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Project script library
+
+
+def _library_json(value: Any, default: Any) -> Any:
+    try:
+        parsed = json.loads(str(value or ""))
+    except (TypeError, json.JSONDecodeError):
+        return default
+    return parsed
+
+
+def _library_modules_from_row(row: sqlite3.Row | dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not row:
+        return []
+    raw = row["modules_json"] if isinstance(row, sqlite3.Row) else row.get("modules_json")
+    try:
+        return normalize_modules(_library_json(raw, []))
+    except ModuleLibraryError:
+        # Rows are written only through normalize_modules.  If an interrupted
+        # migration left an invalid row, expose it as an empty candidate and
+        # let validation report the repairable storage error instead of making
+        # every project read fail.
+        return []
+
+
+def _library_module_api(modules: Any) -> list[dict[str, Any]]:
+    return modules_for_api(modules)
+
+
+def _library_version_payload(row: sqlite3.Row | dict[str, Any], *, include_modules: bool = True) -> dict[str, Any]:
+    data = dict(row)
+    modules = _library_modules_from_row(row)
+    bundle = build_bundle(
+        int(data["project_id"]),
+        int(data["id"]),
+        modules,
+        release_hash=str(data.get("release_hash") or ""),
+    )
+    result = {
+        "version_id": int(data["id"]),
+        "revision": int(data.get("revision") or 0),
+        "release_id": int(data["id"]),
+        "release_hash": str(data.get("release_hash") or bundle.get("release_hash") or ""),
+        "content_hash": str(data.get("content_hash") or bundle.get("content_hash") or ""),
+        "published_at": data.get("created_at"),
+    }
+    if include_modules:
+        # Version/detail responses are public UI payloads.  Keep export
+        # metadata there; the canonical runtime bundle is returned only by
+        # get_published_library/get_library_candidate_bundle.
+        result["modules"] = _library_module_api(modules)
+    return result
+
+
+def _library_references_for_checks(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    tasks: list[dict[str, Any]] = []
+    for check in checks:
+        names: list[str] = []
+        seen: set[str] = set()
+        locations: list[dict[str, Any]] = []
+        for ref in scan_check_references(check):
+            name = str(ref.get("name") or "")
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+            if ref.get("error") or name:
+                locations.append(dict(ref))
+        if names or locations:
+            tasks.append(
+                {
+                    "check_id": int(check["id"]),
+                    "check_name": str(check.get("name") or ""),
+                    "enabled": bool(check.get("enabled")),
+                    "modules": names,
+                    "references": locations,
+                }
+            )
+    return {"count": len(tasks), "tasks": tasks}
+
+
+def _library_checks_readonly(project_id: int) -> list[dict[str, Any]]:
+    with _connect(read_only=True) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, project_id, name, enabled, type, interval_seconds, timeout_ms,
+                   entry_url, viewport_mode, method, headers_json, body, assertions_json,
+                   setup_script, script, tags, alert_policy_json, runner_selection_mode,
+                   runner_ids_json, browser_selection_mode, browser_types_json
+            FROM checks WHERE project_id = ? ORDER BY id
+            """,
+            (int(project_id),),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["enabled"] = bool(item.get("enabled"))
+        item["runner_ids"] = _normalize_runner_ids(item.get("runner_ids_json"))
+        item["browser_types"] = normalize_browser_types(item.get("browser_types_json"), default=[], allow_empty=True)
+        item.pop("runner_ids_json", None)
+        item.pop("browser_types_json", None)
+        result.append(item)
+    return result
+
+
+def _get_library_rows(project_id: int) -> tuple[sqlite3.Row | None, sqlite3.Row | None, list[dict[str, Any]]]:
+    with _connect(read_only=True) as conn:
+        project = conn.execute("SELECT id FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+        if not project:
+            raise ValueError("项目不存在")
+        draft = conn.execute("SELECT * FROM script_library_drafts WHERE project_id = ?", (int(project_id),)).fetchone()
+        published = conn.execute(
+            """
+            SELECT v.* FROM script_library_published p
+            JOIN script_library_versions v ON v.id = p.version_id
+            WHERE p.project_id = ?
+            """,
+            (int(project_id),),
+        ).fetchone()
+    return draft, published, _library_checks_readonly(project_id)
+
+
+def get_project_library(project_id: int) -> dict[str, Any]:
+    """Read the draft/published library without creating a placeholder row."""
+
+    draft, published, checks = _get_library_rows(project_id)
+    modules = _library_modules_from_row(draft)
+    revision = int(draft["revision"] or 0) if draft else 0
+    published_payload = _library_version_payload(published) if published else None
+    effective_modules = list(published_payload.get("modules") or []) if published_payload else []
+    with _connect(read_only=True) as conn:
+        latest_version = conn.execute(
+            "SELECT MAX(revision) AS revision FROM script_library_versions WHERE project_id = ?",
+            (int(project_id),),
+        ).fetchone()
+    latest_version_revision = int(latest_version["revision"] or 0) if latest_version else 0
+    effective_revision = max(revision, latest_version_revision)
+    references = _library_references_for_checks(checks)
+    return {
+        "project_id": int(project_id),
+        "draft_revision": revision,
+        "modules": _library_module_api(modules),
+        "published": published_payload,
+        # The simple save UI edits the effective pointer.  Keep the legacy
+        # draft fields above for existing import/migration consumers, while
+        # making it impossible for an old unsaved draft to appear as current.
+        "effective_revision": int(effective_revision),
+        "effective_modules": effective_modules,
+        "references": references,
+    }
+
+
+def get_project_library_references(project_id: int) -> dict[str, Any]:
+    _draft, _published, checks = _get_library_rows(project_id)
+    references = _library_references_for_checks(checks)
+    return {"project_id": int(project_id), **references}
+
+
+def _library_version_list_item(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    return _library_version_payload(row, include_modules=False)
+
+
+def list_project_library_versions(project_id: int, limit: int = 100) -> list[dict[str, Any]]:
+    with _connect(read_only=True) as conn:
+        if conn.execute("SELECT 1 FROM projects WHERE id = ?", (int(project_id),)).fetchone() is None:
+            raise ValueError("项目不存在")
+        rows = conn.execute(
+            "SELECT * FROM script_library_versions WHERE project_id = ? ORDER BY id DESC LIMIT ?",
+            (int(project_id), max(1, min(500, int(limit)))),
+        ).fetchall()
+    return [_library_version_list_item(row) for row in rows]
+
+
+def get_project_library_version(project_id: int, version_id: int) -> dict[str, Any] | None:
+    with _connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM script_library_versions WHERE id = ? AND project_id = ?",
+            (int(version_id), int(project_id)),
+        ).fetchone()
+    return _library_version_payload(row) if row else None
+
+
+def _library_draft_row(conn: sqlite3.Connection, project_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM script_library_drafts WHERE project_id = ?", (int(project_id),)).fetchone()
+
+
+def _library_published_row(conn: sqlite3.Connection, project_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT v.* FROM script_library_published p
+        JOIN script_library_versions v ON v.id = p.version_id
+        WHERE p.project_id = ?
+        """,
+        (int(project_id),),
+    ).fetchone()
+
+
+def _library_edit_revision(conn: sqlite3.Connection, project_id: int) -> int:
+    """Return the monotonic CAS token for the effective project library.
+
+    The draft row is retained as the edit marker for compatibility with the
+    original draft API.  A fallback to the largest immutable version keeps
+    databases imported before a draft row existed safe.  Rollback advances
+    the marker, so switching the published pointer back to an older version
+    cannot create an ABA window for a concurrent save.
+    """
+
+    draft = _library_draft_row(conn, project_id)
+    draft_revision = int(draft["revision"] or 0) if draft else 0
+    version = conn.execute(
+        "SELECT MAX(revision) AS revision FROM script_library_versions WHERE project_id = ?",
+        (int(project_id),),
+    ).fetchone()
+    version_revision = int(version["revision"] or 0) if version else 0
+    return max(draft_revision, version_revision)
+
+
+def update_project_library_draft(
+    project_id: int,
+    expected_revision: int,
+    modules: Any,
+) -> dict[str, Any]:
+    try:
+        normalized = normalize_modules(modules)
+    except ModuleLibraryError:
+        raise
+    timestamp = now_iso()
+    with write_transaction():
+        conn = _TRANSACTION.connection
+        assert conn is not None
+        project = conn.execute("SELECT status FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+        if not project or str(project["status"]) != "active":
+            raise ValueError("项目不存在或已归档")
+        current = _library_draft_row(conn, project_id)
+        actual = int(current["revision"] or 0) if current else 0
+        if int(expected_revision) != actual:
+            raise LibraryRevisionConflict(int(expected_revision), actual)
+        next_revision = actual + 1
+        encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            """
+            INSERT INTO script_library_drafts(project_id, revision, modules_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET revision = excluded.revision,
+                modules_json = excluded.modules_json, updated_at = excluded.updated_at
+            """,
+            (int(project_id), next_revision, encoded, timestamp),
+        )
+    return get_project_library(project_id)
+
+
+def save_project_library(
+    project_id: int,
+    expected_revision: int,
+    modules: Any,
+) -> dict[str, Any]:
+    """Atomically save the complete project library and make it effective.
+
+    The public save path deliberately does not run network validation.  It
+    performs the same runtime-owned source/export checks and static reference
+    checks as the legacy candidate path, then records an immutable version and
+    moves the published pointer in one SQLite transaction.  Existing draft,
+    validation, version and run-history rows remain available to old API
+    consumers and to run-result diagnostics.
+    """
+
+    normalized = normalize_modules(modules)
+    with write_transaction():
+        conn = _TRANSACTION.connection
+        assert conn is not None
+        project = conn.execute("SELECT status FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+        if not project or str(project["status"]) != "active":
+            raise ValueError("项目不存在或已归档")
+
+        actual_revision = _library_edit_revision(conn, project_id)
+        if int(expected_revision) != actual_revision:
+            raise LibraryRevisionConflict(int(expected_revision), actual_revision)
+
+        checks = _library_checks_readonly(project_id)
+        diagnostics = static_reference_diagnostics(checks, normalized)
+        if diagnostics:
+            raise LibraryStaticReferenceConflict(diagnostics)
+
+        bundle = build_bundle(int(project_id), None, normalized)
+        release_hash = str(bundle.get("release_hash") or "")
+        content_hash = str(bundle.get("content_hash") or "")
+        latest = conn.execute(
+            "SELECT MAX(revision) AS revision FROM script_library_versions WHERE project_id = ?",
+            (int(project_id),),
+        ).fetchone()
+        latest_version_revision = int(latest["revision"] or 0) if latest else 0
+        next_revision = max(actual_revision, latest_version_revision) + 1
+        timestamp = now_iso()
+        encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        cursor = conn.execute(
+            """
+            INSERT INTO script_library_versions(
+                project_id, revision, release_hash, content_hash, modules_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (int(project_id), next_revision, release_hash, content_hash, encoded, timestamp),
+        )
+        version_id = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO script_library_published(project_id, version_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                version_id = excluded.version_id,
+                updated_at = excluded.updated_at
+            """,
+            (int(project_id), version_id, timestamp),
+        )
+        # Keep the legacy draft endpoint's CAS marker aligned with the
+        # effective save.  It is intentionally the same source snapshot, so
+        # an old draft consumer cannot later promote an unrelated stale draft.
+        conn.execute(
+            """
+            INSERT INTO script_library_drafts(project_id, revision, modules_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                revision = excluded.revision,
+                modules_json = excluded.modules_json,
+                updated_at = excluded.updated_at
+            """,
+            (int(project_id), next_revision, encoded, timestamp),
+        )
+
+    return get_project_library(project_id)
+
+
+def _library_draft_candidate(conn: sqlite3.Connection, project_id: int, candidate_revision: int) -> tuple[int, list[dict[str, Any]]]:
+    row = _library_draft_row(conn, project_id)
+    revision = int(row["revision"] or 0) if row else 0
+    modules = _library_modules_from_row(row)
+    if int(candidate_revision) != revision:
+        raise LibraryRevisionConflict(int(candidate_revision), revision)
+    return revision, modules
+
+
+def get_library_candidate_bundle(project_id: int, candidate_revision: int) -> dict[str, Any]:
+    with _connect(read_only=True) as conn:
+        if conn.execute("SELECT 1 FROM projects WHERE id = ?", (int(project_id),)).fetchone() is None:
+            raise ValueError("项目不存在")
+        revision, modules = _library_draft_candidate(conn, project_id, candidate_revision)
+    return build_bundle(int(project_id), None, modules, candidate_revision=revision)
+
+
+def get_published_library(project_id: int) -> dict[str, Any] | None:
+    with _connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT v.* FROM script_library_published p JOIN script_library_versions v ON v.id = p.version_id WHERE p.project_id = ?",
+            (int(project_id),),
+        ).fetchone()
+    if not row:
+        return None
+    modules = _library_modules_from_row(row)
+    bundle = build_bundle(
+        int(project_id), int(row["id"]), modules, release_hash=str(row["release_hash"] or "")
+    )
+    bundle["release_hash"] = str(row["release_hash"] or bundle.get("release_hash") or "")
+    bundle["content_hash"] = str(row["content_hash"] or bundle.get("content_hash") or "")
+    return bundle
+
+
+def _fingerprint_value(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stable_runner_fingerprint(row: sqlite3.Row) -> dict[str, Any]:
+    metadata = _library_json(row["metadata_json"] if "metadata_json" in row.keys() else "{}", {})
+    capabilities = metadata.get("capabilities") if isinstance(metadata, dict) else None
+    return {
+        "runner_id": str(row["runner_id"]),
+        "name": str(row["name"] or ""),
+        "address": str(row["address"] or ""),
+        "network_region": str(row["network_region"] or ""),
+        "role": str(row["role"] or ""),
+        "enabled": bool(row["enabled"]),
+        "connection_mode": str(row["connection_mode"] or ""),
+        "allow_insecure_http": bool(row["allow_insecure_http"]),
+        "installed_browser_types": _library_json(row["installed_browser_types_json"], []),
+        "available_browser_types": _library_json(row["available_browser_types_json"], []),
+        "capabilities": capabilities if isinstance(capabilities, list) else [],
+        "token_hash": str(row["token_hash"] or ""),
+    }
+
+
+def _check_execution_fingerprint(check: dict[str, Any], module_names: set[str]) -> dict[str, Any]:
+    fields = (
+        "id", "type", "enabled", "interval_seconds", "timeout_ms", "entry_url", "viewport_mode", "method",
+        "headers_json", "body", "assertions_json", "setup_script", "script", "runner_selection_mode",
+        "runner_ids", "browser_selection_mode", "browser_types",
+    )
+    return {key: check.get(key) for key in fields if key != "enabled" or key in fields} | {
+        "referenced_modules": sorted(module_names)
+    }
+
+
+def _library_dependency_fingerprint(
+    project_id: int,
+    modules: list[dict[str, Any]],
+    checks: list[dict[str, Any]],
+    *,
+    candidate_revision: int,
+    candidate_bundle: dict[str, Any],
+) -> dict[str, Any]:
+    checks_by_id = {int(check["id"]): check for check in checks if check.get("id") is not None}
+    referenced = {
+        int(check["id"]): set(referenced_module_names(check))
+        for check in checks
+        if referenced_module_names(check)
+    }
+    settings = get_settings()
+    execution_setting_keys = {
+        "default_ui_timeout_ms", "default_api_timeout_ms", "max_concurrency", "max_ui_concurrency",
+        "max_queue_size", "api_pool_size", "browser_pool_size", "browser_recycle_after_runs",
+        "max_task_runtime_seconds", "browser_headless", "browser_type", "enabled_browser_types",
+        "prewarmed_browser_types", "browser_pool_sizes", "browser_proxy", "browser_viewport",
+        "trace_artifacts_enabled", "success_response_artifacts_enabled", "api_retry_attempts", "ui_retry_attempts",
+    }
+    stable_settings = {key: settings.get(key) for key in sorted(execution_setting_keys) if key in settings}
+    project_variables = get_project_variables(project_id)
+    # Execution resolves project variables by overlaying them on the global
+    # environment-variable set. Fingerprint that effective input as one value;
+    # the digest keeps secret values out of persisted/API metadata while still
+    # invalidating a result when a global variable changes.
+    effective_environment_variables = settings_for_project(settings, int(project_id)).get(
+        "environment_variables", []
+    )
+    dependency_setting_keys = sorted({*execution_setting_keys, "environment_variables"})
+    with _connect(read_only=True) as conn:
+        runner_rows = conn.execute("SELECT * FROM probe_runners ORDER BY runner_id").fetchall()
+        project_variables_row = conn.execute(
+            "SELECT updated_at FROM project_variables WHERE project_id = ?",
+            (int(project_id),),
+        ).fetchone()
+        setting_rows = conn.execute(
+            f"SELECT key, updated_at FROM settings WHERE key IN ({', '.join('?' for _ in dependency_setting_keys)})",
+            dependency_setting_keys,
+        ).fetchall()
+        published_row = conn.execute(
+            "SELECT v.id, v.release_hash, v.content_hash FROM script_library_published p "
+            "JOIN script_library_versions v ON v.id = p.version_id WHERE p.project_id = ?",
+            (int(project_id),),
+        ).fetchone()
+    runners = [_stable_runner_fingerprint(row) for row in runner_rows]
+    settings_revisions = {
+        str(row["key"]): str(row["updated_at"] or "")
+        for row in setting_rows
+    }
+    module_hashes = {str(item["name"]): str(item.get("hash") or source_hash(item["source"])) for item in modules}
+    return {
+        "candidate_revision": int(candidate_revision),
+        "release_hash": str(candidate_bundle.get("release_hash") or ""),
+        "content_hash": str(candidate_bundle.get("content_hash") or ""),
+        "module_hashes": module_hashes,
+        "published_version": {
+            "version_id": int(published_row["id"]),
+            "release_hash": str(published_row["release_hash"] or ""),
+            "content_hash": str(published_row["content_hash"] or ""),
+        }
+        if published_row
+        else None,
+        "checks": {
+            str(check_id): _check_execution_fingerprint(checks_by_id[check_id], names)
+            for check_id, names in sorted(referenced.items())
+        },
+        "project_variables_hash": _fingerprint_value(project_variables),
+        "project_variables_revision": str(project_variables_row["updated_at"] or "") if project_variables_row else "",
+        "environment_variables_hash": _fingerprint_value(effective_environment_variables),
+        "settings_revisions": settings_revisions,
+        "settings_hash": _fingerprint_value(stable_settings),
+        "runners_hash": _fingerprint_value(runners),
+    }
+
+
+def _library_changed_module_names(project_id: int, modules: list[dict[str, Any]]) -> set[str]:
+    with _connect(read_only=True) as conn:
+        current = conn.execute(
+            "SELECT v.modules_json FROM script_library_published p JOIN script_library_versions v ON v.id = p.version_id WHERE p.project_id = ?",
+            (int(project_id),),
+        ).fetchone()
+    previous = _library_modules_from_row({"modules_json": current[0]}) if current else []
+    before = {str(item["name"]): str(item.get("hash") or source_hash(item["source"])) for item in previous}
+    after = {str(item["name"]): str(item.get("hash") or source_hash(item["source"])) for item in modules}
+    return {name for name in set(before) | set(after) if before.get(name) != after.get(name)}
+
+
+def library_changed_module_names(project_id: int, modules: list[dict[str, Any]]) -> set[str]:
+    """Return module names whose executable source changed since publication."""
+
+    return _library_changed_module_names(int(project_id), normalize_modules(modules))
+
+
+def library_static_reference_diagnostics(
+    project_id: int,
+    modules: list[dict[str, Any]],
+    *,
+    checks: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Run the runtime-owned static reference check over a frozen task set."""
+
+    frozen_checks = checks if checks is not None else _library_checks_readonly(int(project_id))
+    return static_reference_diagnostics(frozen_checks, normalize_modules(modules))
+
+
+def _normalize_library_validation(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    data = dict(row)
+    result = _library_json(data.get("result_json"), {})
+    diagnostics = _library_json(data.get("diagnostics_json"), [])
+    if not isinstance(result, dict):
+        result = {}
+    if not isinstance(diagnostics, list):
+        diagnostics = []
+    checks = result.get("checks", [])
+    if not isinstance(checks, list):
+        checks = []
+    return {
+        "id": int(data["id"]),
+        "project_id": int(data["project_id"]),
+        "candidate_revision": int(data.get("candidate_revision") or 0),
+        "release_id": None,
+        "release_hash": str(data.get("candidate_release_hash") or ""),
+        "content_hash": str(data.get("candidate_content_hash") or ""),
+        "status": str(data.get("status") or "queued"),
+        "include_disabled": bool(data.get("include_disabled")),
+        "checks": checks,
+        "diagnostics": diagnostics,
+        "started_at": data.get("started_at"),
+        "finished_at": data.get("finished_at"),
+        "created_at": data.get("created_at"),
+    }
+
+
+def create_project_library_validation(
+    project_id: int,
+    candidate_revision: int,
+    *,
+    include_disabled: bool = False,
+) -> dict[str, Any]:
+    with write_transaction():
+        conn = _TRANSACTION.connection
+        assert conn is not None
+        project = conn.execute("SELECT status FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+        if not project or str(project["status"]) != "active":
+            raise ValueError("项目不存在或已归档")
+        revision, modules = _library_draft_candidate(conn, project_id, candidate_revision)
+        checks = _library_checks_readonly(project_id)
+        bundle = build_bundle(int(project_id), None, modules, candidate_revision=revision)
+        dependency = _library_dependency_fingerprint(
+            project_id, modules, checks, candidate_revision=revision, candidate_bundle=bundle
+        )
+        changed_modules = sorted(_library_changed_module_names(project_id, modules))
+        timestamp = now_iso()
+        cursor = conn.execute(
+            """
+            INSERT INTO script_library_validations(
+                project_id, candidate_revision, candidate_release_hash, candidate_content_hash,
+                candidate_modules_json, dependency_fingerprint_json, status, include_disabled,
+                result_json, diagnostics_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, '{}', '[]', ?, ?)
+            """,
+            (
+                int(project_id), revision, str(bundle.get("release_hash") or ""), str(bundle.get("content_hash") or ""),
+                json.dumps(modules, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                json.dumps(dependency, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                1 if include_disabled else 0, timestamp, timestamp,
+            ),
+        )
+        validation_id = int(cursor.lastrowid)
+        conn.execute(
+            "INSERT INTO script_library_validation_meta(validation_id, project_id, changed_modules_json) VALUES (?, ?, ?)",
+            (
+                validation_id,
+                int(project_id),
+                json.dumps(changed_modules, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        for check in checks:
+            check_id = int(check.get("id") or 0)
+            if check_id <= 0:
+                continue
+            conn.execute(
+                "INSERT INTO script_library_validation_checks(validation_id, project_id, check_id, check_json) VALUES (?, ?, ?, ?)",
+                (
+                    validation_id,
+                    int(project_id),
+                    check_id,
+                    json.dumps(check, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+    return get_project_library_validation(project_id, validation_id)  # type: ignore[return-value]
+
+
+def get_project_library_validation(project_id: int, validation_id: int) -> dict[str, Any] | None:
+    with _connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM script_library_validations WHERE id = ? AND project_id = ?",
+            (int(validation_id), int(project_id)),
+        ).fetchone()
+    return _normalize_library_validation(row) if row else None
+
+
+def _library_validation_snapshot_from_conn(
+    conn: sqlite3.Connection,
+    project_id: int,
+    row: sqlite3.Row | dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any], set[str]]:
+    """Return the immutable candidate/check inputs captured for a validation."""
+
+    data = dict(row)
+    modules = normalize_modules(_library_json(data.get("candidate_modules_json"), []))
+    checks: list[dict[str, Any]] = []
+    rows = conn.execute(
+        "SELECT check_id, check_json FROM script_library_validation_checks WHERE validation_id = ? AND project_id = ? ORDER BY check_id",
+        (int(data["id"]), int(project_id)),
+    ).fetchall()
+    for snapshot_row in rows:
+        value = _library_json(snapshot_row["check_json"], {})
+        if not isinstance(value, dict):
+            raise ModuleLibraryError("验证任务快照格式无效")
+        value["id"] = int(snapshot_row["check_id"])
+        checks.append(value)
+    meta = conn.execute(
+        "SELECT changed_modules_json FROM script_library_validation_meta WHERE validation_id = ? AND project_id = ?",
+        (int(data["id"]), int(project_id)),
+    ).fetchone()
+    changed_modules_value = _library_json(meta["changed_modules_json"], []) if meta else []
+    changed_modules = {str(item) for item in changed_modules_value if str(item)} if isinstance(changed_modules_value, list) else set()
+    bundle = build_bundle(
+        int(project_id),
+        None,
+        modules,
+        release_hash=str(data.get("candidate_release_hash") or "") or None,
+        candidate_revision=int(data.get("candidate_revision") or 0),
+    )
+    return modules, checks, bundle, changed_modules
+
+
+def get_project_library_validation_snapshot(project_id: int, validation_id: int) -> dict[str, Any] | None:
+    """Read the frozen candidate and check inputs used by the validation worker."""
+
+    with _connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM script_library_validations WHERE id = ? AND project_id = ?",
+            (int(validation_id), int(project_id)),
+        ).fetchone()
+        if not row:
+            return None
+        modules, checks, bundle, changed_modules = _library_validation_snapshot_from_conn(conn, project_id, row)
+    return {
+        "validation": _normalize_library_validation(row),
+        "modules": modules,
+        "checks": checks,
+        "bundle": bundle,
+        "changed_modules": sorted(changed_modules),
+    }
+
+
+def is_project_library_validation_cancel_requested(project_id: int, validation_id: int) -> bool:
+    with _connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT status, cancel_requested FROM script_library_validations WHERE id = ? AND project_id = ?",
+            (int(validation_id), int(project_id)),
+        ).fetchone()
+    return bool(row and (row["cancel_requested"] or str(row["status"]) == "cancelled"))
+
+
+def list_project_library_validations(project_id: int, limit: int = 100) -> list[dict[str, Any]]:
+    with _connect(read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT * FROM script_library_validations WHERE project_id = ? ORDER BY id DESC LIMIT ?",
+            (int(project_id), max(1, min(500, int(limit)))),
+        ).fetchall()
+    return [_normalize_library_validation(row) for row in rows]
+
+
+def claim_project_library_validation(project_id: int, validation_id: int) -> dict[str, Any] | None:
+    timestamp = now_iso()
+    with write_transaction():
+        conn = _TRANSACTION.connection
+        assert conn is not None
+        row = conn.execute(
+            "SELECT * FROM script_library_validations WHERE id = ? AND project_id = ?",
+            (int(validation_id), int(project_id)),
+        ).fetchone()
+        if not row:
+            return None
+        if str(row["status"]) != "queued" or bool(row["cancel_requested"]):
+            return _normalize_library_validation(row)
+        try:
+            modules, _frozen_checks, bundle, _changed_modules = _library_validation_snapshot_from_conn(conn, project_id, row)
+            current_checks = _library_checks_readonly(project_id)
+            current_dependency = _library_dependency_fingerprint(
+                project_id,
+                modules,
+                current_checks,
+                candidate_revision=int(row["candidate_revision"]),
+                candidate_bundle=bundle,
+            )
+            stored_dependency = _library_json(row["dependency_fingerprint_json"], {})
+        except (ModuleLibraryError, ValueError, TypeError) as exc:
+            current_dependency = None
+            stored_dependency = None
+            dependency_error = str(exc) or exc.__class__.__name__
+        else:
+            dependency_error = ""
+        if dependency_error or current_dependency != stored_dependency:
+            diagnostics = [
+                {
+                    "level": "error",
+                    "code": "validation_stale",
+                    "message": dependency_error or "验证开始前任务、变量、设置或执行节点配置已变化，请重新验证",
+                }
+            ]
+            conn.execute(
+                "UPDATE script_library_validations SET status = 'failed', diagnostics_json = ?, finished_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+                (
+                    json.dumps(diagnostics, ensure_ascii=False),
+                    timestamp,
+                    timestamp,
+                    int(validation_id),
+                    int(project_id),
+                ),
+            )
+            failed = conn.execute(
+                "SELECT * FROM script_library_validations WHERE id = ? AND project_id = ?",
+                (int(validation_id), int(project_id)),
+            ).fetchone()
+            return _normalize_library_validation(failed) if failed else None
+        cursor = conn.execute(
+            """
+            UPDATE script_library_validations
+            SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
+            WHERE id = ? AND project_id = ? AND status = 'queued' AND cancel_requested = 0
+            """,
+            (timestamp, timestamp, int(validation_id), int(project_id)),
+        )
+        if cursor.rowcount == 0:
+            row = conn.execute(
+                "SELECT * FROM script_library_validations WHERE id = ? AND project_id = ?",
+                (int(validation_id), int(project_id)),
+            ).fetchone()
+            return _normalize_library_validation(row) if row else None
+    return get_project_library_validation(project_id, validation_id)
+
+
+def finish_project_library_validation(
+    project_id: int,
+    validation_id: int,
+    status: str,
+    *,
+    checks: list[dict[str, Any]] | None = None,
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status not in {"succeeded", "failed", "cancelled"}:
+        raise ValueError("验证终态无效")
+    timestamp = now_iso()
+    payload = {"checks": checks or []}
+    with write_transaction():
+        conn = _TRANSACTION.connection
+        assert conn is not None
+        row = conn.execute(
+            "SELECT * FROM script_library_validations WHERE id = ? AND project_id = ?",
+            (int(validation_id), int(project_id)),
+        ).fetchone()
+        if not row:
+            return None
+        if str(row["status"]) in {"succeeded", "failed", "cancelled"}:
+            return _normalize_library_validation(row)
+        final_status = normalized_status
+        final_diagnostics = list(diagnostics or [])
+        if bool(row["cancel_requested"]):
+            final_status = "cancelled"
+        elif normalized_status == "succeeded":
+            dependency_error = ""
+            try:
+                modules, _frozen_checks, bundle, _changed_modules = _library_validation_snapshot_from_conn(conn, project_id, row)
+                current_checks = _library_checks_readonly(project_id)
+                current_dependency = _library_dependency_fingerprint(
+                    project_id,
+                    modules,
+                    current_checks,
+                    candidate_revision=int(row["candidate_revision"]),
+                    candidate_bundle=bundle,
+                )
+                stored_dependency = _library_json(row["dependency_fingerprint_json"], {})
+            except (ModuleLibraryError, ValueError, TypeError) as exc:
+                current_dependency = None
+                stored_dependency = None
+                dependency_error = str(exc) or exc.__class__.__name__
+            if dependency_error or current_dependency != stored_dependency:
+                final_status = "failed"
+                final_diagnostics.append(
+                    {
+                        "level": "error",
+                        "code": "validation_stale",
+                        "message": dependency_error or "验证执行期间任务、变量、设置或执行节点配置已变化，请重新验证",
+                    }
+                )
+        conn.execute(
+            """
+            UPDATE script_library_validations
+            SET status = ?, result_json = ?, diagnostics_json = ?, finished_at = ?, updated_at = ?
+            WHERE id = ? AND project_id = ?
+            """,
+            (
+                final_status,
+                json.dumps(payload, ensure_ascii=False),
+                json.dumps(final_diagnostics, ensure_ascii=False),
+                timestamp,
+                timestamp,
+                int(validation_id),
+                int(project_id),
+            ),
+        )
+    return get_project_library_validation(project_id, validation_id)
+
+
+def cancel_project_library_validation(project_id: int, validation_id: int) -> dict[str, Any] | None:
+    timestamp = now_iso()
+    with write_transaction():
+        conn = _TRANSACTION.connection
+        assert conn is not None
+        conn.execute(
+            "UPDATE script_library_validations SET cancel_requested = 1, updated_at = ? WHERE id = ? AND project_id = ? AND status IN ('queued', 'running')",
+            (timestamp, int(validation_id), int(project_id)),
+        )
+        row = conn.execute(
+            "SELECT * FROM script_library_validations WHERE id = ? AND project_id = ?",
+            (int(validation_id), int(project_id)),
+        ).fetchone()
+        if not row:
+            return None
+        if str(row["status"]) == "queued":
+            conn.execute(
+                "UPDATE script_library_validations SET status = 'cancelled', finished_at = ?, updated_at = ? WHERE id = ?",
+                (timestamp, timestamp, int(validation_id)),
+            )
+    return get_project_library_validation(project_id, validation_id)
+
+
+def _library_static_compatibility(project_id: int, modules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    checks = _library_checks_readonly(project_id)
+    return static_reference_diagnostics(checks, modules)
+
+
+def _find_validation_for_publish(conn: sqlite3.Connection, project_id: int, validation_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM script_library_validations WHERE id = ? AND project_id = ?",
+        (int(validation_id), int(project_id)),
+    ).fetchone()
+
+
+def _library_validation_changed_modules(conn: sqlite3.Connection, project_id: int, validation_id: int) -> set[str]:
+    row = conn.execute(
+        "SELECT changed_modules_json FROM script_library_validation_meta WHERE validation_id = ? AND project_id = ?",
+        (int(validation_id), int(project_id)),
+    ).fetchone()
+    values = _library_json(row["changed_modules_json"], []) if row else []
+    return {str(item) for item in values if str(item)} if isinstance(values, list) else set()
+
+
+def publish_project_library(
+    project_id: int,
+    candidate_revision: int,
+    validation_id: int | None = None,
+) -> dict[str, Any]:
+    diagnostics: list[dict[str, Any]]
+    with write_transaction():
+        conn = _TRANSACTION.connection
+        assert conn is not None
+        project = conn.execute("SELECT status FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+        if not project or str(project["status"]) != "active":
+            raise ValueError("项目不存在或已归档")
+        revision, modules = _library_draft_candidate(conn, project_id, candidate_revision)
+        checks = _library_checks_readonly(project_id)
+        diagnostics = static_reference_diagnostics(checks, modules)
+        if diagnostics:
+            raise LibraryValidationConflict("公共方法引用静态校验失败")
+        bundle = build_bundle(int(project_id), None, modules, candidate_revision=revision)
+        dependency = _library_dependency_fingerprint(
+            project_id, modules, checks, candidate_revision=revision, candidate_bundle=bundle
+        )
+        referenced = bool(_library_references_for_checks(checks)["count"])
+        if referenced:
+            if validation_id is None:
+                raise LibraryValidationConflict("存在公共方法引用，请先完成验证")
+            validation = _find_validation_for_publish(conn, project_id, validation_id)
+            if not validation or str(validation["status"]) != "succeeded":
+                raise LibraryValidationConflict("验证结果不存在或未成功")
+            if int(validation["candidate_revision"]) != revision:
+                raise LibraryValidationConflict("验证结果对应的草稿修订号已过期")
+            if str(validation["candidate_content_hash"]) != str(bundle.get("content_hash") or ""):
+                raise LibraryValidationConflict("验证结果对应的公共方法源码已过期")
+            stored_dependency = _library_json(validation["dependency_fingerprint_json"], {})
+            if stored_dependency != dependency:
+                raise LibraryValidationConflict("验证期间任务、变量、设置或执行节点配置已变化，请重新验证")
+            validation_changed = _library_validation_changed_modules(conn, project_id, validation_id)
+            current_changed = _library_changed_module_names(project_id, modules)
+            if validation_changed != current_changed:
+                raise LibraryValidationConflict("发布基线版本已变化，请重新验证")
+            # Every affected enabled task must have a successful runner result.
+            result = _library_json(validation["result_json"], {})
+            if not _validation_result_all_ok(
+                result,
+                checks,
+                modules,
+                project_id,
+                changed_modules=validation_changed,
+            ):
+                raise LibraryValidationConflict("验证未通过全部受影响的启用任务")
+        timestamp = now_iso()
+        release_hash = str(bundle.get("release_hash") or "")
+        content_hash = str(bundle.get("content_hash") or "")
+        encoded = json.dumps(modules, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        existing = conn.execute(
+            "SELECT * FROM script_library_versions WHERE project_id = ? AND revision = ?",
+            (int(project_id), revision),
+        ).fetchone()
+        if existing and (str(existing["content_hash"]) != content_hash or str(existing["release_hash"]) != release_hash):
+            raise LibraryValidationConflict("相同修订号的公共方法版本内容不一致")
+        if existing:
+            version_id = int(existing["id"])
+            version_row = existing
+        else:
+            cursor = conn.execute(
+                "INSERT INTO script_library_versions(project_id, revision, release_hash, content_hash, modules_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (int(project_id), revision, release_hash, content_hash, encoded, timestamp),
+            )
+            version_id = int(cursor.lastrowid)
+            version_row = conn.execute("SELECT * FROM script_library_versions WHERE id = ?", (version_id,)).fetchone()
+        conn.execute(
+            "INSERT INTO script_library_published(project_id, version_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET version_id = excluded.version_id, updated_at = excluded.updated_at",
+            (int(project_id), version_id, timestamp),
+        )
+    return _library_version_payload(version_row)  # type: ignore[arg-type]
+
+
+def _validation_result_all_ok(
+    result: dict[str, Any],
+    checks: list[dict[str, Any]],
+    modules: list[dict[str, Any]],
+    project_id: int,
+    *,
+    changed_modules: set[str] | None = None,
+) -> bool:
+    changed = changed_modules if changed_modules is not None else _library_changed_module_names(project_id, modules)
+    referenced = _library_references_for_checks(checks)["tasks"]
+    affected_enabled = {
+        int(item["check_id"])
+        for item in referenced
+        if bool(item.get("enabled")) and bool(set(item.get("modules") or []) & changed)
+    }
+    if not affected_enabled:
+        return True
+    by_id = {int(item.get("check_id") or 0): item for item in result.get("checks", []) if isinstance(item, dict)}
+    for check_id in affected_enabled:
+        item = by_id.get(check_id)
+        if not item:
+            return False
+        runs = item.get("runs")
+        if not isinstance(runs, list) or not runs or any(str(run.get("status") or "") != "ok" for run in runs if isinstance(run, dict)):
+            return False
+        if any(not isinstance(run, dict) or str(run.get("status") or "") != "ok" for run in runs):
+            return False
+    return True
+
+
+def rollback_project_library(project_id: int, version_id: int) -> dict[str, Any]:
+    with write_transaction():
+        conn = _TRANSACTION.connection
+        assert conn is not None
+        project = conn.execute("SELECT status FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+        if not project or str(project["status"]) != "active":
+            raise ValueError("项目不存在或已归档")
+        version = conn.execute(
+            "SELECT * FROM script_library_versions WHERE id = ? AND project_id = ?",
+            (int(version_id), int(project_id)),
+        ).fetchone()
+        if not version:
+            raise ValueError("公共方法版本不存在")
+        modules = _library_modules_from_row(version)
+        diagnostics = _library_static_compatibility(project_id, modules)
+        if diagnostics:
+            raise LibraryValidationConflict("历史版本与当前引用不兼容")
+        conn.execute(
+            "INSERT INTO script_library_published(project_id, version_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET version_id = excluded.version_id, updated_at = excluded.updated_at",
+            (int(project_id), int(version_id), now_iso()),
+        )
+        # Keep the save CAS token monotonic even though the published pointer
+        # now references an older immutable version.  Preserve any legacy
+        # draft source while advancing only its edit marker.
+        next_revision = _library_edit_revision(conn, project_id) + 1
+        timestamp = now_iso()
+        draft = _library_draft_row(conn, project_id)
+        if draft:
+            conn.execute(
+                "UPDATE script_library_drafts SET revision = ?, updated_at = ? WHERE project_id = ?",
+                (next_revision, timestamp, int(project_id)),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO script_library_drafts(project_id, revision, modules_json, updated_at) VALUES (?, ?, '[]', ?)",
+                (int(project_id), next_revision, timestamp),
+            )
+    return _library_version_payload(version)
+
+
+def import_project_library_in_transaction(
+    project_id: int,
+    library: Any,
+) -> dict[str, Any] | None:
+    """Import the exported published snapshot using the caller's write transaction.
+
+    Project import already owns one transaction for tasks, variables, alerts and
+    the library.  This helper deliberately reuses that connection so a library
+    conflict cannot leave a partially imported project behind.
+    """
+
+    transaction = getattr(_TRANSACTION, "connection", None)
+    if transaction is None:
+        with write_transaction():
+            return import_project_library_in_transaction(project_id, library)
+    conn = transaction
+    project = conn.execute("SELECT status FROM projects WHERE id = ?", (int(project_id),)).fetchone()
+    if not project or str(project["status"]) != "active":
+        raise ValueError("项目不存在或已归档")
+    if library is None:
+        return None
+    raw = library.get("published") if isinstance(library, dict) else library
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ModuleLibraryError("项目公共方法导出格式不正确")
+    incoming = normalize_modules(raw.get("modules") or [])
+    current_draft = _library_draft_row(conn, project_id)
+    current_published = conn.execute(
+        "SELECT v.* FROM script_library_published p JOIN script_library_versions v ON v.id = p.version_id WHERE p.project_id = ?",
+        (int(project_id),),
+    ).fetchone()
+    published_modules = normalize_modules(_library_modules_from_row(current_published)) if current_published else []
+    draft_modules = normalize_modules(_library_modules_from_row(current_draft)) if current_draft else []
+
+    def merge_modules(base: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_name = {str(item["name"]): item for item in base}
+        for item in incoming:
+            previous = by_name.get(str(item["name"]))
+            if previous is not None:
+                if str(previous.get("source") or "") != str(item.get("source") or ""):
+                    raise ModuleLibraryError(f"导入公共方法与现有同名模块源码冲突：{item['name']}")
+                # Same-name/same-source modules are reused, including existing
+                # documentation metadata.
+                continue
+            by_name[str(item["name"])] = item
+        return normalize_modules(list(by_name.values()))
+
+    # Publication is based on the live pointer.  A separately edited draft is
+    # merged for the next candidate and is never silently promoted by import.
+    merged_published = merge_modules(published_modules)
+    draft_base = draft_modules if current_draft else published_modules
+    merged_draft = merge_modules(draft_base)
+    if not merged_published and current_published is None:
+        return None
+    if current_published is not None and normalize_modules(published_modules) == merged_published:
+        published_result = _library_version_payload(current_published)
+    else:
+        bundle = build_bundle(int(project_id), None, merged_published)
+        release_hash = str(bundle.get("release_hash") or "")
+        content_hash = str(bundle.get("content_hash") or "")
+        latest = conn.execute(
+            "SELECT MAX(revision) AS revision FROM script_library_versions WHERE project_id = ?",
+            (int(project_id),),
+        ).fetchone()
+        latest_revision = int(latest["revision"] or 0) if latest else 0
+        timestamp = now_iso()
+        release_revision = latest_revision + 1
+        encoded_published = json.dumps(merged_published, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        cursor = conn.execute(
+            "INSERT INTO script_library_versions(project_id, revision, release_hash, content_hash, modules_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (int(project_id), release_revision, release_hash, content_hash, encoded_published, timestamp),
+        )
+        version_id = int(cursor.lastrowid)
+        conn.execute(
+            "INSERT INTO script_library_published(project_id, version_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET version_id = excluded.version_id, updated_at = excluded.updated_at",
+            (int(project_id), version_id, timestamp),
+        )
+        version_row = conn.execute("SELECT * FROM script_library_versions WHERE id = ?", (version_id,)).fetchone()
+        published_result = _library_version_payload(version_row) if version_row else None
+
+    # Keep an existing unsaved draft intact while incorporating newly imported
+    # modules.  If there was no draft, mirror the imported published snapshot.
+    current_draft_normalized = normalize_modules(draft_modules)
+    if current_draft is None or current_draft_normalized != merged_draft:
+        latest_draft_revision = int(current_draft["revision"] or 0) if current_draft else 0
+        if current_published is not None:
+            latest_draft_revision = max(latest_draft_revision, int(current_published["revision"] or 0))
+        revision_row = conn.execute(
+            "SELECT MAX(revision) AS revision FROM script_library_versions WHERE project_id = ?",
+            (int(project_id),),
+        ).fetchone()
+        latest_draft_revision = max(latest_draft_revision, int(revision_row["revision"] or 0) if revision_row else 0)
+        draft_revision = latest_draft_revision + 1
+        timestamp = now_iso()
+        encoded_draft = json.dumps(merged_draft, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            "INSERT INTO script_library_drafts(project_id, revision, modules_json, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(project_id) DO UPDATE SET revision = excluded.revision, modules_json = excluded.modules_json, updated_at = excluded.updated_at",
+            (int(project_id), draft_revision, encoded_draft, timestamp),
+        )
+    return published_result
 
 
 def get_project_alert_settings(project_id: int, *, public: bool = False) -> dict[str, Any]:
@@ -3274,6 +4534,7 @@ def update_project_variables(project_id: int, variables: list[dict[str, Any]]) -
     with _connect() as conn:
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
+        timestamp = _next_edit_timestamp(conn, "project_variables")
         project = conn.execute("SELECT status FROM projects WHERE id = ?", (project_id,)).fetchone()
         if not project or project[0] != "active":
             raise ValueError("项目不存在或已归档")
@@ -3290,9 +4551,10 @@ def update_project_variables(project_id: int, variables: list[dict[str, Any]]) -
             merged.append(item)
         normalized = normalize_settings_values({"environment_variables": merged})["environment_variables"]
         conn.execute(
-            "INSERT INTO project_variables(project_id, variables_json) VALUES (?, ?) "
-            "ON CONFLICT(project_id) DO UPDATE SET variables_json = excluded.variables_json",
-            (project_id, json.dumps(normalized, ensure_ascii=False)),
+            "INSERT INTO project_variables(project_id, variables_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(project_id) DO UPDATE SET variables_json = excluded.variables_json, "
+            "updated_at = excluded.updated_at",
+            (project_id, json.dumps(normalized, ensure_ascii=False), timestamp),
         )
     return get_project_variables(project_id, public=True)
 
@@ -3344,8 +4606,10 @@ def update_settings(values: dict[str, Any]) -> dict[str, Any]:
     selected_system_ids = {str(item) for item in prospective.get("system_notification_channel_ids", [])}
     if not selected_system_ids.issubset(system_channel_ids):
         raise ValueError("系统告警引用了不存在的系统通知渠道")
-    timestamp = now_iso()
     with _connect() as conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        timestamp = _next_edit_timestamp(conn, "settings")
         for key, value in normalized_values.items():
             if key not in allowed:
                 continue
@@ -4529,6 +5793,18 @@ def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
     _migrate_plaintext_runner_tokens(conn)
 
 
+def _ensure_project_variables_columns(conn: sqlite3.Connection) -> None:
+    """Add the project-variable edit marker to databases created before it."""
+
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(project_variables)").fetchall()}
+    if "updated_at" not in existing:
+        conn.execute("ALTER TABLE project_variables ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "UPDATE project_variables SET updated_at = ? WHERE updated_at = ''",
+        (now_iso(),),
+    )
+
+
 def _ensure_local_probe_runner(conn: sqlite3.Connection) -> None:
     timestamp = now_iso()
     name = str(_read_setting_value(conn, "local_runner_name") or "local").strip() or "local"
@@ -4776,6 +6052,62 @@ def _mark_interrupted_runs(conn: sqlite3.Connection) -> None:
         """,
         (timestamp,),
     )
+
+
+def _mark_interrupted_library_validations(conn: sqlite3.Connection) -> None:
+    """Settle validations left in flight by a process stop before dispatch.
+
+    A restart must never replay real requests from an old candidate.  Keep the
+    immutable candidate and any result evidence, then make the state terminal
+    so clients do not poll forever.  The direct audit insert keeps this startup
+    mutation visible without routing through a second storage connection.
+    """
+
+    rows = conn.execute(
+        "SELECT id, project_id, diagnostics_json FROM script_library_validations "
+        "WHERE status IN ('queued', 'running')"
+    ).fetchall()
+    if not rows:
+        return
+    timestamp = now_iso()
+    message = "服务重启时发现验证未完成，已取消；请重新验证"
+    for row in rows:
+        try:
+            diagnostics = json.loads(row["diagnostics_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            diagnostics = []
+        if not isinstance(diagnostics, list):
+            diagnostics = []
+        diagnostics.append({"level": "error", "code": "validation_interrupted", "message": message})
+        conn.execute(
+            """
+            UPDATE script_library_validations
+            SET status = 'cancelled', cancel_requested = 1,
+                diagnostics_json = ?, finished_at = COALESCE(finished_at, ?), updated_at = ?
+            WHERE id = ? AND status IN ('queued', 'running')
+            """,
+            (
+                json.dumps(diagnostics, ensure_ascii=False),
+                timestamp,
+                timestamp,
+                int(row["id"]),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_events(
+                project_id, action, entity_type, entity_id, entity_name,
+                summary, payload_json, created_at
+            ) VALUES (?, 'cancelled', 'script_library_validation', ?, '', ?, ?, ?)
+            """,
+            (
+                int(row["project_id"]),
+                str(row["id"]),
+                message,
+                json.dumps({"reason": "startup_interruption"}, ensure_ascii=False),
+                timestamp,
+            ),
+        )
 
 
 def _seed_demo_checks(conn: sqlite3.Connection) -> None:

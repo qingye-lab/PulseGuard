@@ -209,6 +209,29 @@ class ConfigImportRequest(BaseModel):
     replace_existing: bool = False
 
 
+class ScriptLibraryDraftUpdate(BaseModel):
+    expected_revision: int = Field(ge=0)
+    modules: list[dict[str, Any]] = Field(default_factory=list, max_length=128)
+
+
+class ScriptLibrarySaveRequest(ScriptLibraryDraftUpdate):
+    """Save the complete project library and make it effective immediately."""
+
+
+class ScriptLibraryValidationCreate(BaseModel):
+    candidate_revision: int = Field(ge=0)
+    include_disabled: bool = False
+
+
+class ScriptLibraryPublishRequest(BaseModel):
+    candidate_revision: int = Field(ge=0)
+    validation_id: int | None = Field(default=None, ge=1)
+
+
+class ScriptLibraryRollbackRequest(BaseModel):
+    version_id: int = Field(ge=1)
+
+
 class ApiInspectRequest(BaseModel):
     type: Literal["api"] = "api"
     entry_url: str = Field(min_length=1, max_length=2048)
@@ -216,11 +239,19 @@ class ApiInspectRequest(BaseModel):
     headers_json: str | None = "{}"
     body: str | None = ""
     timeout_ms: int = Field(default=10000, ge=500, le=300000)
+    # API check scripts prepare requests and may issue one or more HTTP calls;
+    # structured assertions, when saved on the task, inspect the last response.
+    script: str | None = ""
 
     @field_validator("headers_json")
     @classmethod
     def headers_must_be_json_object(cls, value: str | None) -> str:
         return CheckBase.headers_must_be_json_object(value)
+
+    @field_validator("script")
+    @classmethod
+    def script_must_define_entry(cls, value: str | None) -> str:
+        return CheckBase.script_must_define_entry(value)
 
     @model_validator(mode="after")
     def normalize_method(self) -> "ApiInspectRequest":

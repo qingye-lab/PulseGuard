@@ -1,5 +1,6 @@
 import { gzipSync } from "node:zlib";
 import { assertLocalEditorBundle } from "./local-editor-bundle.mjs";
+import { collectEditorReport } from "./editor-budget.mjs";
 
 // Gzip budgets cover every shared JS/CSS dependency, not just a route chunk.
 // Monitoring includes its primary chart even though that chunk is async: moving
@@ -88,6 +89,7 @@ export function bundleBudget() {
       handler(_options, bundle) {
         const report = collectBundleReport(bundle);
         report.editorWorkers = assertLocalEditorBundle(bundle);
+        report.editor = collectEditorReport(bundle, Object.values(report.editorWorkers));
         this.emitFile({ type: "asset", fileName: ".vite/bundle-budget.json", source: JSON.stringify(report, null, 2) });
         console.log("Bundle gzip (including shared JS/CSS): " + Object.entries(report.routes)
           .map(([name, route]) => `${name} ${(route.gzipBytes / 1000).toFixed(1)} kB`).join(", "));

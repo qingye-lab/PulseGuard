@@ -4,6 +4,7 @@ WORKDIR /build/frontend
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
+COPY .agents/skills/pulseguard-operations/ /build/.agents/skills/pulseguard-operations/
 RUN npm run build
 
 FROM ghcr.io/astral-sh/uv:0.9.30 AS uv-bin

@@ -1,6 +1,7 @@
 import { Button, Collapse, Tooltip } from "antd";
 import { uiScriptTemplate, uiSetupScriptTemplate } from "../defaults";
 import { LazyCodeEditorPanel as CodeEditorPanel } from "./LazyCodeEditorPanel";
+import type { ModuleCompletionItem } from "../moduleLibrary";
 
 interface UiScriptSectionsProps {
   setupScript: string;
@@ -9,6 +10,8 @@ interface UiScriptSectionsProps {
   scriptHeight?: string;
   onSetupScriptChange: (value: string) => void;
   onScriptChange: (value: string) => void;
+  moduleCompletions?: ModuleCompletionItem[];
+  completionScopeKey?: string;
 }
 
 export function UiScriptSections({
@@ -17,7 +20,9 @@ export function UiScriptSections({
   setupHeight = "280px",
   scriptHeight = "320px",
   onSetupScriptChange,
-  onScriptChange
+  onScriptChange,
+  moduleCompletions = [],
+  completionScopeKey = ""
 }: UiScriptSectionsProps) {
   return (
     <Collapse
@@ -33,6 +38,8 @@ export function UiScriptSections({
               value={setupScript}
               height={setupHeight}
               onChange={onSetupScriptChange}
+              moduleCompletions={moduleCompletions}
+              completionScopeKey={`${completionScopeKey}:setup`}
               extra={
                 !setupScript.trim() && (
                   <Button size="small" onClick={() => onSetupScriptChange(uiSetupScriptTemplate)}>
@@ -53,6 +60,8 @@ export function UiScriptSections({
               value={script}
               height={scriptHeight}
               onChange={onScriptChange}
+              moduleCompletions={moduleCompletions}
+              completionScopeKey={`${completionScopeKey}:script`}
               extra={
                 !script.trim() && (
                   <Button size="small" onClick={() => onScriptChange(uiScriptTemplate)}>

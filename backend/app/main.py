@@ -19,17 +19,19 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
-from .api_assertions import inspect_api_response
+from .api_assertions import ApiInspectionFailure, inspect_api_response
 from .ui_diagnostics import UiInspectionFailure
 from . import config_transfer, failure_summary, notifier, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
+from .frontend_assets import FrontendAssets
 from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_PRINT_TOKEN, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs, relay_control_token
 from .relay_cert import relay_fingerprint
-from .runner import CheckRunner, MaintenanceBusyError, RuntimeSettingsReloadError
+from .runner import API_SCRIPT_ASSERTIONS_CAPABILITY, SCRIPT_MODULES_CAPABILITY, CheckRunner, MaintenanceBusyError, RuntimeSettingsReloadError
 from .scheduler import PulseScheduler
 from .browser_installation import browser_capabilities, schedule_browser_install, shutdown_browser_installation
 from .browser_types import enabled_browser_types, normalize_browser_types
-from .schemas import ApiInspectRequest, BrowserInstallRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ProjectAlertSettingsUpdate, ProjectCreate, ProjectUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, RunnerProvisionRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
+from .schemas import ApiInspectRequest, BrowserInstallRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ProjectAlertSettingsUpdate, ProjectCreate, ProjectUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, RunnerProvisionRequest, ScriptLibraryDraftUpdate, ScriptLibraryPublishRequest, ScriptLibraryRollbackRequest, ScriptLibrarySaveRequest, ScriptLibraryValidationCreate, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
+from . import script_library_service
 from .variables import mask_data, mask_text
 
 
@@ -176,7 +178,7 @@ app.add_middleware(
 app.mount("/artifacts/screenshots", StaticFiles(directory=SCREENSHOTS_DIR), name="screenshots")
 app.mount("/artifacts/traces", StaticFiles(directory=TRACES_DIR), name="traces")
 app.mount("/artifacts/responses", StaticFiles(directory=RESPONSES_DIR), name="responses")
-app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets", check_dir=False), name="frontend-assets")
+app.mount("/assets", FrontendAssets(directory=STATIC_DIR / "assets", check_dir=False), name="frontend-assets")
 
 
 def _project_context(
@@ -202,6 +204,28 @@ def _active_project_context(project_id: int = Depends(_project_context)) -> int:
     if project.get("status") != "active":
         raise HTTPException(status_code=409, detail="归档项目为只读状态")
     return project_id
+
+
+def _library_project_context(
+    project_id: int,
+    header_project_id: int = Depends(_project_context),
+) -> int:
+    if int(project_id) != int(header_project_id):
+        raise HTTPException(status_code=400, detail="路径 project_id 与 X-PulseGuard-Project-Id 不一致")
+    return int(project_id)
+
+
+def _active_library_project_context(
+    project_id: int,
+    header_project_id: int = Depends(_project_context),
+) -> int:
+    scoped_project_id = _library_project_context(project_id, header_project_id)
+    project = storage.get_project(scoped_project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if project.get("status") != "active":
+        raise HTTPException(status_code=409, detail="归档项目为只读状态")
+    return scoped_project_id
 
 
 @app.get("/api/health")
@@ -275,6 +299,246 @@ def delete_project(project_id: int, request: Request) -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.get("/api/projects/{project_id}/library")
+def project_library(project_id: int = Depends(_library_project_context)) -> dict[str, Any]:
+    try:
+        return storage.get_project_library(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/library")
+def save_library(
+    payload: ScriptLibrarySaveRequest,
+    project_id: int = Depends(_active_library_project_context),
+) -> dict[str, Any]:
+    """Save the complete project library and make it effective in one transaction."""
+
+    try:
+        saved = storage.save_project_library(
+            project_id,
+            payload.expected_revision,
+            payload.modules,
+        )
+    except storage.LibraryRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "expected_revision": exc.expected, "actual_revision": exc.actual},
+        ) from exc
+    except storage.LibraryStaticReferenceConflict as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(exc), "diagnostics": exc.diagnostics},
+        ) from exc
+    except storage.ModuleLibraryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    published = saved.get("published") if isinstance(saved.get("published"), dict) else {}
+    storage.record_audit_event(
+        "saved",
+        "script_library",
+        project_id,
+        summary="保存项目公共方法",
+        payload={
+            "effective_revision": int(saved.get("effective_revision") or 0),
+            "version_id": published.get("version_id"),
+            "content_hash": published.get("content_hash"),
+        },
+        project_id=project_id,
+    )
+    return saved
+
+
+@app.put("/api/projects/{project_id}/library/draft")
+def update_library_draft(
+    payload: ScriptLibraryDraftUpdate,
+    project_id: int = Depends(_active_library_project_context),
+) -> dict[str, Any]:
+    try:
+        return storage.update_project_library_draft(
+            project_id,
+            payload.expected_revision,
+            payload.modules,
+        )
+    except storage.LibraryRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "expected_revision": exc.expected, "actual_revision": exc.actual},
+        ) from exc
+    except storage.ModuleLibraryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/library/references")
+def library_references(project_id: int = Depends(_library_project_context)) -> dict[str, Any]:
+    try:
+        return storage.get_project_library_references(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/library/versions")
+def library_versions(
+    limit: int = Query(default=100, ge=1, le=500),
+    project_id: int = Depends(_library_project_context),
+) -> list[dict[str, Any]]:
+    try:
+        return storage.list_project_library_versions(project_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/library/versions/{version_id}")
+def library_version(
+    version_id: int,
+    project_id: int = Depends(_library_project_context),
+) -> dict[str, Any]:
+    version = storage.get_project_library_version(project_id, version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="公共方法版本不存在")
+    return version
+
+
+@app.post("/api/projects/{project_id}/library/validate", status_code=202)
+async def validate_library(
+    payload: ScriptLibraryValidationCreate,
+    request: Request,
+    project_id: int = Depends(_active_library_project_context),
+) -> dict[str, Any]:
+    try:
+        validation = storage.create_project_library_validation(
+            project_id,
+            payload.candidate_revision,
+            include_disabled=payload.include_disabled,
+        )
+    except storage.LibraryRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except storage.ModuleLibraryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    storage.record_audit_event(
+        "created",
+        "script_library_validation",
+        validation["id"],
+        summary="创建公共方法验证",
+        payload={
+            "candidate_revision": validation["candidate_revision"],
+            "include_disabled": bool(validation.get("include_disabled")),
+        },
+        project_id=project_id,
+    )
+    _track_background_task(
+        request.app,
+        script_library_service.run_project_library_validation(
+            project_id,
+            int(validation["id"]),
+            request.app.state.runner,
+        ),
+    )
+    return {
+        "validation_id": int(validation["id"]),
+        "status": str(validation["status"]),
+        "candidate_revision": int(validation["candidate_revision"]),
+        "content_hash": str(validation.get("content_hash") or ""),
+    }
+
+
+@app.get("/api/projects/{project_id}/library/validations/{validation_id}")
+def library_validation(
+    validation_id: int,
+    project_id: int = Depends(_library_project_context),
+) -> dict[str, Any]:
+    validation = storage.get_project_library_validation(project_id, validation_id)
+    if not validation:
+        raise HTTPException(status_code=404, detail="公共方法验证不存在")
+    return validation
+
+
+@app.post("/api/projects/{project_id}/library/validations/{validation_id}/cancel")
+def cancel_library_validation(
+    validation_id: int,
+    request: Request,
+    project_id: int = Depends(_active_library_project_context),
+) -> dict[str, Any]:
+    validation = storage.cancel_project_library_validation(project_id, validation_id)
+    if not validation:
+        raise HTTPException(status_code=404, detail="公共方法验证不存在")
+    storage.record_audit_event(
+        "cancelled",
+        "script_library_validation",
+        validation_id,
+        summary="取消公共方法验证",
+        project_id=project_id,
+    )
+    return validation
+
+
+@app.post("/api/projects/{project_id}/library/publish")
+def publish_library(
+    payload: ScriptLibraryPublishRequest,
+    request: Request,
+    project_id: int = Depends(_active_library_project_context),
+) -> dict[str, Any]:
+    try:
+        version = storage.publish_project_library(
+            project_id,
+            payload.candidate_revision,
+            payload.validation_id,
+        )
+    except storage.LibraryRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except storage.LibraryValidationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except storage.ModuleLibraryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    storage.record_audit_event(
+        "published",
+        "script_library_version",
+        version["version_id"],
+        summary="发布公共方法版本",
+        payload={
+            "revision": version["revision"],
+            "release_hash": version["release_hash"],
+            "content_hash": version["content_hash"],
+            "validation_id": payload.validation_id,
+        },
+        project_id=project_id,
+    )
+    return version
+
+
+@app.post("/api/projects/{project_id}/library/rollback")
+def rollback_library(
+    payload: ScriptLibraryRollbackRequest,
+    request: Request,
+    project_id: int = Depends(_active_library_project_context),
+) -> dict[str, Any]:
+    try:
+        version = storage.rollback_project_library(project_id, payload.version_id)
+    except storage.LibraryValidationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        if "版本不存在" in str(exc):
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    storage.record_audit_event(
+        "rolled_back",
+        "script_library_version",
+        version["version_id"],
+        summary="回退公共方法版本",
+        payload={"release_hash": version["release_hash"], "content_hash": version["content_hash"]},
+        project_id=project_id,
+    )
+    return version
+
+
 @app.get("/api/worker/health")
 def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
     _verify_worker_token(_bearer_token(authorization))
@@ -306,6 +570,7 @@ def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
             "update_current_image": current_image,
             "update_available": bool(update_supported and current_image and update_target and current_image != update_target),
             "browser_type_status": capabilities["browser_type_status"],
+            "capabilities": [API_SCRIPT_ASSERTIONS_CAPABILITY, SCRIPT_MODULES_CAPABILITY],
         },
     }
 
@@ -885,7 +1150,18 @@ async def inspect_api_check(
     runner = getattr(request.app.state, "runner", None)
     resources = getattr(runner, "resources", None)
     try:
-        return await inspect_api_response(payload.model_dump(), settings, resources=resources)
+        script_loader = getattr(runner, "_load_check_function", None)
+        config = {**payload.model_dump(), "project_id": project_id}
+        if str(config.get("script") or "").strip():
+            config["_module_bundle"] = storage.get_published_library(project_id)
+        return await inspect_api_response(
+            config, settings, resources=resources, script_loader=script_loader
+        )
+    except ApiInspectionFailure as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"接口请求失败：{mask_text(str(exc), settings)}", "diagnostics": exc.diagnostics},
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=mask_text(str(exc), settings)) from exc
     except httpx.HTTPError as exc:

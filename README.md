@@ -36,8 +36,19 @@ PulseGuard 不试图替代完整 E2E 测试平台、公开状态页或 incident/
 
 - 支持定时、手动、批量与重跑；
 - UI 支持结构化步骤、前置脚本和多浏览器类型；
-- API 支持请求配置、字段预览、基础断言和高级脚本；
+- API 支持请求配置、字段预览、基础断言和高级脚本；脚本可先获取令牌、签名或动态参数，再发起目标请求，健康规则检查最后一次响应，无需重复请求；
 - 编辑器试运行不污染正式健康状态或告警统计。
+
+### 项目公共方法库
+
+在“项目管理 → 公共方法”集中维护 Python 函数，同一项目的 API、UI 和前置脚本通过 `ctx.modules.use("模块名")` 复用请求准备、签名和解析逻辑。
+
+- 列表、新建、编辑和保存即生效，编辑器提供模块与函数补全；
+- 保存前检查 Python 编译错误、模块导出及已有任务引用，阻止删除仍被引用的方法；
+- 新运行使用最新保存的源码，已开始的运行和重试继续使用捕获的源码快照；
+- 项目配置导出包含当前生效库，导入时检查同名源码冲突和任务引用。
+
+使用方式见 [项目公共方法库](./docs/project-script-library.md)；动态 API 请求与规则示例见 [API 健康判定](./docs/api-health-checks.md)。
 
 ### 可信健康状态
 
@@ -52,6 +63,7 @@ PulseGuard 不把单次抖动直接等同于故障。系统区分：
 ### 失败证据与趋势
 
 - 失败摘要、截图和 Response Body；
+- API 预览与运行详情保留最近请求记录、规则结果和编译诊断，分别展示目标请求耗时与全程探测耗时；
 - 可选 Playwright Trace，默认关闭；
 - 24 小时、7 天、30 天和自定义时间段趋势；
 - 成功响应时间的平均值、P95、P99 与失败次数；
@@ -78,6 +90,12 @@ PulseGuard 不把单次抖动直接等同于故障。系统区分：
 - 支持冷却与恢复通知；
 - 提供项目范围的 JSON、Prometheus 和受令牌保护的只读快照；
 - 系统配置包与项目配置包分离，支持脱敏导出、导入预检与版本恢复。
+
+### Skill / MCP 接入
+
+通过独立安装的本地 stdio MCP 服务，让 AI 客户端按项目查询任务与运行记录、分析失败、对比成功基线，并读取已保留的截图。控制台“Skill / MCP”页面可生成当前项目的连接配置并下载操作 Skill。
+
+连接默认只读；显式启用执行后，可在用户授权范围内运行已有任务。真实执行可能更新健康状态并发送告警。安装、配置和工具说明见 [Skill + MCP 接入](./docs/mcp.md)。
 
 ## 快速启动
 
@@ -149,6 +167,9 @@ Relay 使用自签 TLS、server fingerprint pinning、一次性部署凭据、To
 | 文档 | 内容 |
 | --- | --- |
 | [运维与运行参考](./docs/operations-reference.md) | 本地开发、浏览器池、多节点、Relay、Token、接口和排障 |
+| [项目公共方法库](./docs/project-script-library.md) | Python 方法复用、保存校验、执行快照与项目导入导出 |
+| [API 健康判定](./docs/api-health-checks.md) | 动态请求、最后响应校验与执行诊断 |
+| [Skill + MCP 接入](./docs/mcp.md) | AI 项目查询、失败诊断、截图与授权探活 |
 | [中国网络环境部署](./docs/china-deployment.md) | 国内镜像与依赖环境部署 |
 | [火山与本地节点部署](./docs/volcano-deployment.md) | 火山主节点、本地子节点和迁移流程 |
 | [English README](./README.en.md) | English overview and setup |
@@ -180,6 +201,8 @@ uv lock --check
 ```text
 backend/                    FastAPI 后端、存储、运行器、告警、测试
 frontend/                   React 前端、页面、组件和样式
+integrations/mcp/           独立安装的 stdio MCP 服务、锁文件和集成测试
+.agents/skills/             可分发的 PulseGuard AI 操作 Skill
 data/                       SQLite 数据目录
 reports/                    截图、Trace、Response Body 和归档摘要
 docs/                       部署、设计和运行文档

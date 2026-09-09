@@ -4237,6 +4237,59 @@ tr:last-child td {
   gap: var(--space-field);
 }
 
+.api-run-timings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-inner);
+}
+
+.api-run-timings > div {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-strong);
+  padding: var(--space-inner) var(--space-sm);
+  display: grid;
+  gap: 3px;
+}
+
+.api-run-timings span {
+  color: var(--pg-muted);
+  font-size: 12px;
+}
+
+.api-run-timings strong {
+  font-variant-numeric: tabular-nums;
+  font-size: var(--type-meta);
+}
+
+.api-request-chain-table .ant-table {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.api-request-chain-request {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-inner);
+}
+
+.api-request-chain-request code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-request-chain-detail {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-field);
+}
+
 .failure-summary-panel {
   background: color-mix(in srgb, var(--panel-strong) 34%, var(--panel));
 }
@@ -6149,6 +6202,8 @@ tr:last-child td {
   .environment-variable-grid,
   .run-detail-meta,
   .run-request-config-grid,
+  .api-run-timings,
+  .api-request-chain-detail,
   .run-evidence-grid,
   .detail-grid,
   .api-assertion-workbench,

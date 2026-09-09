@@ -1,0 +1,4 @@
+interface:
+  display_name: "PulseGuard"
+  short_description: "Inspect health, diagnose failures and run authorized probes"
+  default_prompt: "Use $pulseguard-operations to inspect my project health and explain the latest failures."

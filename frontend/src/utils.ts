@@ -97,6 +97,39 @@ export function dirtyTagColor(isDirty: boolean): SemanticTagColor {
   return isDirty ? "warning" : "success";
 }
 
+export async function copyTextToClipboard(value: string): Promise<void> {
+  if (copyTextWithTextarea(value)) return;
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Some local browser contexts expose Clipboard API but deny writes.
+    }
+  }
+
+  if (!copyTextWithTextarea(value)) throw new Error("copy command rejected");
+}
+
+function copyTextWithTextarea(value: string): boolean {
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  try {
+    return document.execCommand("copy");
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
 export function enabledTagColor(enabled: boolean): SemanticTagColor {
   return enabled ? "success" : "default";
 }

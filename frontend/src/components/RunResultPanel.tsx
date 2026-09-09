@@ -5,7 +5,16 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "../api";
 import { RunnerExecutionTag, failureKindTag } from "./shared/businessTags";
-import type { Run, RunCheckRequestInfo, RunComparison, RunComparisonAssertion, RunComparisonField, RunFailureSummary } from "../types";
+import type {
+  ApiHttpExchange,
+  ApiInspectionTimings,
+  Run,
+  RunCheckRequestInfo,
+  RunComparison,
+  RunComparisonAssertion,
+  RunComparisonField,
+  RunFailureSummary
+} from "../types";
 import { artifactHref, formatDate, formatDuration, parseSnapshot, runnerSummary, runStatusLabel, runStatusTagColor } from "../utils";
 import { StructuredViewer } from "./StructuredViewer";
 
@@ -66,6 +75,8 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true, 
   const responseBody = useMemo(() => extractResponseBody(responseSnapshot), [responseSnapshot]);
   const assertionResults = useMemo(() => extractAssertionResults(responseSnapshot), [responseSnapshot]);
   const stageTimings = useMemo(() => extractStageTimings(responseSnapshot, run?.check_type), [responseSnapshot, run?.check_type]);
+  const apiRequestHistory = useMemo(() => extractApiRequestHistory(requestSnapshot), [requestSnapshot]);
+  const apiTimings = useMemo(() => extractApiTimings(responseSnapshot), [responseSnapshot]);
   const groupSummary = useMemo(() => summarizeRunGroup(groupRuns), [groupRuns]);
   const groupMetaItems = useMemo(() => summarizeRunGroupMeta(run, groupRuns), [groupRuns, run]);
   const isApiSingleGroup = run?.check_type === "api" && !groupLoading && !groupError && groupRuns.length <= 1;
@@ -193,6 +204,9 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true, 
     <Space orientation="vertical" size={14} className="drawer-stack">
       {showFailureSummary && <FailureSummaryPanel summary={failureSummary} error={failureSummaryError} loading={failureSummaryLoading} />}
       {uiRequestInfo && <CheckRequestSection check={uiRequestInfo} />}
+      {run.check_type === "api" && (
+        <ApiRequestChainSection run={run} history={apiRequestHistory} timings={apiTimings} />
+      )}
       <DetailSection title={compactNodeDetail ? "节点信息" : "运行信息"}>
         <Descriptions bordered column={detailDescriptionColumns} size="small">
           <Descriptions.Item label="执行结果">
@@ -420,6 +434,130 @@ function CheckRequestSection({ check }: { check: RunCheckRequestInfo }) {
       )}
     </DetailSection>
   );
+}
+
+interface ApiTimingSummary {
+  requestMs: number | null;
+  taskMs: number | null;
+}
+
+interface ApiRequestChainRow {
+  key: string;
+  index: number;
+  method: string;
+  url: string;
+  status: string;
+  statusCode: number | null;
+  durationMs: number | null;
+  error: string | null;
+  request: unknown;
+  response: unknown;
+}
+
+function ApiRequestChainSection({
+  history,
+  run,
+  timings
+}: {
+  history: ApiHttpExchange[];
+  run: Run;
+  timings: ApiTimingSummary;
+}) {
+  const rows = history.map(toApiRequestChainRow);
+  const totalMs = timings.taskMs ?? numericMs(run.duration_ms);
+  const columns: ColumnsType<ApiRequestChainRow> = [
+    {
+      title: "序号",
+      dataIndex: "index",
+      width: 62,
+      align: "center"
+    },
+    {
+      title: "请求",
+      key: "request",
+      width: 360,
+      render: (_, item) => (
+        <div className="api-request-chain-request">
+          <Tag>{item.method}</Tag>
+          <code title={item.url}>{item.url}</code>
+        </div>
+      )
+    },
+    {
+      title: "结果",
+      key: "status",
+      width: 110,
+      render: (_, item) => (
+        <Tag color={apiExchangeStatusColor(item)}>{item.status}</Tag>
+      )
+    },
+    {
+      title: "耗时",
+      dataIndex: "durationMs",
+      width: 96,
+      render: (value: number | null) => formatDuration(value)
+    }
+  ];
+
+  return (
+    <DetailSection title="接口请求链" extra={<Tag>{rows.length ? `最近 ${rows.length} 条` : "暂无记录"}</Tag>}>
+      <div className="api-run-timings">
+        <div>
+          <span>目标请求耗时</span>
+          <strong>{formatDuration(timings.requestMs)}</strong>
+        </div>
+        <div>
+          <span>全程探测耗时</span>
+          <strong>{formatDuration(totalMs)}</strong>
+        </div>
+      </div>
+      {rows.length ? (
+        <Table
+          rowKey="key"
+          size="small"
+          pagination={false}
+          columns={columns}
+          dataSource={rows}
+          className="api-request-chain-table"
+          expandable={{
+            expandedRowRender: (item) => (
+              <div className="api-request-chain-detail">
+                <StructuredViewer title="请求" value={item.request} defaultMode="json" />
+                <StructuredViewer title="响应" value={item.response || item.error} defaultMode="auto" />
+              </div>
+            )
+          }}
+          scroll={{ x: 640 }}
+        />
+      ) : (
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无请求记录" />
+      )}
+    </DetailSection>
+  );
+}
+
+function toApiRequestChainRow(exchange: ApiHttpExchange, index: number): ApiRequestChainRow {
+  const request = objectRecord(exchange.request);
+  const response = objectRecord(exchange.response);
+  const statusCode = numericMs(response?.status_code);
+  const error = typeof exchange.error === "string" && exchange.error.trim() ? exchange.error : null;
+  return {
+    key: `${index}-${String(request?.url || request?.url_template || "")}`,
+    index: index + 1,
+    method: String(request?.method || "-").toUpperCase(),
+    url: String(request?.url || request?.url_template || response?.url || "-"),
+    status: statusCode === null ? (error ? "请求失败" : "未完成") : `HTTP ${statusCode}`,
+    statusCode,
+    durationMs: numericMs(exchange.duration_ms),
+    error,
+    request: exchange.request,
+    response: exchange.response
+  };
+}
+
+function apiExchangeStatusColor(row: ApiRequestChainRow): string {
+  if (row.error || row.statusCode === null) return "error";
+  return row.statusCode >= 400 ? "error" : row.statusCode >= 300 ? "warning" : "success";
 }
 
 function RunComparisonPanel({
@@ -954,6 +1092,25 @@ function extractResponseBody(value: unknown): unknown {
   return null;
 }
 
+function extractApiRequestHistory(value: unknown): ApiHttpExchange[] {
+  const snapshot = objectRecord(value);
+  const diagnostics = objectRecord(snapshot?.diagnostics);
+  const history = diagnostics?.http_requests;
+  if (!Array.isArray(history)) return [];
+  return history
+    .filter((item): item is ApiHttpExchange => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+    .slice(-10);
+}
+
+function extractApiTimings(value: unknown): ApiTimingSummary {
+  const snapshot = objectRecord(value);
+  const timings = objectRecord(snapshot?.timings) as ApiInspectionTimings | null;
+  return {
+    requestMs: numericMs(timings?.request_ms),
+    taskMs: numericMs(timings?.task_ms)
+  };
+}
+
 function extractAssertionResults(value: unknown): AssertionResult[] {
   if (value && typeof value === "object" && "assertions" in value) {
     const assertions = (value as { assertions?: unknown }).assertions;
@@ -969,7 +1126,7 @@ function extractStageTimings(value: unknown, checkType?: Run["check_type"]): Sta
   const page = objectRecord(snapshot.page);
   if (checkType === "api") {
     const requestMs = numericMs(timings?.request_ms) ?? numericMs(snapshot.duration_ms);
-    return requestMs === null ? [] : [{ label: "请求耗时", value: requestMs }];
+    return requestMs === null ? [] : [{ label: "目标请求耗时", value: requestMs }];
   }
   const result: StageTiming[] = [];
   const pageLoadMs = numericMs(timings?.page_load_ms) ?? numericMs(page?.load_ms);

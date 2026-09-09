@@ -20,7 +20,17 @@ import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import { api, ApiError } from "../api";
 import { useProject } from "../ProjectContext";
 import { UiInspectionFeedback } from "./UiInspectionFeedback";
-import type { CheckPayload, UiAssertion, UiAssertionType, UiElementCandidate, UiInspectResult, UiRuleInspectItem, UiRuleInspectResult, UiSelectorOption } from "../types";
+import type {
+  CheckPayload,
+  UiAssertion,
+  UiAssertionType,
+  UiElementCandidate,
+  UiInspectResult,
+  UiInspectionDiagnostics,
+  UiRuleInspectItem,
+  UiRuleInspectResult,
+  UiSelectorOption
+} from "../types";
 import { createUiAssertion, parseUiAssertions, serializeUiAssertions, UI_ASSERTION_LABELS } from "../uiAssertions";
 import { VIEWPORT_PRESETS } from "./ViewportModeControl";
 
@@ -496,7 +506,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
       </div>
 
       <UiInspectionFeedback error={ruleInspectError?.message}
-        diagnostics={ruleInspectError instanceof ApiError ? ruleInspectError.diagnostics : ruleInspectResult?.diagnostics}
+        diagnostics={ruleInspectError instanceof ApiError ? asUiDiagnostics(ruleInspectError.diagnostics) : ruleInspectResult?.diagnostics}
         onRetry={() => void inspectRules()} />
       {assertions.length === 0 ? (
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
@@ -552,7 +562,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
           </div>
 
           {inspectError && <UiInspectionFeedback error={inspectError.message}
-            diagnostics={inspectError instanceof ApiError ? inspectError.diagnostics : undefined}
+            diagnostics={inspectError instanceof ApiError ? asUiDiagnostics(inspectError.diagnostics) : undefined}
             onRetry={() => void inspectPage()} />}
 
           <div className="ui-picker-layout">
@@ -889,6 +899,11 @@ function withCandidateSelector(candidate: UiElementCandidate, selector?: string)
 
 function selectorOptionLabel(option: UiSelectorOption): string {
   return option.selector;
+}
+
+function asUiDiagnostics(value: ApiError["diagnostics"]): UiInspectionDiagnostics | undefined {
+  if (!value || !("url_variables" in value) || !("variables" in value)) return undefined;
+  return value as UiInspectionDiagnostics;
 }
 
 function markerStyle(candidate: UiElementCandidate, result: UiInspectResult, index: number): CSSProperties {

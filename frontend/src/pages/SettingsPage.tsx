@@ -48,7 +48,7 @@ import type {
   SettingsValues,
   WebhookType
 } from "../types";
-import { dirtyTagColor, enabledTagColor, formatDate } from "../utils";
+import { copyTextToClipboard, dirtyTagColor, enabledTagColor, formatDate } from "../utils";
 import { useProject } from "../ProjectContext";
 
 type SettingsTab = "alerts" | "system-alerts" | "execution" | "variables" | "system";
@@ -2231,42 +2231,6 @@ docker compose -f docker-compose.worker.yml restart pulseguard-worker`}</pre>
       </Modal>
     </SettingsPanel>
   );
-}
-
-async function copyTextToClipboard(value: string): Promise<void> {
-  if (copyTextWithTextarea(value)) return;
-
-  if (navigator.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(value);
-      return;
-    } catch {
-      // Fall back to a temporary textarea below. Some local browser contexts
-      // expose Clipboard API but deny writes without a focused secure context.
-    }
-  }
-
-  if (!copyTextWithTextarea(value)) {
-    throw new Error("copy command rejected");
-  }
-}
-
-function copyTextWithTextarea(value: string): boolean {
-  const textarea = document.createElement("textarea");
-  textarea.value = value;
-  textarea.setAttribute("readonly", "true");
-  textarea.style.position = "fixed";
-  textarea.style.left = "-9999px";
-  textarea.style.top = "0";
-  document.body.appendChild(textarea);
-  textarea.focus();
-  textarea.select();
-  textarea.setSelectionRange(0, textarea.value.length);
-  try {
-    return document.execCommand("copy");
-  } finally {
-    document.body.removeChild(textarea);
-  }
 }
 
 function ReadOnlyApiDocs({ onCopyPath }: { onCopyPath: (path: string) => void }) {
