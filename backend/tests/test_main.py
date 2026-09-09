@@ -1146,12 +1146,19 @@ class RunnerHealthPollingTests(unittest.TestCase):
             install_started = asyncio.Event()
             release_install = asyncio.Event()
             install_failed = asyncio.Event()
+            second_health_poll = asyncio.Event()
+            hold_later_polls = asyncio.Event()
             fetch_count = 0
             install_calls = 0
 
             async def fetch(_: dict[str, object]) -> dict[str, object]:
                 nonlocal fetch_count
                 fetch_count += 1
+                if fetch_count == 2:
+                    second_health_poll.set()
+                elif fetch_count > 2:
+                    # Keep later rounds from retrying after the first install fails.
+                    await hold_later_polls.wait()
                 return self._health()
 
             async def install(_: dict[str, object], __: dict[str, object]) -> None:
@@ -1159,7 +1166,6 @@ class RunnerHealthPollingTests(unittest.TestCase):
                 install_calls += 1
                 install_started.set()
                 await release_install.wait()
-                install_failed.set()
                 raise RuntimeError("browser install failed")
 
             with patch.object(main_module.storage, "list_enabled_probe_runners", return_value=[runner]), patch.object(
@@ -1173,17 +1179,17 @@ class RunnerHealthPollingTests(unittest.TestCase):
             ), patch.object(main_module, "logger") as logger, patch.object(
                 main_module, "RUNNER_HEALTH_POLL_SECONDS", 0.01
             ):
+                logger.exception.side_effect = lambda *args: install_failed.set()
                 poll_task = asyncio.create_task(main_module._runner_health_poll_loop())
                 try:
                     await asyncio.wait_for(install_started.wait(), 1)
-                    await asyncio.sleep(0.05)
+                    await asyncio.wait_for(second_health_poll.wait(), 1)
                     self.assertEqual(install_calls, 1)
                     self.assertGreaterEqual(fetch_count, 2)
                     self.assertGreaterEqual(mark_available.call_count, 2)
                     mark_unavailable.assert_not_called()
                     release_install.set()
                     await asyncio.wait_for(install_failed.wait(), 1)
-                    await asyncio.sleep(0)
                     mark_unavailable.assert_not_called()
                     logger.exception.assert_called_once()
                 finally:

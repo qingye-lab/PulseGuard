@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -421,7 +422,7 @@ class CheckAlertPolicyStorageTests(unittest.TestCase):
         ):
             db_path = Path(temp_dir) / "pulseguard.db"
             timestamp = storage.now_iso()
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 conn.execute(
                     """
                     CREATE TABLE checks (
@@ -475,7 +476,9 @@ class CheckAlertPolicyStorageTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "migrate-projects.py --apply"):
                 storage.init_db()
 
-        self.assertTrue(db_path.exists())
+            self.assertTrue(db_path.exists())
+            with closing(sqlite3.connect(db_path)) as conn:
+                self.assertEqual(conn.execute("SELECT name FROM checks").fetchall(), [("Legacy policy API",)])
 
     def test_member_settings_support_multiple_channels_and_prune_deleted_task_references(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(

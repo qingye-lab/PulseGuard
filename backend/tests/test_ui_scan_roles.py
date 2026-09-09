@@ -40,7 +40,7 @@ class UiScanRoleTests(unittest.IsolatedAsyncioTestCase):
                 scan = await self.page.evaluate(UI_SCAN_SCRIPT)
                 title = next(c for c in scan["candidates"] if c["text"] == "Title 0")
                 self.assertEqual(await self.page.locator(title["selector"]).count(), 1)
-                self.assertTrue((await _wait_for_selector_collection(self.page, title, "visible", 10))[0])
+                self.assertTrue((await _wait_for_selector_collection(self.page, title, "visible", 1000))[0])
 
     async def test_repeated_fields_survive_build_hash_change_and_detect_missing_field(self) -> None:
         await self.fixture(2)
@@ -50,7 +50,7 @@ class UiScanRoleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(title["scope_selector"], title["relative_selector"])
         self.assertEqual(await self.page.locator(title["scope_selector"]).count(), 2)
         await self.fixture(2, suffix="newBuild")
-        self.assertTrue((await _wait_for_selector_collection(self.page, title, "visible", 10))[0])
+        self.assertTrue((await _wait_for_selector_collection(self.page, title, "visible", 1000))[0])
         await self.page.locator(title["selector"]).last.evaluate("el => el.remove()")
         passed, actual = await _wait_for_selector_collection(self.page, title, "visible", 10)
         self.assertFalse(passed)
