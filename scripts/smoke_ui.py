@@ -283,7 +283,7 @@ def main() -> int:
                     drawer.locator('input[name="check-name"]').fill(name)
                     drawer.locator('input[name="check-entry-url"]').fill(f"{base}/api/health")
                     with page.expect_response(lambda response: response.url.endswith("/api/checks/debug") and response.request.method == "POST") as debug_response:
-                        drawer.get_by_role("button", name="试运行当前配置", exact=True).click()
+                        drawer.get_by_role("button", name="试运行草稿", exact=True).click()
                     debug = debug_response.value.json()
                     assert debug_response.value.ok and debug["status"] == "ok", debug
                     expect(drawer.get_by_role("heading", name="调试结果", exact=True)).to_be_visible()
@@ -363,7 +363,7 @@ def main() -> int:
                     assert api_requests[before_requests:] == ['seed', 'target:fresh'], api_requests
                     before_requests = len(api_requests)
                     with page.expect_response(lambda r: r.url.endswith('/api/checks/debug')) as debug_chain_response:
-                        chain_drawer.get_by_role('button', name='试运行当前配置', exact=True).click()
+                        chain_drawer.get_by_role('button', name='试运行草稿', exact=True).click()
                     chain_run = debug_chain_response.value.json()
                     assert debug_chain_response.value.ok and chain_run['status'] == 'ok', chain_run
                     assert api_requests[before_requests:] == ['seed', 'target:fresh'], api_requests
