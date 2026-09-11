@@ -6,12 +6,12 @@ This file defines repository-specific workflow rules for PulseGuard. Higher-prio
 
 ## Remote Synchronization
 
-Both remotes publish the same product and must keep identical source trees.
-Historical commits differ; preserve each remote's history without force pushes.
+Both remotes publish the same product from the same `main` commit.
+Maintain one baseline and push it to both remotes without force pushes.
 
 - Retain useful changes from either remote before synchronizing.
-- Apply the verified source tree as a new commit on each divergent line.
-- Verify tree equality before and after pushing both main branches.
+- Preserve historical divergence through a history-preserving merge, retaining the verified source tree.
+- Verify commit equality after pushing both remote main branches.
 - Do not commit real company or team names. Team identity is optional deployment configuration.
 - `VITE_APP_TEAM_NAME` controls the frontend team badge at build time; empty or whitespace hides it.
 - `PULSEGUARD_TEAM_NAME` controls the health endpoint's existing `team` field; it defaults to empty.
