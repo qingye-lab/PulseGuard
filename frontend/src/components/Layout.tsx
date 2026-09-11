@@ -309,7 +309,10 @@ export function Layout() {
           </Dropdown>
         </div>
       </aside>
-      <main className="main-area" id="main-content">
+      {/* tabIndex=-1 makes the skip link actually move focus here instead of only
+          scrolling; without it the browser leaves focus on <body> and the next
+          Tab returns to the sidebar the reader just tried to skip. */}
+      <main className="main-area" id="main-content" tabIndex={-1}>
         <header className="topbar">
           <div>
             <Title level={1} className="page-title">
