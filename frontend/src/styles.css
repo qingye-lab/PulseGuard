@@ -198,6 +198,12 @@ button svg {
   transform: translateY(0);
 }
 
+/* The main region receives focus from the skip link. It is a programmatic
+   target, not an interactive control, so it must not paint a focus ring. */
+.main-area:focus {
+  outline: none;
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 232px minmax(0, 1fr);
