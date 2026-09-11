@@ -37,7 +37,7 @@ const { Text, Title } = Typography;
 // The team badge is deployment branding, not application data, so it is not
 // hardcoded here. Set VITE_APP_TEAM_NAME at build time to show one; the badge
 // stays out of the layout entirely when it is unset.
-const APP_TEAM_NAME = import.meta.env.VITE_APP_TEAM_NAME || "";
+const APP_TEAM_NAME = (import.meta.env.VITE_APP_TEAM_NAME || "").trim();
 
 type NavLeaf = {
   to: string;

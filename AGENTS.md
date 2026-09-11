@@ -4,47 +4,18 @@
 
 This file defines repository-specific workflow rules for PulseGuard. Higher-priority system, developer, and tool instructions still apply.
 
-## Branch Lines
+## Remote Synchronization
 
-This repository publishes to two remotes that carry **two different product lines**. They are not two progress levels of one line; they diverged at `388e375` and were both rewritten afterwards, so the same work appears on each side under different commit hashes.
+Both remotes publish the same product and must keep identical source trees.
+Historical commits differ; preserve each remote's history without force pushes.
 
-| Remote | Line | Branding | Purpose |
-| --- | --- | --- | --- |
-| `origin` | Public | **Stripped** | GitHub release. No company, team, or internal host identity anywhere in content. |
-| `corp` | Internal | **Preserved** | Internal GitLab deployment. May carry internal-only identity. |
-
-- `origin` — `https://github.com/liyanqing90/PulseGuard.git`
-- `corp` — `https://git.corpautohome.com/liyanqing/PulseGuard.git`
-
-The two lines are kept in sync by content, not by history. Do not assume a commit on one side has a mirror on the other, and do not merge the lines into each other.
-
-### Branding rule
-
-Brand identity is a **build-time deployment setting**, never a literal in source that ships to both lines. Each surface has one knob, and both default to empty:
-
-| Surface | Setting | Unset behaviour |
-| --- | --- | --- |
-| Console team badge | `VITE_APP_TEAM_NAME` (frontend build arg) | Badge is omitted from the layout |
-| `GET /api/health` `team` field | `PULSEGUARD_TEAM_NAME` (backend env) | Field is an empty string |
-
-Both are plumbed through `Dockerfile` build args so a single source tree produces either build. Never reintroduce a hardcoded company or team name — such as `新零售测试团队` — into source, tests, fixtures, or committed configuration.
-
-A public build must be verifiable as unbranded before release:
-
-```sh
-cd frontend && npm run build          # no VITE_APP_TEAM_NAME set
-grep -ri "新零售测试团队" frontend/dist backend/app   # must return nothing
-curl -s http://127.0.0.1:8787/api/health             # "team" must be empty
-```
-
-`backend/tests/test_main.py` guards the `PULSEGUARD_TEAM_NAME` default, so a source literal reaching a release build fails the suite.
-
-### Adding a change to both lines
-
-1. Land the change on the internal line first, where it can be exercised against the real deployment.
-2. Re-apply it to the public line as a **new commit**. Do not cherry-pick the internal commit if it carries branding; the cherry-pick will drag the identity across.
-3. Run the unbranded verification above on the public side.
-4. If the same work must exist on both, keep commit messages identical so the pairs stay recognisable in `git log`, and accept that the hashes will differ.
+- Retain useful changes from either remote before synchronizing.
+- Apply the verified source tree as a new commit on each divergent line.
+- Verify tree equality before and after pushing both main branches.
+- Do not commit real company or team names. Team identity is optional deployment configuration.
+- `VITE_APP_TEAM_NAME` controls the frontend team badge at build time; empty or whitespace hides it.
+- `PULSEGUARD_TEAM_NAME` controls the health endpoint's existing `team` field; it defaults to empty.
+- Docker Compose forwards both settings as build arguments. Rebuild to change the frontend setting.
 
 ## Architecture Boundaries
 
