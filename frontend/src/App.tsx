@@ -35,8 +35,8 @@ export default function App() {
     <Routes key={currentProject.id}>
       <Route element={<Layout />}>
         <Route path="/" element={page(<OverviewPage />)} />
-        <Route path="/ui-checks" element={page(<ChecksPage type="ui" />)} />
-        <Route path="/api-checks" element={page(<ChecksPage type="api" />)} />
+        <Route path="/ui-checks" element={page(<ChecksPage key="ui" type="ui" />)} />
+        <Route path="/api-checks" element={page(<ChecksPage key="api" type="api" />)} />
         <Route path="/monitoring" element={page(<MonitoringPage />)} />
         <Route path="/runs" element={page(<RunsPage />)} />
         <Route path="/runs/:runId" element={page(<RunDetailPage />)} />

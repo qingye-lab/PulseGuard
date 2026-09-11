@@ -2,6 +2,10 @@ import type { Check, CheckType, FailureKind, NotificationStatus, Run, RunStatus,
 
 export type SemanticTagColor = "default" | "blue" | "success" | "warning" | "error" | "processing";
 
+export function formatRunDuration(run: Pick<Run, "status" | "duration_ms">): string {
+  return run.status === "preparation_failed" ? "未执行" : formatDuration(run.duration_ms);
+}
+
 export function taskStatus(check: Check): TaskSurfaceStatus {
   if (!check.enabled) return "disabled";
   return normalizedTaskStatus(check.monitor_status || check.current_status || "unknown");
@@ -26,7 +30,8 @@ export function runStatusLabel(status: RunStatus): string {
     ok: "正常",
     failed: "失败",
     timeout: "超时",
-    skipped: "已跳过"
+    skipped: "已跳过",
+    preparation_failed: "前置失败"
   }[status];
 }
 
@@ -64,11 +69,12 @@ export function runStatusTagColor(status: RunStatus): SemanticTagColor {
   if (status === "ok") return "success";
   if (status === "failed" || status === "timeout") return "error";
   if (status === "running" || status === "pending") return "processing";
-  if (status === "skipped") return "warning";
+  if (status === "skipped" || status === "preparation_failed") return "warning";
   return "default";
 }
 
 export function runnerExecutionMeta(status: RunStatus, failureKind?: FailureKind | null): { label: string; color: SemanticTagColor } {
+  if (status === "preparation_failed") return { label: "前置失败", color: "warning" };
   if (status === "pending") return { label: "等待中", color: "processing" };
   if (status === "running") return { label: "执行中", color: "processing" };
   if (failureKind === "runner" || (status === "skipped" && failureKind !== "target")) {

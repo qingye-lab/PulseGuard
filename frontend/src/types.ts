@@ -1,6 +1,6 @@
 export type CheckType = "ui" | "api";
 export type ViewportMode = "web" | "h5";
-export type RunStatus = "pending" | "running" | "ok" | "failed" | "timeout" | "skipped";
+export type RunStatus = "pending" | "running" | "ok" | "failed" | "timeout" | "skipped" | "preparation_failed";
 export type NotificationStatus = "disabled" | "not_required" | "suppressed" | "sent" | "failed";
 export type FailureKind = "none" | "target" | "runner" | string;
 export type RunnerSelectionMode = "selected_parallel" | "round_robin_all";

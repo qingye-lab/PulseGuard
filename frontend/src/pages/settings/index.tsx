@@ -1,10 +1,11 @@
-import { Alert, App, Button, Card, Descriptions, Empty, Form, Input, Modal, Popconfirm, Segmented, Select, Skeleton, Space, Switch, Table, Tag, Tooltip, Upload } from "antd";
+import { Alert, App, Button, Card, Descriptions, Empty, Form, Input, Modal, Popconfirm, Segmented, Select, Space, Switch, Table, Tag, Tooltip, Upload } from "antd";
 import type { UploadProps } from "antd";
 import { BellRing, Clipboard, Database, FolderKanban, Info, KeyRound, Monitor, Plus, RotateCcw, Send, ShieldCheck, Trash2, Zap } from "lucide-react";
 
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../../api";
+import { InitialLoadState } from "../../components/InitialLoadState";
 
 import type {
   AlertTagPolicy,
@@ -67,6 +68,7 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
   const [settings, setSettings] = useState<SettingsValues | null>(null);
   const [savedSettings, setSavedSettings] = useState<SettingsValues | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [testingChannelId, setTestingChannelId] = useState<string | null>(null);
   const [previewing, setPreviewing] = useState(false);
@@ -87,6 +89,9 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
   const [readOnlyTokenProjectIds, setReadOnlyTokenProjectIds] = useState<number[]>([currentProject.id]);
   const [createdReadOnlyToken, setCreatedReadOnlyToken] = useState<{ name: string; token: string } | null>(null);
   const [databaseBackups, setDatabaseBackups] = useState<DatabaseBackup[]>([]);
+  const [backupsLoaded, setBackupsLoaded] = useState(false);
+  const [backupsLoading, setBackupsLoading] = useState(true);
+  const [backupsError, setBackupsError] = useState<string | null>(null);
   const [backupBusy, setBackupBusy] = useState(false);
   const [projectAlertSection, setProjectAlertSection] = useState<ProjectAlertSection>("channels");
   const [systemSettingsSection, setSystemSettingsSection] = useState<SystemSettingsSection>("storage");
@@ -99,16 +104,19 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
     }
   }, [activeTab, navigate, tab, tabOverride]);
 
-  useEffect(() => {
+  function loadSettings() {
+    setLoading(true);
     api
       .settings()
       .then((values) => {
         setSettings(cloneSettings(values));
         setSavedSettings(cloneSettings(values));
+        setLoadError(null);
       })
-      .catch((err: Error) => message.error(err.message))
+      .catch((err: Error) => setLoadError(err.message))
       .finally(() => setLoading(false));
-  }, [message]);
+  }
+  useEffect(() => { loadSettings(); }, []);
 
   useEffect(() => {
     if (activeTab !== "system") return;
@@ -116,10 +124,16 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
   }, [activeTab]);
 
   async function loadDatabaseBackups() {
+    setBackupsLoading(true);
     try {
       setDatabaseBackups(await api.databaseBackups());
+      setBackupsLoaded(true);
+      setBackupsError(null);
     } catch (err) {
-      message.error((err as Error).message);
+      setBackupsError((err as Error).message);
+      if (backupsLoaded) message.error((err as Error).message);
+    } finally {
+      setBackupsLoading(false);
     }
   }
 
@@ -566,7 +580,7 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
   if (loading || !settings) {
     return (
       <div className="page-content settings-page">
-        <Skeleton active paragraph={{ rows: 10 }} />
+        <InitialLoadState loading={loading} error={loadError} onRetry={loadSettings} />
       </div>
     );
   }
@@ -1124,12 +1138,13 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
                   title={<Space size={8}><Database size={16} /><span>数据库备份</span></Space>}
                   extra={<Button icon={<Database size={16} />} loading={backupBusy} onClick={createDatabaseBackup}>创建备份</Button>}
                 >
-                  <Table<DatabaseBackup>
+                  {!backupsLoaded ? <InitialLoadState loading={backupsLoading} error={backupsError} onRetry={() => void loadDatabaseBackups()} /> : <Table<DatabaseBackup>
                     className="settings-backup-table"
                     rowKey="filename"
                     size="small"
                     pagination={false}
                     dataSource={databaseBackups}
+                    loading={backupsLoading}
                     locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无数据库备份" /> }}
                     columns={[
                       { title: "备份文件", dataIndex: "filename", ellipsis: true },
@@ -1151,7 +1166,7 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
                         )
                       }
                     ]}
-                  />
+                  />}
                 </Card>
               </div>
             )}

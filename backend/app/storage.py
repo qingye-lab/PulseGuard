@@ -149,7 +149,7 @@ _LOCK = threading.RLock()
 _TRANSACTION = threading.local()
 _CLEANUP_BATCH_SIZE = 500
 _RUN_CLEANUP_BATCH_SQL = """SELECT id FROM runs
-    WHERE created_at < ? AND status IN ('ok', 'failed', 'timeout', 'skipped')
+    WHERE created_at < ? AND status IN ('ok', 'failed', 'timeout', 'skipped', 'preparation_failed')
     ORDER BY created_at, id LIMIT ?"""
 _TAG_SPLIT_PATTERN = re.compile(r"[,\s]+")
 LOCAL_RUNNER_ID = "local"
@@ -1004,9 +1004,14 @@ def _init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_page_filter_started ON runs(observation_kind, check_type, status, started_at DESC, id DESC)"
         )
+        cleanup_index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_runs_cleanup_terminal'"
+        ).fetchone()
+        if cleanup_index and "preparation_failed" not in str(cleanup_index["sql"]):
+            conn.execute("DROP INDEX idx_runs_cleanup_terminal")
         conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_runs_cleanup_terminal ON runs(created_at, id)
-               WHERE status IN ('ok', 'failed', 'timeout', 'skipped')"""
+               WHERE status IN ('ok', 'failed', 'timeout', 'skipped', 'preparation_failed')"""
         )
         if TREND_BACKFILL_ON_STARTUP:
             _backfill_trend_rollups(conn)
@@ -2925,6 +2930,8 @@ def start_run(run_id: int) -> dict[str, Any] | None:
 
 def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
     affects_health = data.get("affects_health")
+    if data.get("status") == "preparation_failed":
+        affects_health = False
     affects_health_value = None if affects_health is None else (1 if affects_health else 0)
     failure_fingerprint = _failure_fingerprint_for_values(
         str(data.get("status") or ""),
@@ -3544,7 +3551,7 @@ def runner_metadata(
         "runner_region": str(runner.get("network_region") or "local"),
         "runner_browser_version": str(browser_version if browser_version is not None else runner.get("browser_version") or ""),
         "browser_type": str(browser_type if browser_type is not None else runner.get("browser_type") or ""),
-        "failure_kind": failure_kind if failure_kind in {"none", "target", "runner"} else "runner",
+        "failure_kind": failure_kind if failure_kind in {"none", "target", "runner", "preparation"} else "runner",
     }
 
 
@@ -5556,7 +5563,7 @@ def _archive_runs(conn: sqlite3.Connection, run_ids: list[int]) -> None:
         FROM runs
         WHERE id IN ({placeholders})
           AND check_id > 0
-          AND status IN ('ok', 'failed', 'timeout', 'skipped')
+          AND status IN ('ok', 'failed', 'timeout', 'skipped', 'preparation_failed')
         GROUP BY project_id, archive_date, check_type, status
         """,
         run_ids,
@@ -6260,7 +6267,9 @@ def _run_summary_select(alias: str = "") -> str:
 
 def _normalize_failure_kind(value: Any, status: str) -> str:
     failure_kind = str(value or "").strip()
-    if failure_kind in {"none", "target", "runner"}:
+    if status == "preparation_failed":
+        return "preparation"
+    if failure_kind in {"none", "target", "runner", "preparation"}:
         return failure_kind
     if status in {"failed", "timeout"}:
         return "target"

@@ -13,7 +13,7 @@ export type BatchRunNotice = {
   finishedAt: string;
 };
 
-const RUN_STATUS_ORDER: RunStatus[] = ["ok", "failed", "timeout", "skipped", "running", "pending"];
+const RUN_STATUS_ORDER: RunStatus[] = ["ok", "failed", "timeout", "preparation_failed", "skipped", "running", "pending"];
 
 export function summarizeBatchRuns(type: CheckType, runs: Run[]): BatchRunNotice {
   const counts: Record<RunStatus, number> = {
@@ -22,7 +22,8 @@ export function summarizeBatchRuns(type: CheckType, runs: Run[]): BatchRunNotice
     ok: 0,
     failed: 0,
     timeout: 0,
-    skipped: 0
+    skipped: 0,
+    preparation_failed: 0
   };
   runs.forEach((run) => {
     counts[run.status] += 1;
@@ -32,7 +33,7 @@ export function summarizeBatchRuns(type: CheckType, runs: Run[]): BatchRunNotice
   const latestRun = orderedRuns.length ? orderedRuns[orderedRuns.length - 1] : null;
   const issueRun = [...orderedRuns]
     .reverse()
-    .find((run) => run.status === "failed" || run.status === "timeout" || run.status === "skipped") || null;
+    .find((run) => run.status === "failed" || run.status === "timeout" || run.status === "skipped" || run.status === "preparation_failed") || null;
 
   return {
     type,
@@ -78,7 +79,7 @@ export function BatchRunActions({
 
 export function batchRunNotificationType(notice: BatchRunNotice): "success" | "info" | "warning" {
   if (!notice.total) return "info";
-  if (notice.counts.failed || notice.counts.timeout) return "warning";
+  if (notice.counts.failed || notice.counts.timeout || notice.counts.preparation_failed) return "warning";
   if (notice.counts.skipped) return "info";
   return "success";
 }

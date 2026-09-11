@@ -6,11 +6,12 @@ from typing import Any
 from .variables import mask_text
 
 
-FAILURE_STATUSES = {"failed", "timeout", "skipped"}
+FAILURE_STATUSES = {"failed", "timeout", "skipped", "preparation_failed"}
 ASSERTION_FAILURE_STATUSES = {"failed", "timeout"}
 FAILURE_KIND_LABELS = {
     "target": "目标页面/API",
     "runner": "执行环境",
+    "preparation": "前置准备",
     "none": "未记录",
 }
 
@@ -60,6 +61,8 @@ def _summary_text(
 ) -> str:
     if status not in FAILURE_STATUSES:
         return "本次运行未记录失败。"
+    if status == "preparation_failed":
+        return "前置准备失败，目标检查未执行，不用于判定目标故障或恢复。"
     if failure_kind == "runner":
         return "Runner 执行过程失败，目标检查未完成。"
     if status == "timeout":
@@ -101,6 +104,8 @@ def _next_steps(
 ) -> list[str]:
     if status not in FAILURE_STATUSES:
         return ["如需复盘，可查看运行日志、请求/响应快照和最近成功对比。"]
+    if status == "preparation_failed":
+        return ["查看前置脚本错误和变量解析结果，修复后重新运行。", "本次没有有效目标观测，不据此确认故障或恢复。"]
     if failure_kind == "runner":
         return [
             "检查 Runner 是否在线、执行队列是否已满，以及浏览器或运行依赖是否可用。",

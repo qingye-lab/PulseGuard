@@ -90,7 +90,9 @@ class ModulePreflightMetadataTests(unittest.TestCase):
 
         self.assertIsNotNone(persisted)
         assert persisted is not None
-        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["status"], "preparation_failed")
+        self.assertFalse(persisted["affects_health"])
+        self.assertEqual(persisted["failure_kind"], "preparation")
         self.assertEqual(
             self._runtime_metadata(persisted),
             {
@@ -134,7 +136,8 @@ class ModulePreflightMetadataTests(unittest.TestCase):
         self.assertIsNotNone(persisted)
         assert persisted is not None
         self.assertEqual(persisted["check_id"], 0)
-        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["status"], "preparation_failed")
+        self.assertFalse(persisted["affects_health"])
         self.assertEqual(persisted["observation_kind"], "draft")
         self.assertEqual(
             self._runtime_metadata(persisted),

@@ -698,7 +698,11 @@ class DraftRunnerTests(RunnerTestCase):
             "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
         ) as maybe_notify, patch(
             "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock
-        ) as run_structured_ui_check, patch.object(
+        ) as run_structured_ui_check, patch(
+            "backend.app.ui_assertions.prepare_ui_prerequisites", new_callable=AsyncMock
+        ) as prepare, patch(
+            "backend.app.ui_assertions.navigate_ui_target", new_callable=AsyncMock
+        ), patch.object(
             CheckRunner, "_load_check_function", side_effect=AssertionError("script should not load")
         ):
             runner = CheckRunner()
@@ -758,7 +762,11 @@ class DraftRunnerTests(RunnerTestCase):
             "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
         ), patch(
             "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock
-        ) as run_structured_ui_check, patch.object(
+        ) as run_structured_ui_check, patch(
+            "backend.app.ui_assertions.prepare_ui_prerequisites", new_callable=AsyncMock
+        ) as prepare, patch(
+            "backend.app.ui_assertions.navigate_ui_target", new_callable=AsyncMock
+        ), patch.object(
             CheckRunner, "_load_check_function", return_value=setup_func
         ) as load_check_function:
             runner = CheckRunner()
@@ -767,7 +775,8 @@ class DraftRunnerTests(RunnerTestCase):
         self.assertEqual(result, finished_run)
         load_check_function.assert_called_once()
         self.assertEqual(load_check_function.call_args.kwargs["function_name"], "setup")
-        self.assertIs(run_structured_ui_check.call_args.kwargs["setup_func"], setup_func)
+        self.assertIs(prepare.call_args.kwargs["setup_func"], setup_func)
+        self.assertIs(run_structured_ui_check.call_args.kwargs["page"], prepare.return_value)
 
     def test_ui_inspect_loads_setup_script_for_scan(self) -> None:
         setup_func = AsyncMock()

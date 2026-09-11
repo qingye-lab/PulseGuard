@@ -24,6 +24,7 @@ import { Activity, Calendar, Maximize2, RefreshCw, RotateCcw, SlidersHorizontal 
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import { InitialLoadState } from "../components/InitialLoadState";
 import { palette } from "../designSystem";
 import type {
   CheckTrend,
@@ -388,6 +389,8 @@ export function MonitoringPage() {
   const lastUpdated = data?.end ? dayjs(data.end).format("MM-DD HH:mm") : "-";
   const waitingForCustomRange = !isTrendDimensionReady(globalDimension);
 
+  if (!data && !waitingForCustomRange) return <div className="page-content"><InitialLoadState loading={loading} error={error} onRetry={refresh} /></div>;
+
   return (
     <div className="page-content monitoring-page">
       {error && (
@@ -516,6 +519,7 @@ export function MonitoringPage() {
       </Card>
 
       <TaskTrendDrawer
+        key={activeTask?.check_id ?? "closed"}
         task={activeTask}
         defaultDimension={activeTask ? overrides[activeTask.check_id] || globalDimension : globalDimension}
         resetDimension={globalDimension}
@@ -952,6 +956,7 @@ function TaskTrendDrawer({
 }) {
   const [dimension, setDimension] = useState<Dimension>(defaultDimension);
   const [trend, setTrend] = useState<CheckTrend | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -990,7 +995,7 @@ function TaskTrendDrawer({
         setLoading(false);
       });
     return () => controller.abort();
-  }, [dimension, task]);
+  }, [dimension, task, loadAttempt]);
 
   return (
     <Drawer
@@ -1034,13 +1039,15 @@ function TaskTrendDrawer({
         )
       }
     >
-      {error && <Alert type="error" title={error} showIcon role="alert" />}
+      {error && trend && <Alert type="error" title={error} showIcon role="alert" />}
       <div className="monitoring-drawer-summary">
         <Text type="secondary">{dimensionSummary(dimension)}</Text>
       </div>
-      {loading ? (
-        <Skeleton active paragraph={{ rows: 8 }} />
-      ) : trend ? (
+      {!isTrendDimensionReady(dimension) ? (
+        <Empty description="请选择完整日期范围" />
+      ) : !trend ? (
+        <InitialLoadState loading={loading} error={error} onRetry={() => setLoadAttempt((attempt) => attempt + 1)} />
+      ) : (
         <div className="monitoring-drawer-content">
           <div className="monitoring-drawer-metrics">
             <StatChip label="样本" value={formatCount(trend.success_count)} />
@@ -1050,8 +1057,6 @@ function TaskTrendDrawer({
           </div>
           <Suspense fallback={<Skeleton active paragraph={{ rows: 3 }} />}><LatencyChart points={trend.points} variant="drawer" /></Suspense>
         </div>
-      ) : (
-        <Empty description="暂无趋势数据" />
       )}
     </Drawer>
   );

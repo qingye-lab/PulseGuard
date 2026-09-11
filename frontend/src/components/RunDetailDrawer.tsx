@@ -78,9 +78,9 @@ export function RunDetailDrawer({ runId, onClose, onRerun, returnTo }: Props) {
         ) : null
       }
     >
-      {loading && <Skeleton active paragraph={{ rows: 8 }} />}
+      {(loading || !run) && !error && <Skeleton active paragraph={{ rows: 8 }} />}
       {error && <Alert type="error" title={error} showIcon />}
-      {!loading && !error && <RunResultPanel run={run} mode="detail" />}
+      {!loading && !error && run && <RunResultPanel run={run} mode="detail" />}
     </Drawer>
   );
 }

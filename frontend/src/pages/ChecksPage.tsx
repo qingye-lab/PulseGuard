@@ -6,6 +6,7 @@ import { cloneElement, isValidElement, lazy, Suspense, useEffect, useMemo, useSt
 import type { ReactElement } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import { InitialLoadState } from "../components/InitialLoadState";
 import { checkToCopyPayload } from "../checkPayload";
 import { useProject } from "../ProjectContext";
 import {
@@ -85,6 +86,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
   const [detailRunId, setDetailRunId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadedType, setLoadedType] = useState<CheckType | null>(null);
   const [busy, setBusy] = useState<BusyState>(null);
   const [duplicatingId, setDuplicatingId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
@@ -103,6 +105,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
     setLoading(true);
     try {
       setChecks(await api.checks(type));
+      setLoadedType(type);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
@@ -499,6 +502,8 @@ export function ChecksPage({ type }: { type: CheckType }) {
       }
     }
   ];
+
+  if (loadedType !== type) return <div className="page-content"><InitialLoadState loading={loading} error={error} onRetry={() => void load()} /></div>;
 
   return (
     <div className="page-content">

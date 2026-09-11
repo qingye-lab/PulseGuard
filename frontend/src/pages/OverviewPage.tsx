@@ -4,6 +4,7 @@ import { History, Play, Settings2 } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
+import { InitialLoadState } from "../components/InitialLoadState";
 import {
   deriveProjectStatus,
   eventHealthHint,
@@ -25,6 +26,7 @@ export function OverviewPage() {
   const readOnly = currentProject.status === "archived";
   const location = useLocation();
   const [overview, setOverview] = useState<Overview | null>(null);
+  const [loading, setLoading] = useState(true);
   const [settings, setSettings] = useState<SettingsValues | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [detailRunId, setDetailRunId] = useState<number | null>(null);
@@ -36,6 +38,7 @@ export function OverviewPage() {
   const error = actionError || dynamicError || settingsError;
 
   async function loadDynamic() {
+    setLoading(true);
     try {
       const [nextOverview, nextRuntime] = await Promise.all([api.overview(), api.runtime()]);
       setOverview(nextOverview);
@@ -43,6 +46,8 @@ export function OverviewPage() {
       setDynamicError(null);
     } catch (err) {
       setDynamicError((err as Error).message);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -100,6 +105,10 @@ export function OverviewPage() {
     } finally {
       setRunningId(null);
     }
+  }
+
+  if (!overview) {
+    return <div className="page-content"><InitialLoadState loading={loading} error={dynamicError} onRetry={() => void loadDynamic()} /></div>;
   }
 
   const projectStatus = deriveProjectStatus(overview);

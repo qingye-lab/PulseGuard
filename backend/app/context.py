@@ -25,6 +25,10 @@ class RunnerEnvironmentFailure(RunFailure):
     """Expected failure caused by local runner dependencies or browser setup."""
 
 
+class PreparationFailure(RunFailure):
+    """The target could not be checked because its prerequisites failed."""
+
+
 def compile_check_function(
     script: str,
     ctx: "RunContext",

@@ -1,8 +1,9 @@
-import { App, Button, Card, Descriptions, Drawer, Empty, Select, Skeleton, Space, Table, Tabs, Tag, Tooltip, Typography } from "antd";
+import { App, Button, Card, Descriptions, Drawer, Empty, Select, Space, Table, Tabs, Tag, Tooltip, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Eye, RefreshCw, RotateCcw } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
+import { InitialLoadState } from "../components/InitialLoadState";
 import { useProject } from "../ProjectContext";
 import { StructuredViewer } from "../components/StructuredViewer";
 import type { AuditEvent, Check, CheckVersion, DatabaseHealth, ProbeRunner, RunArchive } from "../types";
@@ -24,7 +25,12 @@ export function OperationsPage() {
   const [selectedCheckId, setSelectedCheckId] = useState<number | null>(null);
   const [versions, setVersions] = useState<CheckVersion[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsLoadedFor, setVersionsLoadedFor] = useState<number | null>(null);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
+  const versionsRequest = useRef(0);
   const [restoringId, setRestoringId] = useState<number | null>(null);
   const [drawer, setDrawer] = useState<DetailDrawer>(null);
 
@@ -50,29 +56,39 @@ export function OperationsPage() {
       setRunners(nextRunners);
       setChecks(nextChecks);
       setDatabaseHealth(nextDatabaseHealth);
+      setLoaded(true);
+      setLoadError(null);
       setSelectedCheckId((current) => {
         if (current && nextChecks.some((check) => check.id === current)) return current;
         return nextChecks[0]?.id ?? null;
       });
     } catch (err) {
-      message.error((err as Error).message);
+      setLoadError((err as Error).message);
+      if (loaded) message.error((err as Error).message);
     } finally {
       setLoading(false);
     }
   }
 
   async function loadVersions(checkId = selectedCheckId) {
+    const request = ++versionsRequest.current;
     if (!checkId) {
       setVersions([]);
       return;
     }
     setVersionsLoading(true);
     try {
-      setVersions(await api.checkVersions(checkId));
+      const nextVersions = await api.checkVersions(checkId);
+      if (request !== versionsRequest.current) return;
+      setVersions(nextVersions);
+      setVersionsLoadedFor(checkId);
+      setVersionsError(null);
     } catch (err) {
+      if (request !== versionsRequest.current) return;
+      setVersionsError((err as Error).message);
       message.error((err as Error).message);
     } finally {
-      setVersionsLoading(false);
+      if (request === versionsRequest.current) setVersionsLoading(false);
     }
   }
 
@@ -319,10 +335,10 @@ export function OperationsPage() {
     setDrawer({ title: `执行节点 ${runner.runner_id}`, value: runnerDetail(runner) });
   }
 
-  if (loading) {
+  if (!loaded) {
     return (
       <div className="page-content operations-page">
-        <Skeleton active paragraph={{ rows: 10 }} />
+        <InitialLoadState loading={loading} error={loadError} onRetry={() => void loadOperations()} />
       </div>
     );
   }
@@ -458,7 +474,7 @@ export function OperationsPage() {
                   </Button>
                 </Space>
                 {selectedCheckId ? (
-                  <Table
+                  versionsLoadedFor !== selectedCheckId ? <InitialLoadState loading={versionsLoading} error={versionsError} onRetry={() => void loadVersions()} /> : <Table
                     rowKey="id"
                     columns={versionColumns}
                     dataSource={versions}

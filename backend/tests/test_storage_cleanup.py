@@ -66,8 +66,10 @@ class StorageCleanupTests(unittest.TestCase):
 
     def test_existing_database_gets_idempotent_cleanup_index_and_batch_query_uses_it(self) -> None:
         self.seed_runs(3)
+        preparation_ids = self.seed_runs(1, status="preparation_failed")
         with storage._connect() as conn:
             conn.execute("DROP INDEX idx_runs_cleanup_terminal")
+            conn.execute("CREATE INDEX idx_runs_cleanup_terminal ON runs(created_at, id) WHERE status IN ('ok', 'failed', 'timeout', 'skipped')")
         storage.init_db()
         storage.init_db()
         with storage._connect(read_only=True) as conn:
@@ -76,6 +78,8 @@ class StorageCleanupTests(unittest.TestCase):
                 (storage.now_iso(), 500),
             ).fetchall()
             details = " ".join(str(row["detail"]) for row in plan)
+            rows = conn.execute(storage._RUN_CLEANUP_BATCH_SQL, (storage.now_iso(), 500)).fetchall()
+            self.assertIn(preparation_ids[0], [row["id"] for row in rows])
         self.assertIn("SEARCH runs USING INDEX idx_runs_cleanup_terminal", details)
         self.assertNotIn("USE TEMP B-TREE", details)
 

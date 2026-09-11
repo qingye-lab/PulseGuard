@@ -1379,7 +1379,7 @@ def runs(
 ) -> list[dict[str, Any]]:
     if type and type not in {"ui", "api"}:
         raise HTTPException(status_code=400, detail="任务类型无效")
-    if status and status not in {"ok", "failed", "timeout", "skipped", "running", "pending"}:
+    if status and status not in {"ok", "failed", "timeout", "skipped", "running", "pending", "preparation_failed"}:
         raise HTTPException(status_code=400, detail="运行状态无效")
     if notification_status and notification_status not in NOTIFICATION_STATUSES:
         raise HTTPException(status_code=400, detail="告警状态无效")
@@ -1419,7 +1419,7 @@ def runs_page(
 ) -> dict[str, Any]:
     if type and type not in {"ui", "api"}:
         raise HTTPException(status_code=400, detail="任务类型无效")
-    if status and status not in {"ok", "failed", "timeout", "skipped", "running", "pending"}:
+    if status and status not in {"ok", "failed", "timeout", "skipped", "running", "pending", "preparation_failed"}:
         raise HTTPException(status_code=400, detail="运行状态无效")
     if observation_kind and observation_kind not in {"observation", "verification", "draft"}:
         raise HTTPException(status_code=400, detail="运行来源类型无效")

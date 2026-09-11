@@ -3,6 +3,7 @@ import type { ColumnsType } from "antd/es/table";
 import { Edit3, Plus, Trash2, Users } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
+import { InitialLoadState } from "../components/InitialLoadState";
 import type { Member } from "../types";
 
 type MemberFormValues = Omit<Member, "id">;
@@ -21,18 +22,22 @@ export function MembersPage() {
   const [form] = Form.useForm<MemberFormValues>();
   const [members, setMembers] = useState<Member[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [editing, setEditing] = useState<Member | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [isCompactList, setIsCompactList] = useState(() => window.matchMedia("(max-width: 720px)").matches);
 
-  useEffect(() => {
+  function loadMembers() {
+    setLoading(true);
     api
       .settings()
-      .then((values) => setMembers(values.members || []))
-      .catch((err: Error) => message.error(err.message))
+      .then((values) => { setMembers(values.members || []); setLoaded(true); setLoadError(null); })
+      .catch((err: Error) => setLoadError(err.message))
       .finally(() => setLoading(false));
-  }, [message]);
+  }
+  useEffect(() => { loadMembers(); }, []);
 
   useEffect(() => {
     if (!modalOpen) return;
@@ -182,6 +187,8 @@ export function MembersPage() {
       render: (_, member) => renderMemberActions(member)
     }
   ];
+
+  if (!loaded) return <div className="page-content"><InitialLoadState loading={loading} error={loadError} onRetry={loadMembers} /></div>;
 
   return (
     <div className="page-content members-page">

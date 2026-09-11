@@ -47,7 +47,7 @@ def _with_result_identity(result: Any, check: dict[str, Any]) -> dict[str, Any]:
     payload.setdefault("original_check_id", check_id)
     runs = payload.get("runs")
     payload["runs"] = runs if isinstance(runs, list) else []
-    if str(payload.get("status") or "").lower() not in {"ok", "failed", "timeout", "skipped", "cancelled"}:
+    if str(payload.get("status") or "").lower() not in {"ok", "failed", "timeout", "skipped", "cancelled", "preparation_failed"}:
         payload["status"] = "failed"
     return payload
 

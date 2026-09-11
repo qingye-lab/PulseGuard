@@ -8,12 +8,13 @@ import { cloneElement, isValidElement, lazy, Suspense, useEffect, useState } fro
 import type { ReactElement } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import { InitialLoadState } from "../components/InitialLoadState";
 import { useProject } from "../ProjectContext";
 import { RunnerExecutionTag } from "../components/shared/businessTags";
 import type { CheckType, NotificationStatus, ProbeRunner, Run, RunStatus } from "../types";
 import {
   formatDate,
-  formatDuration,
+  formatRunDuration,
   notificationChannelLabel,
   notificationStatusMeta,
   notificationStatusTagColor,
@@ -47,7 +48,8 @@ const RUN_STATUS_FILTER_OPTIONS: Array<{ label: string; value: RunStatus | "" }>
   { label: runStatusFilterLabel("ok"), value: "ok" },
   { label: runStatusFilterLabel("failed"), value: "failed" },
   { label: runStatusFilterLabel("running"), value: "running" },
-  { label: runStatusFilterLabel("skipped"), value: "skipped" }
+  { label: runStatusFilterLabel("skipped"), value: "skipped" },
+  { label: runStatusFilterLabel("preparation_failed"), value: "preparation_failed" }
 ];
 
 function parseCheckTypeParam(value: string | null): CheckType | "" {
@@ -56,7 +58,7 @@ function parseCheckTypeParam(value: string | null): CheckType | "" {
 
 function parseRunStatusParam(value: string | null): RunStatus | "" {
   if (value === "timeout") return "failed";
-  return value === "ok" || value === "failed" || value === "running" || value === "skipped" ? value : "";
+  return value === "ok" || value === "failed" || value === "running" || value === "skipped" || value === "preparation_failed" ? value : "";
 }
 
 function parseNotificationStatusParam(value: string | null): NotificationStatus | "" {
@@ -100,6 +102,7 @@ export function RunsPage() {
   const [dateRange, setDateRange] = useState<[Dayjs | null, Dayjs | null] | null>(() => parseDateRangeParams(searchParams));
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
   const [rerunningId, setRerunningId] = useState<number | null>(null);
   const [detailRunId, setDetailRunId] = useState<number | null>(null);
   const [isNarrowTable, setIsNarrowTable] = useState(false);
@@ -127,6 +130,7 @@ export function RunsPage() {
           page_size: HISTORY_PAGE_SIZE
         });
       setRuns(result.items);
+      setLoaded(true);
       setTotal(result.total);
       setError(null);
     } catch (err) {
@@ -278,7 +282,7 @@ export function RunsPage() {
         return <Tag color={notificationStatusTagColor(run.notification_status)}>{notification.label}</Tag>;
       }
     },
-    { title: "耗时", dataIndex: "duration_ms", render: (value?: number | null) => formatDuration(value), width: 88, align: "right" },
+    { title: "耗时", dataIndex: "duration_ms", render: (_: unknown, run: Run) => formatRunDuration(run), width: 88, align: "right" },
     {
       title: "错误摘要",
       dataIndex: "error_message",
@@ -318,6 +322,8 @@ export function RunsPage() {
       )
     }
   ];
+
+  if (!loaded) return <div className="page-content"><InitialLoadState loading={loading} error={error} onRetry={() => void load()} /></div>;
 
   return (
     <div className="page-content">
@@ -514,7 +520,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, readOnl
 
             <div className="history-card-meta">
               <HistoryMeta label="执行时间" value={formatDate(run.started_at)} />
-              <HistoryMeta label="耗时" value={formatDuration(run.duration_ms)} />
+              <HistoryMeta label="耗时" value={formatRunDuration(run)} />
               <HistoryMeta label="执行节点" value={runnerSummary(run)} />
               {run.check_type === "ui" && run.browser_type && <HistoryMeta label="浏览器类型" value={run.browser_type} />}
               <HistoryMeta label="告警渠道" value={notificationChannelLabel(run.notification_channel, run.notification_status)} />

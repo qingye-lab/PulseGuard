@@ -71,7 +71,7 @@ export interface ProjectStatus {
   isVerifiedHealthy: boolean;
 }
 
-export function deriveProjectStatus(overview: Overview | null): ProjectStatus {
+export function deriveProjectStatus(overview: Overview): ProjectStatus {
   const monitoredCount = (overview?.ui_count || 0) + (overview?.api_count || 0);
   const staleOrUnknownCount = (overview?.unknown_count || 0) + (overview?.stale_count || 0);
   const failingCount = overview?.failing_count || 0;

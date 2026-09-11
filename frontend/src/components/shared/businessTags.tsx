@@ -9,6 +9,7 @@ export function failureKindTag(
 ): ReactNode {
   if (value === "target") return <Tag color="error">目标页面/API</Tag>;
   if (value === "runner") return <Tag color="warning">执行环境</Tag>;
+  if (value === "preparation") return <Tag color="warning">前置准备</Tag>;
   return <>{emptyNode}</>;
 }
 

@@ -17,7 +17,7 @@ from .variables import VARIABLE_NAME_PATTERN
 CheckType = Literal["ui", "api"]
 RunnerSelectionMode = Literal["selected_parallel", "round_robin_all"]
 BrowserSelectionMode = Literal["selected_parallel", "round_robin_all"]
-RunStatus = Literal["pending", "running", "ok", "failed", "timeout", "skipped"]
+RunStatus = Literal["pending", "running", "ok", "failed", "timeout", "skipped", "preparation_failed"]
 NotificationStatus = Literal["disabled", "not_required", "suppressed", "sent", "failed"]
 NOTIFICATION_STATUSES = {"disabled", "not_required", "suppressed", "sent", "failed"}
 

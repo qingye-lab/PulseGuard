@@ -17,6 +17,95 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def smoke_preparation_failure(page, context, base: str, output: Path, project_id: int) -> None:
+    from playwright.sync_api import expect
+
+    headers = {"X-PulseGuard-Project-Id": str(project_id)}
+    payload = {
+        "name": "详情页监控", "type": "ui", "enabled": False,
+        "entry_url": f"{base}/__smoke/api-seed", "timeout_ms": 1000,
+        "assertions_json": '[{"type":"title_contains","expected_text":"Dashboard"}]',
+        "setup_script": "async def setup(ctx, page):\n    ctx.fail('前置接口未返回商品标识')",
+        "runner_ids": ["local"], "browser_types": ["chromium"],
+    }
+    created = context.request.post(f"{base}/api/checks", data=payload, headers=headers)
+    assert created.ok, created.text()
+    check = created.json()
+    response = context.request.post(f"{base}/api/checks/{check['id']}/run", headers=headers)
+    assert response.ok, response.text()
+    run = response.json()
+    assert run["status"] == "preparation_failed", run
+    assert not run["affects_health"] and run["duration_ms"] == 0, run
+    page.goto(f"{base}/runs/{run['id']}?project_id={project_id}")
+    expect(page.get_by_text("前置失败", exact=True).first).to_be_visible()
+    expect(page.get_by_text("前置准备耗时", exact=True)).to_be_visible()
+    expect(page.get_by_text("未执行", exact=True).first).to_be_visible()
+    page.screenshot(path=str(output / "preparation-failure.png"), full_page=True)
+    print("PASS: preparation failure has a distinct result and separate timing", flush=True)
+
+
+def smoke_initial_loading(page, base: str, output: Path, project_id: int) -> None:
+    """Pending and failed requests must not render successful empty states."""
+    from playwright.sync_api import expect
+
+    cases = [
+        ("/", "/api/overview", "没有启用中的监控任务"),
+        ("/api-checks", "/api/checks?*", "暂无任务"),
+        ("/runs", "/api/runs-page?*", "暂无运行记录"),
+        ("/members", "/api/settings", "暂无成员"),
+        ("/monitoring", "/api/monitoring-trends?*", "暂无整体趋势数据"),
+        ("/operations", "/api/audit-events", "暂无审计事件"),
+        ("/projects/modules", f"/api/projects/{project_id}/library", "暂无公共方法"),
+        ("/settings/execution", "/api/settings", "暂无通知渠道"),
+        ("/settings/execution", "/api/runners", "暂无执行节点"),
+        ("/settings/system", "/api/database-backups", "暂无数据库备份"),
+    ]
+    for path, endpoint, empty_text in cases:
+        pending = []
+        pattern = f"{base}{endpoint}"
+        page.route(pattern, lambda route: pending.append(route))
+        page.goto(f"{base}{path}?project_id={project_id}")
+        expect(page.get_by_role("status", name="正在加载").first).to_be_visible()
+        expect(page.get_by_text(empty_text, exact=False)).not_to_be_visible()
+        if path == "/":
+            expect(page.get_by_text("监控未启用", exact=True)).not_to_be_visible()
+            expect(page.get_by_text("无故障", exact=True)).not_to_be_visible()
+            page.screenshot(path=str(output / "overview-loading.png"))
+        # Wait for the real request to enter the route handler, then fail it.
+        deadline = time.monotonic() + 10
+        while not pending and time.monotonic() < deadline:
+            page.wait_for_timeout(20)
+        assert pending, path
+        for route in pending:
+            route.fulfill(status=503, content_type="application/json", body=json.dumps({"detail": "smoke load unavailable"}))
+        expect(page.get_by_text("加载失败", exact=True)).to_be_visible()
+        expect(page.get_by_text(empty_text, exact=False)).not_to_be_visible()
+        page.unroute(pattern)
+        with page.expect_response(lambda response: response.ok and response.request.method == "GET" and response.url.startswith(f"{base}{endpoint.split('?')[0]}")):
+            page.get_by_role("button", name="重新加载", exact=True).click()
+        expect(page.get_by_text("加载失败", exact=True)).not_to_be_visible()
+        expect(page.get_by_role("status", name="正在加载")).to_have_count(0)
+        if path == "/":
+            expect(page.get_by_text("项目状态", exact=True)).to_be_visible()
+            expect(page.get_by_text("监控未启用", exact=True)).to_be_visible()
+            # A refresh must retain the last successful data, including an empty result.
+            pending.clear()
+            page.route(pattern, lambda route: pending.append(route))
+            page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+            deadline = time.monotonic() + 10
+            while not pending and time.monotonic() < deadline:
+                page.wait_for_timeout(20)
+            assert pending, 'overview refresh did not start'
+            expect(page.get_by_text("监控未启用", exact=True)).to_be_visible()
+            expect(page.get_by_role("status", name="正在加载")).to_have_count(0)
+            for route in pending:
+                route.fulfill(status=503, content_type="application/json", body=json.dumps({"detail": "smoke refresh unavailable"}))
+            expect(page.get_by_text("smoke refresh unavailable", exact=True)).to_be_visible()
+            expect(page.get_by_text("监控未启用", exact=True)).to_be_visible()
+            page.unroute(pattern)
+    print("PASS initial loading, failure and retry across ten data surfaces", flush=True)
+
+
 def smoke_project_module_library_simple(page, context, base: str, output: Path, first_project: dict, second_project: dict) -> None:
     """Exercise the current project library through the real compact UI."""
     from playwright.sync_api import expect
@@ -275,6 +364,8 @@ def main() -> int:
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 name = "Smoke API"
                 try:
+                    smoke_initial_loading(page, base, output, int(second_project["id"]))
+                    smoke_preparation_failure(page, context, base, output, int(second_project["id"]))
                     page.goto(f'{base}/api-checks?project_id={first_project["id"]}')
                     expect(page.get_by_role("button", name="新增任务", exact=True).first).to_be_visible()
                     page.get_by_role("button", name="新增任务", exact=True).first.click()

@@ -1,8 +1,9 @@
-import { Alert, Button, Card, Collapse, Empty, Form, Input, InputNumber, Segmented, Select, Skeleton, Space, Switch, Tag, Tooltip } from "antd";
+import { Alert, Button, Card, Collapse, Empty, Form, Input, InputNumber, Segmented, Select, Space, Switch, Tag, Tooltip } from "antd";
 import { ArrowLeft, Play, Save } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
+import { InitialLoadState } from "../components/InitialLoadState";
 import { useProject } from "../ProjectContext";
 import {
   checkToPayload,
@@ -32,6 +33,7 @@ export function DebugPage() {
   const checkType = type === "api" ? "api" : "ui";
   const id = Number(checkId);
   const [check, setCheck] = useState<Check | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [form, setForm] = useState<CheckPayload | null>(null);
   const [baseline, setBaseline] = useState<CheckPayload | null>(null);
   const [run, setRun] = useState<Run | null>(null);
@@ -72,7 +74,7 @@ export function DebugPage() {
     return () => {
       cancelled = true;
     };
-  }, [id, projectId]);
+  }, [id, projectId, loadAttempt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -178,7 +180,7 @@ export function DebugPage() {
     return (
       <div className="page-content">
         <Card>
-          <Skeleton active paragraph={{ rows: 4 }} />
+          <InitialLoadState loading={!error} error={error} onRetry={() => { setError(null); setLoadAttempt((attempt) => attempt + 1); }} />
         </Card>
       </div>
     );

@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 from fastapi.testclient import TestClient
 
 from backend.app import storage, ui_assertions
-from backend.app.context import RunContext, RunFailure
+from backend.app.context import RunContext, RunFailure, PreparationFailure
 from backend.app.main import app
 from backend.app.runner import CheckRunner
 from backend.app.variables import RuntimeVariables, VariableResolutionError, mask_text, resolve_url
@@ -60,12 +60,96 @@ class RuntimeVariableTests(unittest.TestCase):
 
 
 class DynamicUiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_separate_navigation_uses_secret_value_not_masked_evidence(self):
+        ctx = self.context()
+        async def setup(run_ctx, page):
+            run_ctx.vars.set("skuId", "private-id", secret=True)
+            run_ctx.vars.set("image", "image")
+        try:
+            page = await ui_assertions.prepare_ui_prerequisites(ctx, setup)
+            self.assertNotIn("private-id", ctx.request_snapshot["url"])
+            await ui_assertions.navigate_ui_target(ctx, page)
+            self.assertIn("private-id", page.url)
+        finally:
+            await ctx.close(False)
+
+    async def test_preparation_result_does_not_update_health_or_notify(self):
+        result = {"id": 1, "status": "preparation_failed", "failure_kind": "preparation", "affects_health": False}
+        with patch.object(CheckRunner, "_execute_core", new_callable=AsyncMock, return_value=result), patch(
+            "backend.app.runner.storage.get_settings", return_value={}
+        ), patch("backend.app.runner.storage.finish_run", return_value=result), patch(
+            "backend.app.runner.storage.get_run", return_value=result
+        ), patch("backend.app.runner.storage.update_run_notification"), patch(
+            "backend.app.runner.storage.update_check_status"
+        ) as health, patch("backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock) as notify:
+            await CheckRunner()._execute({"id": 1, "project_id": 1}, "manual", 1)
+        health.assert_not_called()
+        notify.assert_not_awaited()
+
+    async def test_remote_preparation_status_preserves_non_observation(self):
+        result = CheckRunner()._remote_result_to_finish_payload(
+            {"run": {"status": "preparation_failed", "failure_kind": "preparation"}}, 1, {"runner_id": "edge"},
+        )
+        self.assertFalse(result["affects_health"])
+        self.assertEqual(result["failure_kind"], "preparation")
+
+    async def test_preparation_failure_is_not_a_target_observation(self):
+        for script in (
+            "async def setup(ctx, page):\n    raise AssertionError('login failed')",
+            "async def setup(ctx, page):\n    await ctx.pause(1)",
+        ):
+            ctx = self.context()
+            ctx.check.update({"setup_script": script, "timeout_ms": 10})
+            ctx.timeout_ms = 10
+            with patch("backend.app.runner.RunContext", return_value=ctx):
+                result = await CheckRunner()._execute_core(ctx.check, "manual", 0, {"ui_retry_attempts": 2})
+            self.assertEqual(result["status"], "preparation_failed")
+            self.assertEqual(result["failure_kind"], "preparation")
+            self.assertFalse(result["affects_health"])
+            self.assertEqual(result["duration_ms"], 0)
+            self.assertEqual(ctx.new_page.return_value.gotos, [])
+            self.assertEqual(ctx.new_page.await_count, 1)
+            self.assertEqual(json.loads(result["request_snapshot"])["preparation"]["status"], "failed")
+
+    async def test_scripted_target_has_its_own_clock_after_setup(self):
+        ctx = self.context()
+        ctx.check.update({
+            "entry_url": "https://example.com", "assertions_json": "[]", "timeout_ms": 150,
+            "setup_script": "async def setup(ctx, page):\n    await ctx.pause(0.1)",
+            "script": "async def check(ctx):\n    await ctx.pause(0.1)",
+        })
+        ctx.timeout_ms = 150
+        ctx.entry_url = ctx.check["entry_url"]
+        try:
+            duration = await CheckRunner()._run_check_attempt(ctx, ctx.check, {"max_task_runtime_seconds": 60})
+            self.assertGreaterEqual(ctx.request_snapshot["preparation"]["duration_ms"], 90)
+            self.assertGreaterEqual(duration, 90)
+            self.assertLess(duration, 190)
+        finally:
+            await ctx.close(False)
+
+    async def test_target_timeout_after_successful_setup_remains_target_failure(self):
+        ctx = self.context()
+        ctx.check.update({
+            "entry_url": "https://example.com", "assertions_json": "[]", "timeout_ms": 20,
+            "setup_script": "async def setup(ctx, page):\n    pass",
+            "script": "async def check(ctx):\n    await ctx.pause(1)",
+        })
+        ctx.timeout_ms = 20
+        ctx.entry_url = ctx.check["entry_url"]
+        with patch("backend.app.runner.RunContext", return_value=ctx):
+            result = await CheckRunner()._execute_core(ctx.check, "manual", 0, {"ui_retry_attempts": 0})
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["failure_kind"], "target")
+        self.assertGreaterEqual(result["duration_ms"], 15)
+
     def context(self):
         check = {"type": "ui", "entry_url": "https://example.com/detail?sku=${skuId}&image=${image}",
                  "timeout_ms": 1000, "assertions_json": json.dumps([
                      {"type": "title_contains", "expected_text": "${title}"},
                      {"type": "element_visible", "selector": "${selector}"}])}
         ctx = RunContext(check, 0, {}, artifacts=None)
+        ctx.pause = asyncio.sleep
         ctx.new_page = AsyncMock(return_value=SetupInspectPage())
         return ctx
 
@@ -147,7 +231,7 @@ class DynamicUiTests(unittest.IsolatedAsyncioTestCase):
         async def setup(run_ctx, page):
             await asyncio.Event().wait()
         try:
-            with self.assertRaises(asyncio.TimeoutError):
+            with self.assertRaises(PreparationFailure):
                 await ui_assertions.prepare_ui_target(ctx, setup)
             self.assertEqual(ctx.new_page.return_value.gotos, [])
             self.assertEqual(ctx.request_snapshot["preparation"]["status"], "failed")

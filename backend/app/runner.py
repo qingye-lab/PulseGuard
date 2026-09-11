@@ -25,7 +25,7 @@ from .browser_types import (
 from .ui_assertions import has_enabled_ui_assertions, run_structured_ui_check
 from . import notifier, storage
 from .artifacts import ArtifactStore
-from .context import RunContext, RunFailure, RunnerEnvironmentFailure, compile_check_function
+from .context import RunContext, RunFailure, RunnerEnvironmentFailure, PreparationFailure, compile_check_function
 from .monitoring import run_metadata
 from .resource_pool import ProbeResourcePool
 from .script_modules import (
@@ -766,7 +766,7 @@ class CheckRunner:
         if finished_run is None:
             raise RuntimeError("运行记录更新失败")
 
-        if library_validation or not record_status:
+        if library_validation or not record_status or not finished_run.get("affects_health", True):
             storage.update_run_notification(run_id, "not_required", channel=None, error=None, sent_at=None)
             return storage.get_run(run_id) or finished_run
 
@@ -824,7 +824,7 @@ class CheckRunner:
             }
             settings_for_failure = settings
             return {
-                "status": "failed",
+                "status": "preparation_failed",
                 "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "duration_ms": 0,
                 "error_message": mask_text(preflight_error, settings_for_failure),
@@ -835,8 +835,8 @@ class CheckRunner:
                 "response_path": None,
                 "request_snapshot": json.dumps(mask_data(request_snapshot, settings_for_failure), ensure_ascii=False),
                 "response_snapshot": None,
-                "affects_health": True,
-                **self._runner_metadata(settings_for_failure, failure_kind="target"),
+                "affects_health": False,
+                **self._runner_metadata(settings_for_failure, failure_kind="preparation"),
             }
         max_attempts = self._max_attempts(check, settings)
 
@@ -864,6 +864,12 @@ class CheckRunner:
                 failure_kind = "none"
             except asyncio.CancelledError:
                 raise
+            except PreparationFailure as exc:
+                duration_ms = 0
+                status = "preparation_failed"
+                error_message = str(exc)
+                error_stack = traceback.format_exc()
+                failure_kind = "preparation"
             except asyncio.TimeoutError as exc:
                 duration_ms = self._task_duration_from_exception(exc)
                 status = "timeout"
@@ -950,6 +956,7 @@ class CheckRunner:
         )
         return {
             "status": status,
+            **({"affects_health": False} if failure_kind == "preparation" else {}),
             "finished_at": finished.isoformat(timespec="seconds"),
             "duration_ms": duration_ms,
             "error_message": safe_error_message,
@@ -1000,10 +1007,12 @@ class CheckRunner:
                     raise RunFailure("请至少添加一个校验项，或填写高级脚本")
 
             return await self._measure_task_duration(asyncio.wait_for(run_api_flow(), timeout=timeout_seconds))
-        if uses_structured_ui:
-            setup_func = None
-            setup_script = str(check.get("setup_script") or "")
-            if setup_script.strip():
+        from .ui_assertions import prepare_ui_prerequisites, navigate_ui_target
+
+        setup_func = None
+        setup_script = str(check.get("setup_script") or "")
+        if setup_script.strip():
+            try:
                 setup_func = self._load_check_function(
                     setup_script,
                     ctx,
@@ -1012,38 +1021,27 @@ class CheckRunner:
                     script_label="前置脚本",
                     attempt=ctx.attempt,
                 )
-            return await self._measure_task_duration(asyncio.wait_for(
-                run_structured_ui_check(ctx, setup_func=setup_func), timeout=max_runtime_seconds,
-            ))
-        else:
-            setup_func = None
-            setup_script = str(check.get("setup_script") or "")
-            if setup_script.strip():
-                setup_func = self._load_check_function(
-                    setup_script,
-                    ctx,
-                    function_name="setup",
-                    expected_signature="async def setup(ctx, page)",
-                    script_label="前置脚本",
-                    attempt=ctx.attempt,
-                )
-            check_func = self._load_check_function(
-                check.get("script") or "",
-                ctx,
-                attempt=ctx.attempt,
-            )
+            except Exception as exc:
+                raise PreparationFailure(str(exc)) from exc
+        check_func = None if uses_structured_ui else self._load_check_function(
+            check.get("script") or "", ctx, attempt=ctx.attempt,
+        )
+        page = None
+        if uses_structured_ui or setup_func is not None:
+            page = await prepare_ui_prerequisites(ctx, setup_func=setup_func)
 
-            async def run_scripted_ui() -> None:
-                if setup_func is None:
-                    await check_func(ctx)
-                    return
-                from .ui_assertions import prepare_ui_target
-
-                await prepare_ui_target(ctx, setup_func=setup_func)
+        async def run_ui_target() -> None:
+            if page is not None:
+                await navigate_ui_target(ctx, page)
+            if uses_structured_ui:
+                await run_structured_ui_check(ctx, page=page)
+            else:
                 ctx.ui_stage = "script"
                 await check_func(ctx)
 
-            return await self._measure_task_duration(asyncio.wait_for(run_scripted_ui(), timeout=timeout_seconds))
+        return await self._measure_task_duration(asyncio.wait_for(
+            run_ui_target(), timeout=max_runtime_seconds if uses_structured_ui else timeout_seconds,
+        ))
 
     @staticmethod
     async def _measure_task_duration(awaitable: Any) -> int:
@@ -1352,7 +1350,7 @@ class CheckRunner:
         address = str(settings.get("local_runner_address") or "127.0.0.1").strip()
         region = str(settings.get("local_runner_region") or "local").strip() or "local"
         browser_version = str(getattr(ctx, "browser_version", None) or "").strip()
-        normalized_failure_kind = failure_kind if failure_kind in {"none", "target", "runner"} else "runner"
+        normalized_failure_kind = failure_kind if failure_kind in {"none", "target", "runner", "preparation"} else "runner"
         return {
             "runner_id": storage.LOCAL_RUNNER_ID,
             "runner_name": name,
@@ -1704,7 +1702,8 @@ class CheckRunner:
         except (TypeError, ValueError):
             max_runtime = max(check_timeout, 60.0)
         attempts = self._max_attempts(check, settings)
-        return min(3600.0, max_runtime * attempts + 15.0)
+        preparation_budget = check_timeout if check.get("type") == "ui" and str(check.get("setup_script") or "").strip() else 0.0
+        return min(3600.0, (max_runtime + preparation_budget) * attempts + 15.0)
 
     @staticmethod
     def _response_error_detail(response: httpx.Response) -> str:
@@ -1741,6 +1740,7 @@ class CheckRunner:
         )
         return {
             "status": str(data.get("status") or "failed"),
+            **({"affects_health": False} if data.get("status") == "preparation_failed" else {}),
             "finished_at": str(data.get("finished_at") or storage.now_iso()),
             "duration_ms": int(data.get("duration_ms") or 0),
             "error_message": data.get("error_message"),

@@ -1,8 +1,9 @@
-import { Alert, App as AntApp, Button, Drawer, Empty, Form, Input, Modal, Popconfirm, Space, Spin, Table, Tabs, Typography } from "antd";
+import { Alert, App as AntApp, Button, Drawer, Empty, Form, Input, Modal, Popconfirm, Space, Table, Tabs, Typography } from "antd";
 import type { TableColumnsType } from "antd";
 import { BookOpen, Copy, Plus, Save, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../api";
+import { InitialLoadState } from "../components/InitialLoadState";
 import { useProject } from "../ProjectContext";
 import { LazyCodeEditorPanel } from "../components/LazyCodeEditorPanel";
 import type { ModuleLibrary, ProjectModule } from "../types";
@@ -86,8 +87,6 @@ export function ModulesPage() {
       setModules(effectiveModules(nextLibrary));
     } catch (reason) {
       if (!isCurrent()) return;
-      setLibrary(null);
-      setModules([]);
       setError((reason as Error).message || "公共方法加载失败");
     } finally {
       if (isCurrent()) setLoading(false);
@@ -293,6 +292,8 @@ export function ModulesPage() {
     }
   ], [deleteConfirmName, modules, readOnly, saving, currentRevision, library, projectId]);
 
+  if (!library) return <div className="page-content"><InitialLoadState loading={loading} error={error} onRetry={() => void loadLibrary()} /></div>;
+
   return (
     <div className="page-content modules-page">
       <div className="modules-page-header">
@@ -309,10 +310,8 @@ export function ModulesPage() {
           <Button type="link" size="small" onClick={() => void loadLibrary()} disabled={loading}>重新加载</Button>
         </div>
       )}
-      {loading ? (
-        <div className="modules-page-loading"><Spin /></div>
-      ) : (
         <Table<ProjectModule>
+          loading={loading}
           className="modules-page-table"
           rowKey="name"
           columns={columns}
@@ -320,8 +319,6 @@ export function ModulesPage() {
           pagination={false}
           locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无公共方法" /> }}
         />
-      )}
-
       <Drawer
         title="公共方法使用教程"
         open={tutorialOpen}

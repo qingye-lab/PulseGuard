@@ -15,7 +15,7 @@ import type {
   RunComparisonField,
   RunFailureSummary
 } from "../types";
-import { artifactHref, formatDate, formatDuration, parseSnapshot, runnerSummary, runStatusLabel, runStatusTagColor } from "../utils";
+import { artifactHref, formatDate, formatDuration, formatRunDuration, parseSnapshot, runnerSummary, runStatusLabel, runStatusTagColor } from "../utils";
 import { StructuredViewer } from "./StructuredViewer";
 
 type RunResultMode = "detail" | "debug";
@@ -45,6 +45,7 @@ interface RunGroupSummary {
   ok: number;
   targetFailures: number;
   runnerFailures: number;
+  preparationFailures: number;
   running: number;
 }
 
@@ -82,7 +83,7 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true, 
   const isApiSingleGroup = run?.check_type === "api" && !groupLoading && !groupError && groupRuns.length <= 1;
   const hasGroupResults = Boolean(showGroupResults && mode === "detail" && run?.run_group_id && !isApiSingleGroup);
   const showComparison = Boolean(run && mode === "detail" && !hasGroupResults && run.check_id > 0 && ["failed", "timeout"].includes(run.status));
-  const showFailureSummary = Boolean(run && mode === "detail" && !hasGroupResults && run.check_id > 0 && ["failed", "timeout", "skipped"].includes(run.status));
+  const showFailureSummary = Boolean(run && mode === "detail" && !hasGroupResults && run.check_id > 0 && ["failed", "timeout", "skipped", "preparation_failed"].includes(run.status));
   const showDiagnostics = mode === "debug";
 
   useEffect(() => {
@@ -217,7 +218,10 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true, 
           {!compactNodeDetail && run.run_group_id && <Descriptions.Item label="运行分组">{run.run_group_id}</Descriptions.Item>}
           <Descriptions.Item label="开始时间">{formatDate(run.started_at)}</Descriptions.Item>
           <Descriptions.Item label="结束时间">{formatDate(run.finished_at)}</Descriptions.Item>
-          <Descriptions.Item label="耗时">{formatDuration(run.duration_ms)}</Descriptions.Item>
+          <Descriptions.Item label="目标执行耗时">{formatRunDuration(run)}</Descriptions.Item>
+          {numericMs(objectRecord(objectRecord(requestSnapshot)?.preparation)?.duration_ms) !== null && (
+            <Descriptions.Item label="前置准备耗时">{formatDuration(numericMs(objectRecord(objectRecord(requestSnapshot)?.preparation)?.duration_ms))}</Descriptions.Item>
+          )}
           {stageTimings.map((item) => (
             <Descriptions.Item key={item.label} label={item.label}>
               {formatDuration(item.value)}
@@ -772,6 +776,7 @@ function RunGroupSummaryTag({ summary }: { summary: RunGroupSummary }) {
   if (summary.running) return <Tag color="processing">{summary.running} 执行中 / {summary.total}</Tag>;
   if (summary.targetFailures) return <Tag color="error">{summary.targetFailures} 目标失败 / {summary.total}</Tag>;
   if (summary.runnerFailures) return <Tag color="warning">{summary.runnerFailures} 节点异常 / {summary.total}</Tag>;
+  if (summary.preparationFailures) return <Tag color="warning">{summary.preparationFailures} 前置失败 / {summary.total}</Tag>;
   return <Tag color="success">{summary.ok} 正常 / {summary.total}</Tag>;
 }
 
@@ -1140,7 +1145,7 @@ function singleRunMetaItems(run: Run): MetaItemData[] {
   return [
     { label: "类型", value: run.check_type === "ui" ? "UI" : "API" },
     ...(run.check_type === "ui" && run.browser_type ? [{ label: "Browser Type", value: run.browser_type }] : []),
-    { label: "耗时", value: formatDuration(run.duration_ms) },
+    { label: "目标执行耗时", value: formatRunDuration(run) },
     { label: "开始", value: formatDate(run.started_at) },
     { label: "结束", value: formatDate(run.finished_at) }
   ];
@@ -1266,12 +1271,13 @@ function summarizeRunGroup(runs: Run[]): RunGroupSummary {
     (summary, run) => {
       summary.total += 1;
       if (run.status === "ok") summary.ok += 1;
+      if (run.status === "preparation_failed") summary.preparationFailures += 1;
       if (["running", "pending"].includes(run.status)) summary.running += 1;
       if (run.failure_kind === "target" && ["failed", "timeout"].includes(run.status)) summary.targetFailures += 1;
       if (run.failure_kind === "runner" || (run.status === "skipped" && run.failure_kind !== "target")) summary.runnerFailures += 1;
       return summary;
     },
-    { total: 0, ok: 0, targetFailures: 0, runnerFailures: 0, running: 0 }
+    { total: 0, ok: 0, targetFailures: 0, runnerFailures: 0, preparationFailures: 0, running: 0 }
   );
 }
 
@@ -1292,7 +1298,7 @@ function runHasEvidence(run: Run): boolean {
 }
 
 function shouldShowEvidence(run: Run): boolean {
-  return runHasEvidence(run) || ["failed", "timeout", "skipped"].includes(run.status);
+  return runHasEvidence(run) || ["failed", "timeout", "skipped", "preparation_failed"].includes(run.status);
 }
 
 function defaultRunTab(run: Run | null, mode: RunResultMode, responseSnapshot: unknown, assertionCount: number): string {

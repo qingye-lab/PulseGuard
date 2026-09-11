@@ -1,10 +1,11 @@
-import { App, Button, Card, Checkbox, Drawer, Dropdown, Empty, Form, Input, Modal, Segmented, Skeleton, Space, Switch, Tag } from "antd";
+import { App, Button, Card, Checkbox, Drawer, Dropdown, Empty, Form, Input, Modal, Segmented, Space, Switch, Tag } from "antd";
 import type { MenuProps } from "antd";
 import { Clipboard, Download, Info, KeyRound, Monitor, MoreHorizontal, Pencil, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ProbeRunner, ProbeRunnerPayload, RelayStatus, RunnerProvisionResult, RunnerUpdateStatus } from "../../types";
 import { copyTextToClipboard, formatDate } from "../../utils";
 import { api } from "../../api";
+import { InitialLoadState } from "../../components/InitialLoadState";
 import { StructuredViewer } from "../../components/StructuredViewer";
 import { SettingsPanel } from "./panelPrimitives";
 
@@ -13,6 +14,8 @@ export function RunnerNodePanel() {
   const [runners, setRunners] = useState<ProbeRunner[]>([]);
   const [relayStatus, setRelayStatus] = useState<RelayStatus | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [createMode, setCreateMode] = useState<RunnerCreateMode>("manual");
   const [provisionPlatform, setProvisionPlatform] = useState<RunnerProvisionPlatform>("linux");
@@ -35,8 +38,11 @@ export function RunnerNodePanel() {
       const [nextRunners, nextRelayStatus] = await Promise.all([api.runners(), api.relayStatus()]);
       setRunners(nextRunners);
       setRelayStatus(nextRelayStatus);
+      setLoaded(true);
+      setLoadError(null);
     } catch (err) {
-      message.error((err as Error).message);
+      setLoadError((err as Error).message);
+      if (loaded) message.error((err as Error).message);
     } finally {
       setLoading(false);
     }
@@ -342,8 +348,8 @@ export function RunnerNodePanel() {
           </Space>
         </div>
 
-        {loading ? (
-          <Skeleton active paragraph={{ rows: 4 }} />
+        {!loaded ? (
+          <InitialLoadState loading={loading} error={loadError} onRetry={() => void loadRunners()} />
         ) : runners.length === 0 ? (
           <Empty description="暂无执行节点" />
         ) : (

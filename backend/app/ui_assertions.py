@@ -7,7 +7,7 @@ import time
 from typing import Any
 from urllib.parse import urldefrag
 
-from .context import RunContext, RunFailure
+from .context import RunContext, RunFailure, PreparationFailure
 from .ui_scan_script import UI_SCAN_SCRIPT
 from .variables import mask_data, mask_text, resolve_data, resolve_text, resolve_url
 from .viewport import browser_context_options, viewport_for_mode
@@ -411,8 +411,8 @@ async def inspect_ui_rule_selectors(payload: dict[str, Any], settings: dict[str,
         await playwright.stop()
 
 
-async def prepare_ui_target(ctx: RunContext, setup_func: Any | None = None) -> Any:
-    """One owner for setup -> variable resolution -> navigation in all UI entrypoints."""
+async def prepare_ui_prerequisites(ctx: RunContext, setup_func: Any | None = None) -> Any:
+    """Complete prerequisites before starting the target clock."""
     ctx.ui_stage = "browser"
     page = await ctx.new_page()
     started = time.perf_counter()
@@ -438,10 +438,10 @@ async def prepare_ui_target(ctx: RunContext, setup_func: Any | None = None) -> A
             raise RunFailure("页面 URL 不能为空")
         target_snapshot["url"] = target_url
         preparation["status"] = "ok"
-    except BaseException:
+    except Exception as exc:
         preparation["status"] = "failed"
         preparation["failed_stage"] = ctx.ui_stage
-        raise
+        raise PreparationFailure(str(exc) or exc.__class__.__name__) from exc
     finally:
         preparation["duration_ms"] = max(0, int((time.perf_counter() - started) * 1000))
         preparation["variables"] = ctx.vars.snapshot()
@@ -450,6 +450,12 @@ async def prepare_ui_target(ctx: RunContext, setup_func: Any | None = None) -> A
             preparation["last_response"] = ctx.response_snapshot
         ctx.request_snapshot = mask_data(target_snapshot, ctx.settings)
 
+    return page
+
+
+async def navigate_ui_target(ctx: RunContext, page: Any) -> Any:
+    # Evidence is masked; navigation must use the actual runtime variables.
+    target_url = ctx.entry_url.strip()
     ctx.ui_stage = "navigate"
     page_load_started = time.perf_counter()
     try:
@@ -463,11 +469,17 @@ async def prepare_ui_target(ctx: RunContext, setup_func: Any | None = None) -> A
     return page
 
 
-async def run_structured_ui_check(ctx: RunContext, setup_func: Any | None = None) -> None:
+async def prepare_ui_target(ctx: RunContext, setup_func: Any | None = None) -> Any:
+    page = await prepare_ui_prerequisites(ctx, setup_func)
+    return await navigate_ui_target(ctx, page)
+
+
+async def run_structured_ui_check(ctx: RunContext, setup_func: Any | None = None, *, page: Any | None = None) -> None:
     assertions = [item for item in normalize_ui_assertions(ctx.check.get("assertions_json")) if item.get("enabled", True)]
     if not assertions:
         raise RunFailure("请至少启用一个 UI 校验项")
-    page = await prepare_ui_target(ctx, setup_func)
+    if page is None:
+        page = await prepare_ui_target(ctx, setup_func)
     ctx.ui_stage = "assertions"
     assertions = [resolve_data(item, ctx.settings) for item in assertions]
     page_load_ms = ctx.request_snapshot["page_load_ms"]
