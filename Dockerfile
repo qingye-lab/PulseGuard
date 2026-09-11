@@ -1,5 +1,10 @@
 FROM node:22-bookworm AS frontend-build
 
+# Deployment branding is injected at build time so one source tree can serve
+# both the public build (unset, no team badge) and internal deployments.
+ARG VITE_APP_TEAM_NAME=""
+ENV VITE_APP_TEAM_NAME=${VITE_APP_TEAM_NAME}
+
 WORKDIR /build/frontend
 COPY frontend/package*.json ./
 RUN npm ci

@@ -1,6 +1,11 @@
 services:
   pulseguard:
-    build: .
+    build:
+      context: .
+      args:
+        # The team badge is deployment branding. Leave unset for the public
+        # build; internal deployments set it in .env.
+        VITE_APP_TEAM_NAME: ${VITE_APP_TEAM_NAME:-}
     container_name: pulseguard
     restart: unless-stopped
     ports:
