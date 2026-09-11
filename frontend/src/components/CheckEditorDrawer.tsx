@@ -48,6 +48,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   const [runningMode, setRunningMode] = useState<"saved" | "draft" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [debugRun, setDebugRun] = useState<Run | null>(null);
+  const [lastRunMode, setLastRunMode] = useState<"saved" | "draft" | null>(null);
   const [debugSnapshot, setDebugSnapshot] = useState<CheckPayload | null>(null);
   const [bodyMode, setBodyMode] = useState<BodyEditorMode>("json");
   const [notificationChannels, setNotificationChannels] = useState<NotificationChannel[]>([]);
@@ -127,6 +128,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     const next = check ? checkToPayload(check) : blankCheck(type);
     setError(null);
     setDebugRun(null);
+    setLastRunMode(null);
     setDebugSnapshot(null);
     setActiveCheck(check);
     setForm(next);
@@ -221,6 +223,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
       }
       const run = await api.runCheck(activeCheck.id);
       setDebugRun(run);
+      setLastRunMode("saved");
       setDebugSnapshot(normalizeCheckPayload(checkToPayload(activeCheck)));
       onSaved();
     } catch (err) {
@@ -237,6 +240,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
       const payload = prepareCheckPayload(form, { bodyMode });
       const run = await api.debugCheck(payload);
       setDebugRun(run);
+      setLastRunMode("draft");
       setDebugSnapshot(normalizeCheckPayload(payload));
     } catch (err) {
       setError((err as Error).message);
@@ -254,6 +258,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     if (!next) return;
     setError(null);
     setDebugRun(null);
+    setLastRunMode(null);
     setDebugSnapshot(null);
     setForm(next);
     setBodyMode(detectBodyMode(next.body));
@@ -353,10 +358,10 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
             loading={runningMode === "saved"}
             disabled={saving || running || !activeCheck}
           >
-            人工验证已保存配置
+            运行已保存配置
           </Button>
           <Button icon={<Play size={16} />} onClick={handleRunDraft} loading={runningMode === "draft"} disabled={saving || running}>
-            试运行当前配置
+            试运行草稿
           </Button>
           <Button type="primary" icon={<Save size={16} />} onClick={handleSaveOnly} loading={saving} disabled={running}>
             保存
@@ -686,7 +691,28 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
         )}
 
         {error && <Alert type="error" title={error} showIcon />}
-        {debugRun && <RunResultPanel run={debugRun} mode="debug" />}
+        {debugRun && (
+          <>
+            {/* Which configuration produced the result below decides how much the
+                result is worth: a draft run proves the text on screen works, a saved
+                run proves what the scheduler will actually want to check.
+                Only the saved run reaches alert channels. */}
+            {lastRunMode === "saved" ? (
+              <Alert
+                type="warning"
+                showIcon
+                title="本次运行使用已保存配置，会计入任务状态并可能触发告警"
+              />
+            ) : (
+              <Alert
+                type="info"
+                showIcon
+                title="本次运行使用当前草稿，不会保存配置、不计入任务状态、不触发告警"
+              />
+            )}
+            <RunResultPanel run={debugRun} mode="debug" />
+          </>
+        )}
       </Space>
     </Drawer>
   );

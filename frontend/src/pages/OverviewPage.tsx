@@ -1,9 +1,18 @@
-import { Alert, Button, Card, Descriptions, Empty, Space, Table, Tag, Typography } from "antd";
+import { Alert, Button, Card, Descriptions, Empty, Space, Table, Tag, Tooltip, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { History, Play, Settings2 } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
+import {
+  deriveProjectStatus,
+  eventHealthHint,
+  eventHealthLabel,
+  eventHealthTagColor,
+  monitoringReadinessHint,
+  monitoringReadinessLabel,
+  monitoringReadinessTagColor
+} from "../checkStatus";
 import { useProject } from "../ProjectContext";
 import type { CheckType, Overview, OverviewTrend, OverviewTrendSeries, Run, RuntimeStatus, SettingsValues } from "../types";
 import { checkListPath, formatDate, formatDuration, runStatusLabel, runStatusTagColor } from "../utils";
@@ -93,10 +102,12 @@ export function OverviewPage() {
     }
   }
 
-  const confirmingCount = (overview?.suspected_failing_count || 0) + (overview?.suspected_recovery_count || 0);
-  const staleOrUnknownCount = (overview?.unknown_count || 0) + (overview?.stale_count || 0);
-  const abnormalCount = (overview?.failing_count || 0) + confirmingCount + staleOrUnknownCount;
-  const hasIncident = abnormalCount > 0;
+  const projectStatus = deriveProjectStatus(overview);
+  const { readiness, health, confirmingCount, staleOrUnknownCount, failingCount, isVerifiedHealthy } = projectStatus;
+  const monitoringInactive = readiness !== "ready";
+  // The "no failures" reading is only reassuring once monitoring is proven to
+  // be working. Until then it stays labelled but is never coloured as success.
+  const healthTagColor = monitoringInactive && health === "healthy" ? "default" : eventHealthTagColor[health];
   const trends = overview?.trends || [];
 
   const columns: ColumnsType<Run> = [
@@ -139,28 +150,51 @@ export function OverviewPage() {
       <div className="project-primary-grid overview-primary-grid">
         <Card
           title="项目状态"
-          extra={<Tag color={hasIncident ? "error" : "success"}>{hasIncident ? "需要处理" : "健康"}</Tag>}
+          extra={
+            <Space size={6} wrap>
+              <Tooltip title={monitoringReadinessHint[readiness]}>
+                <Tag color={monitoringReadinessTagColor[readiness]}>{monitoringReadinessLabel[readiness]}</Tag>
+              </Tooltip>
+              <Tooltip title={eventHealthHint[health]}>
+                <Tag color={healthTagColor}>{isVerifiedHealthy ? "监控正常" : eventHealthLabel[health]}</Tag>
+              </Tooltip>
+            </Space>
+          }
         >
-          <Descriptions
-            className="project-state-descriptions"
-            bordered
-            size="small"
-            column={2}
-            items={[
-              { key: "ui", label: "页面监控", children: overview?.ui_count ?? 0 },
-              { key: "api", label: "接口监控", children: overview?.api_count ?? 0 },
-              { key: "failing", label: "当前故障", children: <Text type={overview?.failing_count ? "danger" : undefined}>{overview?.failing_count ?? 0}</Text> },
-              { key: "confirming", label: "确认中", children: confirmingCount },
-              { key: "stale", label: "待观测/过期", children: staleOrUnknownCount },
-              { key: "today", label: "今日定时观测", children: overview?.today_runs ?? 0 },
-              { key: "latest", label: "最近执行", children: overview?.latest_run ? formatDate(overview.latest_run.started_at) : "未执行" },
-              {
-                key: "recovered",
-                label: "最近恢复",
-                children: overview?.latest_recovered ? `${overview.latest_recovered.name} · ${formatDate(overview.latest_recovered.last_success_at)}` : "暂无恢复"
-              }
-            ]}
-          />
+          <div className="project-state-descriptions-wrap">
+            {monitoringInactive && (
+              <Alert
+                type={readiness === "disabled" ? "warning" : "info"}
+                showIcon
+                title={monitoringReadinessHint[readiness]}
+                action={
+                  <Button size="small" type="primary" onClick={() => navigate("/ui-checks")}>
+                    {readiness === "disabled" ? "启用监控任务" : "查看监控任务"}
+                  </Button>
+                }
+              />
+            )}
+            <Descriptions
+              className="project-state-descriptions"
+              bordered
+              size="small"
+              column={2}
+              items={[
+                { key: "ui", label: "页面监控", children: overview?.ui_count ?? 0 },
+                { key: "api", label: "接口监控", children: overview?.api_count ?? 0 },
+                { key: "failing", label: "当前故障", children: <Text type={failingCount ? "danger" : undefined}>{failingCount}</Text> },
+                { key: "confirming", label: "确认中", children: confirmingCount },
+                { key: "stale", label: "待观测/过期", children: staleOrUnknownCount },
+                { key: "today", label: "今日定时观测", children: overview?.today_runs ?? 0 },
+                { key: "latest", label: "最近执行", children: overview?.latest_run ? formatDate(overview.latest_run.started_at) : "未执行" },
+                {
+                  key: "recovered",
+                  label: "最近恢复",
+                  children: overview?.latest_recovered ? `${overview.latest_recovered.name} · ${formatDate(overview.latest_recovered.last_success_at)}` : "暂无恢复"
+                }
+              ]}
+            />
+          </div>
         </Card>
 
         <Card
@@ -202,12 +236,6 @@ export function OverviewPage() {
         </Card>
       </div>
 
-      {trends.length > 0 && (
-        <section className="trend-grid" aria-label="运行趋势">
-          {trends.map((trend) => <TrendCard key={trend.key} trend={trend} />)}
-        </section>
-      )}
-
       <Card
         title="当前故障现场"
         extra={
@@ -222,11 +250,25 @@ export function OverviewPage() {
           dataSource={overview?.recent_failures || []}
           pagination={false}
           locale={{
-            emptyText: <Empty description="暂无失败记录" />
+            emptyText: (
+              <Empty
+                description={
+                  monitoringInactive
+                    ? "监控未生效，暂无失败记录并不代表系统健康"
+                    : "暂无失败记录，最近一次观测时间见上方「最近执行」"
+                }
+              />
+            )
           }}
           scroll={{ x: 980 }}
         />
       </Card>
+
+      {trends.length > 0 && (
+        <section className="trend-grid" aria-label="运行趋势">
+          {trends.map((trend) => <TrendCard key={trend.key} trend={trend} />)}
+        </section>
+      )}
 
       {detailRunId && (
         <Suspense fallback={null}>

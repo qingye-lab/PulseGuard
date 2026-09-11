@@ -16,8 +16,10 @@ import {
   Plus,
   PlugZap,
   ScrollText,
+  ServerCog,
   ShieldCheck,
   Settings,
+  SlidersHorizontal,
   Users,
   WandSparkles
 } from "lucide-react";
@@ -31,7 +33,11 @@ import { formatDate } from "../utils";
 import { useProject } from "../ProjectContext";
 
 const { Text, Title } = Typography;
-const APP_TEAM_NAME = "新零售测试团队";
+
+// The team badge is deployment-specific branding, not application data, so it
+// is read from the environment at build time and falls back to the original
+// label that shipped with this deployment. Override with VITE_APP_TEAM_NAME.
+const APP_TEAM_NAME = import.meta.env.VITE_APP_TEAM_NAME || "新零售测试团队";
 
 type NavLeaf = {
   to: string;
@@ -48,39 +54,44 @@ type NavEntry =
       children: NavLeaf[];
     };
 
+// Navigation is organised by duty: what you watch (监控), what you configure
+// (配置), and what you operate (运维). Every destination stays reachable; only
+// the grouping changed, so no path needed renaming and no redirect was added.
+// /debug is intentionally absent — it is a full-screen route reached from a
+// check, and Layout special-cases its title instead.
 const navEntries: NavEntry[] = [
-  { to: "/", label: "总览", icon: <LayoutDashboard size={16} /> },
   {
     key: "monitoring",
-    label: "监控任务",
+    label: "监控",
     icon: <MonitorCheck size={16} />,
     children: [
+      { to: "/", label: "总览", icon: <LayoutDashboard size={16} /> },
       { to: "/ui-checks", label: "页面监控", icon: <MonitorCheck size={16} /> },
       { to: "/api-checks", label: "接口监控", icon: <PlugZap size={16} /> },
+      { to: "/runs", label: "运行记录", icon: <History size={16} /> },
       { to: "/monitoring", label: "监控趋势", icon: <Activity size={16} /> }
     ]
   },
-  { to: "/runs", label: "运行记录", icon: <History size={16} /> },
-  { to: "/members", label: "成员管理", icon: <Users size={16} /> },
-  { to: "/integrations", label: "Skill / MCP", icon: <BookOpen size={16} /> },
   {
-    key: "projects",
-    label: "项目管理",
-    icon: <FolderKanban size={16} />,
+    key: "configuration",
+    label: "配置",
+    icon: <SlidersHorizontal size={16} />,
     children: [
       { to: "/projects", label: "项目列表", icon: <FolderKanban size={16} /> },
       { to: "/projects/modules", label: "公共方法", icon: <WandSparkles size={16} /> },
-      { to: "/projects/alerts", label: "项目告警", icon: <BellRing size={16} /> }
-    ]
-  },
-  {
-    key: "system",
-    label: "系统设置",
-    icon: <Settings size={16} />,
-    children: [
+      { to: "/projects/alerts", label: "项目告警", icon: <BellRing size={16} /> },
       { to: "/settings/execution", label: "执行配置", icon: <Activity size={16} /> },
       { to: "/settings/system-alerts", label: "系统告警", icon: <ShieldCheck size={16} /> },
       { to: "/settings/variables", label: "变量管理", icon: <KeyRound size={16} /> },
+      { to: "/members", label: "成员管理", icon: <Users size={16} /> },
+      { to: "/integrations", label: "Skill / MCP", icon: <BookOpen size={16} /> }
+    ]
+  },
+  {
+    key: "operations",
+    label: "运维",
+    icon: <ServerCog size={16} />,
+    children: [
       { to: "/settings/system", label: "系统配置", icon: <Settings size={16} /> },
       { to: "/operations", label: "运维审计", icon: <ScrollText size={16} /> }
     ]
