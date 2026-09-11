@@ -25,7 +25,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useId, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { StructuredViewer } from "../components/StructuredViewer";
 import type {
@@ -60,6 +60,18 @@ const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
   variables: "变量管理",
   system: "系统配置"
 };
+
+const SETTINGS_TAB_ORDER: SettingsTab[] = ["alerts", "system-alerts", "execution", "variables", "system"];
+
+/**
+ * "项目告警" is served by its own route (`/projects/alerts` renders SettingsPage
+ * with a tab override) because it is project-scoped while the other four are
+ * system-scoped. The in-page tabs therefore point at the route each tab really
+ * lives on rather than all pretending to be `/settings/*`.
+ */
+function settingsTabPath(tab: SettingsTab): string {
+  return tab === "alerts" ? "/projects/alerts" : `/settings/${tab}`;
+}
 
 const SETTINGS_TAB_KEYS = new Set<SettingsTab>(Object.keys(SETTINGS_TAB_LABELS) as SettingsTab[]);
 
@@ -688,6 +700,19 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
 
   return (
     <div className="page-content settings-page">
+      <nav className="settings-tab-bar" aria-label="设置分类">
+        {SETTINGS_TAB_ORDER.map((tabKey) => (
+          <Link
+            key={tabKey}
+            to={settingsTabPath(tabKey)}
+            className={`settings-tab ${tabKey === activeTab ? "is-active" : ""}`}
+            aria-current={tabKey === activeTab ? "page" : undefined}
+          >
+            {SETTINGS_TAB_LABELS[tabKey]}
+          </Link>
+        ))}
+      </nav>
+
       {!(activeTab === "variables" && variableScope === "project") && <Card size="small" className="settings-command-card">
         <div className="settings-command-bar">
           <div className="settings-title-row">

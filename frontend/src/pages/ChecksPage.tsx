@@ -1,4 +1,4 @@
-import { Alert, App, Button, Card, Checkbox, Dropdown, Empty, Input, Select, Skeleton, Space, Statistic, Switch, Table, Tag } from "antd";
+import { Alert, App, Button, Card, Checkbox, Dropdown, Empty, Input, Segmented, Select, Skeleton, Space, Statistic, Switch, Table, Tag } from "antd";
 import type { MenuProps, PaginationProps } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Copy, Edit3, FilterX, History, MoreHorizontal, Play, Plus, Power, PowerOff, RefreshCw, Search, Trash2 } from "lucide-react";
@@ -19,6 +19,37 @@ import type { Check, CheckBatchAction, CheckType, ProbeRunner, Run, TaskSurfaceS
 import { compactUrl, formatDate, formatDuration, intervalLabel, taskStatus, taskStatusLabel, taskStatusTagColor } from "../utils";
 
 type EnabledFilter = "" | "enabled" | "disabled";
+
+// Column presets exist because the full task table is wider than a laptop
+// viewport. "overview" keeps the columns an operator needs to answer "what is
+// broken and what do I do"; "diagnostic" keeps every column for triage. Only
+// the rendering changes — no data is dropped, and hidden fields stay reachable
+// from the detail drawer and the row actions.
+type ChecksColumnPreset = "overview" | "diagnostic";
+
+const CHECK_PRESET_STORAGE_KEY = "pulseguard:checks-column-preset";
+
+const checkPresetOptions = [
+  { value: "overview", label: "运维视图" },
+  { value: "diagnostic", label: "排障视图" }
+] as const;
+
+/**
+ * The diagnostic table needs ~1480px of content width, which no laptop viewport
+ * offers once the 232px rail and page padding are removed. So the fitting preset
+ * is the default, and the wide one is only ever an explicit, persisted choice
+ * for operators who have the screen for it.
+ */
+function readStoredPreset(): ChecksColumnPreset {
+  try {
+    const stored = window.localStorage.getItem(CHECK_PRESET_STORAGE_KEY);
+    if (stored === "overview" || stored === "diagnostic") return stored;
+  } catch {
+    // Private browsing or a locked-down profile: fall through to the default.
+  }
+  return "overview";
+}
+
 type BusyState = number | "batch" | null;
 
 const CheckEditorDrawer = lazy(() => import("../components/CheckEditorDrawer").then((module) => ({ default: module.CheckEditorDrawer })));
@@ -64,6 +95,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
   const [runners, setRunners] = useState<ProbeRunner[]>([]);
   const [selectedCheckIds, setSelectedCheckIds] = useState<number[]>([]);
   const [isCompactList, setIsCompactList] = useState(() => window.matchMedia("(max-width: 720px)").matches);
+  const [columnPreset, setColumnPreset] = useState<ChecksColumnPreset>(readStoredPreset);
   const navigate = useNavigate();
   const focusedCheckId = searchParams.get("check_id");
 
@@ -95,6 +127,14 @@ export function ChecksPage({ type }: { type: CheckType }) {
     media.addEventListener("change", sync);
     return () => media.removeEventListener("change", sync);
   }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(CHECK_PRESET_STORAGE_KEY, columnPreset);
+    } catch {
+      // Persistence is a convenience; the preset still applies for this session.
+    }
+  }, [columnPreset]);
 
   const filtered = useMemo(() => {
     const keyword = query.trim().toLowerCase();
@@ -338,6 +378,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
     setSearchParams(next, { replace: true });
   }
 
+  const isOverviewPreset = columnPreset === "overview";
   const columns: ColumnsType<Check> = [
     {
       title: "名称",
@@ -351,21 +392,25 @@ export function ChecksPage({ type }: { type: CheckType }) {
         </div>
       ),
       fixed: "left",
-      width: 230
+      width: 200
     },
     ...(type === "api" ? [{ title: "Method", dataIndex: "method", width: 92 }] : []),
-    {
-      title: "URL",
-      dataIndex: "entry_url",
-      ellipsis: true,
-      width: 260,
-      render: (value: string) => <span title={value}>{compactUrl(value)}</span>
-    },
-    {
-      title: "执行节点",
-      width: 130,
-      render: (_, check) => <Tag>{runnerStrategyLabel(check, runners)}</Tag>
-    },
+    ...(isOverviewPreset
+      ? []
+      : [
+          {
+            title: "URL",
+            dataIndex: "entry_url",
+            ellipsis: true,
+            width: 260,
+            render: (value: string) => <span title={value}>{compactUrl(value)}</span>
+          },
+          {
+            title: "执行节点",
+            width: 130,
+            render: (_: unknown, check: Check) => <Tag>{runnerStrategyLabel(check, runners)}</Tag>
+          }
+        ]),
     { title: "状态", className: "check-status-cell", render: (_, check) => <TaskStatusTag check={check} />, width: 105 },
     {
       title: "启用",
@@ -380,10 +425,14 @@ export function ChecksPage({ type }: { type: CheckType }) {
       ),
       width: 92
     },
-    { title: "定时", dataIndex: "interval_seconds", render: (value: number) => intervalLabel(value), width: 105 },
-    { title: "最近执行", dataIndex: "last_run_at", render: (value?: string | null) => formatDate(value), width: 180 },
+    ...(isOverviewPreset
+      ? []
+      : [{ title: "定时", dataIndex: "interval_seconds", render: (value: number) => intervalLabel(value), width: 105 }]),
+    { title: "最近执行", dataIndex: "last_run_at", render: (value?: string | null) => formatDate(value), width: 158 },
     { title: "耗时", dataIndex: "last_duration_ms", render: (value?: number | null) => formatDuration(value), width: 105 },
-    { title: "连续失败", dataIndex: "consecutive_failures", render: (value: number) => value || "-", width: 105 },
+    ...(isOverviewPreset
+      ? []
+      : [{ title: "连续失败", dataIndex: "consecutive_failures", render: (value: number) => value || "-", width: 105 }]),
     {
       title: "操作",
       className: "check-actions-cell",
@@ -532,6 +581,14 @@ export function ChecksPage({ type }: { type: CheckType }) {
             />
           </div>
           <Space wrap>
+            {!isCompactList && (
+              <Segmented
+                value={columnPreset}
+                onChange={(value) => setColumnPreset(value as ChecksColumnPreset)}
+                options={checkPresetOptions.map((option) => ({ value: option.value, label: option.label }))}
+                aria-label="表格列视图"
+              />
+            )}
             <Button icon={<FilterX size={16} />} onClick={resetFilters} disabled={!hasFilters}>
               清空筛选
             </Button>
@@ -635,7 +692,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
               )
             }}
             className="checks-table project-data-table"
-            scroll={{ x: type === "api" ? 1580 : 1480 }}
+            scroll={{ x: isOverviewPreset ? (type === "api" ? 928 : 872) : type === "api" ? 1580 : 1480 }}
           />
         )}
       </Card>

@@ -269,6 +269,21 @@ button svg {
   margin-top: 2px;
 }
 
+/* Rendered only when VITE_APP_TEAM_NAME is set at build time. */
+.brand-team {
+  display: inline-block;
+  max-width: 100%;
+  padding: 1px 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-tight);
+  background: var(--panel-strong);
+  color: var(--rail-muted);
+  font-size: var(--type-small);
+  font-weight: var(--weight-medium);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
 .brand-name.ant-typography {
   display: block;
   margin: 0;
@@ -815,6 +830,12 @@ button svg {
   color: var(--ink);
   font-variant-numeric: tabular-nums;
   font-weight: var(--weight-semibold);
+}
+
+/* The readiness notice sits above the metric grid, so it needs its own
+   separation from the descriptions rather than relying on the card body gap. */
+.project-state-descriptions-wrap .ant-alert {
+  margin-bottom: var(--space-sm);
 }
 
 .project-stat-grid {
@@ -4534,6 +4555,50 @@ tr:last-child td {
 
 .settings-page {
   gap: var(--space-md);
+}
+
+/* Settings is one route per section, but the five sections are also siblings a
+   reader expects to move between. This bar gives that in-page navigation without
+   introducing another routing layer; each link targets the route the section
+   actually lives on. */
+.settings-tab-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  padding-bottom: var(--space-sm);
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-tab {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-tight);
+  color: var(--pg-muted);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  transition-property: background-color, border-color, color;
+  transition-duration: var(--duration-fast);
+  transition-timing-function: var(--ease-out);
+}
+
+.settings-tab:hover {
+  background-color: var(--panel-strong);
+  color: var(--ink);
+}
+
+.settings-tab:focus-visible {
+  outline: 2px solid var(--pg-accent);
+  outline-offset: 2px;
+}
+
+.settings-tab.is-active {
+  border-color: var(--line-strong);
+  background-color: var(--panel);
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
 }
 
 .settings-command-card {

@@ -10,7 +10,7 @@ export const palette = {
   surfaceRaised: "#ffffff",
   text: "#171717",
   textMuted: "#4d4d4d",
-  textTertiary: "#7d7d7d",
+  textTertiary: "#737373",
   border: "#e6e6e6",
   borderStrong: "#c9c9c9",
   primary: "#006bff",
