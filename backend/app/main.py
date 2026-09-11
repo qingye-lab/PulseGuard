@@ -24,7 +24,7 @@ from .ui_diagnostics import UiInspectionFailure
 from . import config_transfer, failure_summary, notifier, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
 from .frontend_assets import FrontendAssets
-from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_PRINT_TOKEN, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs, relay_control_token
+from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TEAM_NAME, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_PRINT_TOKEN, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs, relay_control_token
 from .relay_cert import relay_fingerprint
 from .runner import API_SCRIPT_ASSERTIONS_CAPABILITY, SCRIPT_MODULES_CAPABILITY, CheckRunner, MaintenanceBusyError, RuntimeSettingsReloadError
 from .scheduler import PulseScheduler
@@ -230,7 +230,7 @@ def _active_library_project_context(
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "name": APP_DISPLAY_NAME, "team": ""}
+    return {"status": "ok", "name": APP_DISPLAY_NAME, "team": TEAM_NAME}
 
 
 @app.get("/api/projects")

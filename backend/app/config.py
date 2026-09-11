@@ -28,6 +28,9 @@ TIMEZONE = os.getenv("TZ", "Asia/Shanghai")
 ALERT_DETAIL_BASE_URL = (os.getenv("PULSEGUARD_ALERT_DETAIL_BASE_URL") or "http://localhost:8787").rstrip("/")
 APP_VERSION = os.getenv("PULSEGUARD_VERSION", "0.1.0").strip() or "0.1.0"
 BUILD_SHA = os.getenv("PULSEGUARD_BUILD_SHA", "unknown").strip() or "unknown"
+# Deployment branding, not application data. Empty by default so a public build
+# carries no team or company identity; internal deployments set it explicitly.
+TEAM_NAME = os.getenv("PULSEGUARD_TEAM_NAME", "").strip()
 NODE_ROLE = os.getenv("PULSEGUARD_NODE_ROLE", "main").strip().lower() or "main"
 WORKER_TOKEN_FILE = Path(os.getenv("PULSEGUARD_WORKER_TOKEN_FILE", DATA_DIR / "worker-token")).resolve()
 RUNNER_HEALTH_POLL_SECONDS = max(10, int(os.getenv("PULSEGUARD_RUNNER_HEALTH_POLL_SECONDS", "30")))

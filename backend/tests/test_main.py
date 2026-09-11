@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from backend.app import config as config_module
 from backend.app import main as main_module
 from backend.app import storage
 from backend.app.main import app
@@ -115,6 +116,20 @@ class FrontendRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok", "name": "PulseGuard", "team": ""})
+
+    def test_health_route_reports_deployment_team_name_when_configured(self) -> None:
+        # Branding is a deployment setting, not application data. A public build
+        # leaves PULSEGUARD_TEAM_NAME unset and reports no team identity; an
+        # internal deployment sets it and gets it echoed here.
+        with patch.object(main_module, "TEAM_NAME", "内部团队"):
+            payload = TestClient(app).get("/api/health").json()
+
+        self.assertEqual(payload["team"], "内部团队")
+
+    def test_team_name_defaults_to_empty_so_public_builds_stay_unbranded(self) -> None:
+        # Guards the public line: the default must stay empty, so no company or
+        # team name can reach a released build through a source literal.
+        self.assertEqual(config_module.TEAM_NAME, "")
 
     def test_database_health_route_returns_storage_capacity_signals(self) -> None:
         payload = {

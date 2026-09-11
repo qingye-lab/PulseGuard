@@ -17,6 +17,9 @@ FROM ghcr.io/astral-sh/uv:0.9.30 AS uv-bin
 FROM mcr.microsoft.com/playwright/python:v1.49.1-noble AS runtime-base
 ARG PULSEGUARD_VERSION=0.1.0
 ARG PULSEGUARD_BUILD_SHA=unknown
+# Same deployment branding as the frontend build arg. Unset keeps GET /api/health
+# free of team identity for public builds.
+ARG PULSEGUARD_TEAM_NAME=""
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
@@ -32,6 +35,7 @@ ENV PULSEGUARD_REPORTS_DIR=/app/reports
 ENV PULSEGUARD_STATIC_DIR=/app/frontend/dist
 ENV PULSEGUARD_VERSION=${PULSEGUARD_VERSION}
 ENV PULSEGUARD_BUILD_SHA=${PULSEGUARD_BUILD_SHA}
+ENV PULSEGUARD_TEAM_NAME=${PULSEGUARD_TEAM_NAME}
 
 COPY --from=uv-bin /uv /uvx /bin/
 COPY pyproject.toml uv.lock /app/
