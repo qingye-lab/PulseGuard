@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import time
 import uuid
@@ -41,6 +42,9 @@ SESSION_LOCK = asyncio.Lock()
 PUBLIC_CONNECTIONS = 0
 PUBLIC_CONNECTION_LOCK = asyncio.Lock()
 AUTH_FAILURES: dict[str, tuple[int, float]] = {}
+logger = logging.getLogger("uvicorn.error.relay")
+# Worker runs share this TCP listener with health, update and artifact requests.
+RELAY_AUXILIARY_STREAM_HEADROOM = 4
 
 
 @dataclass
@@ -55,6 +59,7 @@ class RelaySession:
     stream_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     streams: dict[str, TunnelStream] = field(default_factory=dict)
     disconnect_reason: str | None = None
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     async def send_json(self, message: dict[str, Any]) -> None:
         async with self.send_lock:
@@ -156,6 +161,7 @@ async def revoke_relay_session(runner_id: str, reason: str = "revoked") -> bool:
         if not session:
             return False
         storage.mark_probe_runner_relay_disconnected(runner_id, reason)
+        logger.info("relay_revoked runner_id=%r", runner_id)
         await session.close()
         return True
 
@@ -180,6 +186,7 @@ async def _tcp_client_connected(session: RelaySession, reader: asyncio.StreamRea
         return
     async with session.stream_lock:
         if len(session.streams) >= _max_concurrent_streams():
+            logger.warning("relay_stream_rejected runner_id=%r session_id=%s reason=stream_limit active_streams=%s", session.runner_id, session.session_id, len(session.streams))
             await _close_writer_best_effort(writer)
             return
         stream_id = uuid.uuid4().hex
@@ -199,8 +206,8 @@ async def _tcp_client_connected(session: RelaySession, reader: asyncio.StreamRea
             )
             stream.tasks.add(task)
             await task
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("relay_stream_failed runner_id=%r session_id=%s stream_id=%s error_type=%s", session.runner_id, session.session_id, stream_id, type(exc).__name__)
     finally:
         await _close_stream_best_effort(session, stream_id)
 
@@ -208,9 +215,10 @@ async def _tcp_client_connected(session: RelaySession, reader: asyncio.StreamRea
 def _max_concurrent_streams() -> int:
     try:
         settings = storage.get_settings()
-        return max(1, int(settings.get("max_concurrency") or RELAY_MAX_CONCURRENT_STREAMS))
+        capacity = max(1, int(settings.get("max_concurrency") or 1))
     except Exception:
-        return RELAY_MAX_CONCURRENT_STREAMS
+        capacity = 1
+    return max(capacity, RELAY_MAX_CONCURRENT_STREAMS) + RELAY_AUXILIARY_STREAM_HEADROOM
 
 
 async def _start_internal_server(handler: Any, port: int) -> asyncio.AbstractServer:
@@ -229,12 +237,14 @@ async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -
     if stream:
         close_stream = False
         if not stream.record_received(len(data), RELAY_MAX_BODY_BYTES):
+            logger.warning("relay_stream_failed runner_id=%r session_id=%s stream_id=%r reason=byte_limit", session.runner_id, session.session_id, stream_id)
             close_stream = True
         else:
             try:
                 stream.writer.write(data)
                 await asyncio.wait_for(stream.writer.drain(), timeout=RELAY_STREAM_IDLE_TIMEOUT_SECONDS)
-            except Exception:
+            except Exception as exc:
+                logger.warning("relay_stream_failed runner_id=%r session_id=%s stream_id=%r error_type=%s", session.runner_id, session.session_id, stream_id, type(exc).__name__)
                 close_stream = True
         if close_stream:
             await _close_stream_best_effort(session, stream_id)
@@ -271,6 +281,7 @@ async def _open_relay_session(
         if old_session:
             ACTIVE_SESSIONS.pop(runner_id, None)
             storage.mark_probe_runner_relay_disconnected(runner_id, "relay session replaced")
+            logger.info("relay_replaced runner_id=%r session_id=%s", runner_id, old_session.session_id)
             await old_session.close()
         server = await _start_internal_server(handler, port)
         session = RelaySession(runner_id=runner_id, token=token, token_version=token_version, websocket=websocket, server=server)
@@ -333,6 +344,7 @@ async def relay_connect(websocket: WebSocket) -> None:
             return
         session_holder["session"] = session
         storage.mark_probe_runner_relay_connected(runner_id, token_version=token_version)
+        logger.info("relay_connected runner_id=%r session_id=%s", runner_id, session.session_id)
         await session.send_json({"type": "ready"})
         while True:
             try:
@@ -370,13 +382,20 @@ async def relay_connect(websocket: WebSocket) -> None:
                     disconnect_reason = "invalid relay message"
                     await _close_websocket_best_effort(websocket, code=4400, reason="invalid relay message")
                     return
+                reason = str(message.get("reason") or "")
+                if message_type == "error" or reason in {"idle_timeout", "byte_limit", "io_error", "eof_before_data"}:
+                    # Never log an arbitrary peer-provided message (it may contain credentials).
+                    safe_reason = reason if reason in {"idle_timeout", "byte_limit", "io_error", "worker_connect_failed", "eof_before_data"} else "peer_error"
+                    error_type = str(message.get("error_type") or "")
+                    safe_error_type = error_type if error_type in {"TimeoutError", "ConnectionRefusedError", "ConnectionResetError", "OSError", "gaierror"} else "unspecified"
+                    logger.warning("relay_peer_stream_failed runner_id=%r session_id=%s stream_id=%r reason=%s error_type=%s", runner_id, session.session_id, stream_id[:128], safe_reason, safe_error_type)
                 await _close_stream_best_effort(session, stream_id)
             else:
                 disconnect_reason = "invalid relay message"
                 await _close_websocket_best_effort(websocket, code=4400, reason="invalid relay message")
                 return
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        disconnect_reason = f"websocket disconnected (code={exc.code})"
     except Exception as exc:
         disconnect_reason = str(exc)[:500]
         if runner_id:
@@ -385,6 +404,11 @@ async def relay_connect(websocket: WebSocket) -> None:
         raise
     finally:
         if session:
+            reason = session.disconnect_reason or disconnect_reason
+            # Unexpected exception text is retained in the existing node field;
+            # journal entries use a bounded classification instead of raw payloads.
+            known_reason = reason if reason in {"relay heartbeat timeout", "invalid relay message", "relay token rotated", "client disconnected"} or reason.startswith("websocket disconnected (code=") else "session_error"
+            logger.info("relay_disconnected runner_id=%r session_id=%s reason=%s active_streams=%s", runner_id, session.session_id, known_reason, len(session.streams))
             active_session = False
             async with SESSION_LOCK:
                 if ACTIVE_SESSIONS.get(runner_id) is session:

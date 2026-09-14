@@ -75,6 +75,34 @@ class FailingSendWebsocket:
 
 
 class RelayClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_connect_timeout_reports_stream_failure_without_hanging(self) -> None:
+        async def blocked(*args):
+            await asyncio.Event().wait()
+        with patch("backend.app.relay_client.asyncio.open_connection", side_effect=blocked), patch(
+            "backend.app.relay_client.WORKER_CONNECT_TIMEOUT_SECONDS", 0.01
+        ), patch("backend.app.relay_client._send_json_best_effort", new_callable=AsyncMock) as send:
+            await asyncio.wait_for(relay_client._open_worker_stream("s1", object(), asyncio.Lock(), {}), 1)
+        self.assertEqual(send.call_args.args[2]["reason"], "worker_connect_failed")
+
+    async def test_clean_and_failed_disconnects_both_back_off(self) -> None:
+        for outcomes in ([None, None, asyncio.CancelledError()], [ConnectionError(), ConnectionError(), asyncio.CancelledError()]):
+            with self.subTest(outcomes=outcomes), patch("backend.app.relay_client.run_once", new=AsyncMock(side_effect=outcomes)), patch(
+                "backend.app.relay_client.asyncio.sleep", new_callable=AsyncMock
+            ) as sleep, patch("backend.app.relay_client.random.uniform", side_effect=lambda low, high: high):
+                with self.assertRaises(asyncio.CancelledError):
+                    await relay_client.main_loop()
+                self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 2])
+
+    async def test_stable_session_resets_reconnect_backoff(self) -> None:
+        with patch("backend.app.relay_client.run_once", new=AsyncMock(side_effect=[None, None, asyncio.CancelledError()])), patch(
+            "backend.app.relay_client.asyncio.sleep", new_callable=AsyncMock
+        ) as sleep, patch("backend.app.relay_client.random.uniform", side_effect=lambda low, high: high), patch(
+            "backend.app.relay_client.time.monotonic", side_effect=[0, 0, 0, 65, 65]
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await relay_client.main_loop()
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 1])
+
     async def test_fingerprint_requires_peer_certificate(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "TLS certificate is unavailable"):
             relay_client._assert_fingerprint(FakeWebsocket(None), "00")  # type: ignore[arg-type]

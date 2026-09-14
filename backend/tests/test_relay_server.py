@@ -718,8 +718,8 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         second_writer = FakeWriter()
 
         with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch(
-            "backend.app.relay_server.storage.get_settings",
-            return_value={"max_concurrency": 1},
+            "backend.app.relay_server._max_concurrent_streams",
+            return_value=1,
         ):
             await relay_server._tcp_client_connected(  # type: ignore[arg-type]
                 session,
@@ -745,8 +745,8 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         rejected_writer = FailingCloseWriter()
 
         with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch(
-            "backend.app.relay_server.storage.get_settings",
-            return_value={"max_concurrency": 1},
+            "backend.app.relay_server._max_concurrent_streams",
+            return_value=1,
         ):
             await relay_server._tcp_client_connected(  # type: ignore[arg-type]
                 session,
@@ -789,3 +789,51 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum('"type":"open"' in message for message in websocket.messages), 2)
         self.assertTrue(first_writer.closed)
         self.assertTrue(second_writer.closed)
+
+    async def test_busy_execution_stream_still_allows_health_connection(self) -> None:
+        websocket = FakeWebSocket()
+        session = relay_server.RelaySession("edge-1", "secret", 1, websocket, FakeServer())
+        session.streams["busy-run"] = relay_server.TunnelStream(BlockingReader(), FakeWriter())
+        writer = FakeWriter()
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch(
+            "backend.app.relay_server.storage.get_settings", return_value={"max_concurrency": 1}
+        ):
+            await relay_server._tcp_client_connected(session, EmptyReader(), writer)
+        self.assertEqual(sum('"type":"open"' in message for message in websocket.messages), 1)
+        self.assertIn("busy-run", session.streams)
+        await session.close()
+
+    async def test_stream_limit_remains_bounded_with_auxiliary_headroom(self) -> None:
+        with patch("backend.app.relay_server.storage.get_settings", return_value={"max_concurrency": 5}), patch(
+            "backend.app.relay_server.RELAY_MAX_CONCURRENT_STREAMS", 2
+        ):
+            self.assertEqual(relay_server._max_concurrent_streams(), 9)
+        with patch("backend.app.relay_server.storage.get_settings", side_effect=RuntimeError), patch(
+            "backend.app.relay_server.RELAY_MAX_CONCURRENT_STREAMS", 2
+        ):
+            self.assertEqual(relay_server._max_concurrent_streams(), 6)
+
+    async def test_disconnect_journal_keeps_session_and_stream_reason_without_peer_secrets(self) -> None:
+        from fastapi import WebSocketDisconnect
+        class DisconnectSocket(SessionWebSocket):
+            async def receive_text(self):
+                if not self.texts:
+                    raise WebSocketDisconnect(code=1006, reason="secret-in-close")
+                return await super().receive_text()
+        websocket = DisconnectSocket([
+            '{"type":"hello","runner_id":"edge-1","relay_token":"secret-token","relay_token_version":1}',
+            '{"type":"error","stream_id":"s1","reason":"worker_connect_failed","message":"secret-in-error"}',
+            '{"type":"error","stream_id":"s2","error_type":{"secret":"do-not-log"}}',
+        ])
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"allocated_internal_port": 18001}), patch(
+            "backend.app.relay_server._start_internal_server", new=AsyncMock(return_value=FakeServer())
+        ), patch("backend.app.relay_server.storage.mark_probe_runner_relay_connected"), patch(
+            "backend.app.relay_server.storage.mark_probe_runner_relay_disconnected"
+        ) as mark_disconnected, self.assertLogs("uvicorn.error.relay", level="INFO") as logs:
+            await relay_server.relay_connect(websocket)
+        text = "\n".join(logs.output)
+        for expected in ("relay_connected", "relay_disconnected", "session_id=", "edge-1", "worker_connect_failed", "1006"):
+            self.assertIn(expected, text)
+        self.assertNotIn("secret-", text)
+        self.assertNotIn("do-not-log", text)
+        mark_disconnected.assert_called_once_with("edge-1", "websocket disconnected (code=1006)")

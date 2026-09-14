@@ -2,11 +2,45 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from backend.app.resource_pool import BrowserPool, ProbeResourcePool
 
 
 class BrowserPoolTests(unittest.TestCase):
+    def test_hanging_context_release_wakes_waiter_and_retires_browser(self) -> None:
+        async def scenario() -> None:
+            fake = FakePlaywright()
+            pool = browser_pool(fake, size=1)
+            await pool.start(settings())
+            lease = await pool.acquire_context(settings(), {})
+            original_browser = lease.browser
+
+            async def hanging_close():
+                await asyncio.Event().wait()
+
+            lease.context.close = hanging_close
+            waiter = asyncio.create_task(pool.acquire_context(settings(), {}))
+            await asyncio.sleep(0)
+            self.assertFalse(waiter.done())
+            try:
+                with patch("backend.app.resource_pool.RESOURCE_CLEANUP_TIMEOUT_SECONDS", 0.02):
+                    with self.assertRaises(TimeoutError):
+                        await pool.release_context(lease)
+                next_lease = await asyncio.wait_for(waiter, 1)
+                self.assertTrue(original_browser.closed)
+                self.assertIsNot(next_lease.browser, original_browser)
+                self.assertNotIn(lease, pool._active_contexts)
+                await pool.release_context(next_lease)
+                self.assertEqual(pool.snapshot()["in_use"], 0)
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+                await pool.shutdown()
+
+        asyncio.run(scenario())
+
     def test_start_prepares_single_browser_and_five_default_contexts(self) -> None:
         async def scenario() -> None:
             fake = FakePlaywright()

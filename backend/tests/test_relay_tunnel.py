@@ -53,6 +53,7 @@ class RelayTunnelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([message["type"] for message in sent], ["data", "close"])
         self.assertEqual(base64.b64decode(str(sent[0]["data"])), b"abc")
+        self.assertEqual(sent[-1]["reason"], "byte_limit")
 
     async def test_pump_reader_to_sender_closes_idle_stream(self) -> None:
         sent: list[dict[str, object]] = []
@@ -62,7 +63,7 @@ class RelayTunnelTests(unittest.IsolatedAsyncioTestCase):
 
         await pump_reader_to_sender("stream-1", SlowReader(), send_json, idle_timeout_seconds=0.01)  # type: ignore[arg-type]
 
-        self.assertEqual(sent, [{"type": "close", "stream_id": "stream-1"}])
+        self.assertEqual(sent, [{"type": "close", "stream_id": "stream-1", "reason": "idle_timeout"}])
 
     async def test_tunnel_stream_caps_cumulative_received_bytes(self) -> None:
         stream = TunnelStream(reader=FakeReader([]), writer=FakeWriter())  # type: ignore[arg-type]

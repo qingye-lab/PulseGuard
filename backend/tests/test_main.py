@@ -1074,6 +1074,65 @@ class RunnerRouteTests(unittest.TestCase):
 
 
 class RunnerHealthPollingTests(unittest.TestCase):
+    def test_failed_background_alert_is_removed_so_a_later_poll_can_retry(self) -> None:
+        async def scenario() -> None:
+            tasks = {}
+            with patch.object(main_module.notifier, "notify_runner_unavailable_if_needed", new=AsyncMock(
+                side_effect=[RuntimeError("delivery failed"), {"status": "sent"}]
+            )) as notify, self.assertLogs(main_module.logger, level="ERROR"):
+                main_module._schedule_runner_unavailable_notification("edge-1", tasks)
+                await asyncio.gather(*tasks.values())
+                self.assertEqual(tasks, {})
+                main_module._schedule_runner_unavailable_notification("edge-1", tasks)
+                await asyncio.gather(*tasks.values())
+                self.assertEqual(tasks, {})
+            self.assertEqual(notify.await_count, 2)
+
+        asyncio.run(scenario())
+
+    def test_slow_offline_alert_does_not_block_polls_and_is_cancelled_on_shutdown(self) -> None:
+        async def scenario() -> None:
+            offline, healthy = self._runner("offline"), self._runner("healthy")
+            notification_started, notification_cancelled = asyncio.Event(), asyncio.Event()
+            second_round = asyncio.Event()
+            healthy_polls = 0
+
+            async def fetch(runner):
+                nonlocal healthy_polls
+                if runner["runner_id"] == "offline":
+                    raise ConnectionError("offline")
+                healthy_polls += 1
+                if healthy_polls >= 3:
+                    second_round.set()
+                return self._health()
+
+            async def notify(*_args):
+                notification_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    notification_cancelled.set()
+
+            with patch.object(main_module.storage, "list_enabled_probe_runners", return_value=[offline, healthy]), patch.object(
+                main_module.storage, "get_settings", return_value={}
+            ), patch.object(main_module.storage, "mark_probe_runner_available"), patch.object(
+                main_module.storage, "mark_probe_runner_unavailable", return_value=offline
+            ), patch.object(main_module, "_fetch_runner_health", side_effect=fetch), patch.object(
+                main_module.notifier, "notify_runner_unavailable_if_needed", side_effect=notify
+            ) as send, patch.object(main_module, "RUNNER_HEALTH_POLL_SECONDS", 0.01):
+                task = asyncio.create_task(main_module._runner_health_poll_loop())
+                try:
+                    await asyncio.wait_for(notification_started.wait(), 1)
+                    await asyncio.wait_for(second_round.wait(), 1)
+                    send.assert_awaited_once()
+                finally:
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                self.assertTrue(notification_cancelled.is_set())
+
+        asyncio.run(scenario())
+
     @staticmethod
     def _runner(runner_id: str) -> dict[str, object]:
         return {"runner_id": runner_id, "role": "child", "address": f"http://{runner_id}:8788"}

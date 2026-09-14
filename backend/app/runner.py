@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import traceback
 import uuid
 from contextlib import asynccontextmanager
@@ -35,6 +36,13 @@ from .script_modules import (
     normalize_module_bundle,
 )
 from .variables import mask_data, mask_text
+from .worker_client import fetch_runner_health
+
+logger = logging.getLogger("uvicorn.error.runner")
+RUNNER_RECOVERY_TIMEOUT_SECONDS = 5
+# Trimmed off the worker's total budget so it expires just before the main
+# node stops waiting on the HTTP call.
+WORKER_TIMEOUT_SAFETY_MARGIN_SECONDS = 5.0
 
 _TASK_DURATION_ATTR = "_pulseguard_task_duration_ms"
 API_SCRIPT_ASSERTIONS_CAPABILITY = "api_script_assertions_v1"
@@ -129,6 +137,7 @@ class CheckRunner:
         self._running_jobs = 0
         self._worker_jobs = 0
         self._jobs: set[asyncio.Task[None]] = set()
+        self._runner_health_checks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
         self._maintenance_active = False
         self._suppress_shutdown_records = False
@@ -157,6 +166,11 @@ class CheckRunner:
                 job.cancel()
             if jobs:
                 await asyncio.gather(*jobs, return_exceptions=True)
+            health_checks = list(self._runner_health_checks.values())
+            for task in health_checks:
+                task.cancel()
+            if health_checks:
+                await asyncio.gather(*health_checks, return_exceptions=True)
             await self.resources.shutdown()
         finally:
             self._suppress_shutdown_records = previous_suppression
@@ -405,10 +419,66 @@ class CheckRunner:
                 return self._deployment_paused_result(check, trigger, run_id=run_id)
             self._worker_jobs += 1
         try:
-            return await self._execute_worker_run(check, trigger, run_id, settings)
+            # Same total-runtime watchdog the local path gets.  Without it a
+            # hung browser launch or a stuck cleanup holds a capacity slot
+            # forever: the main node's HTTP timeout only stops it waiting, it
+            # does not stop the worker executing.
+            return await asyncio.wait_for(
+                self._execute_worker_run(check, trigger, run_id, settings),
+                timeout=self._worker_job_timeout_seconds(check, settings),
+            )
+        except asyncio.TimeoutError:
+            return self._worker_timeout_result(check, trigger, run_id, settings)
         finally:
             async with self._lock:
                 self._worker_jobs -= 1
+
+    def _worker_job_timeout_seconds(self, check: dict[str, Any], settings: dict[str, Any]) -> float:
+        """Total worker budget, trimmed so the worker gives up first.
+
+        The main node waits `_remote_runner_timeout_seconds` on the HTTP call.
+        Expiring marginally earlier means it receives a described timeout
+        instead of a bare connection timeout.
+        """
+        budget = self._job_timeout_seconds(check, settings)
+        return max(0.5, budget - min(WORKER_TIMEOUT_SAFETY_MARGIN_SECONDS, budget * 0.1))
+
+    def _worker_timeout_result(
+        self,
+        check: dict[str, Any],
+        trigger: str,
+        run_id: int,
+        settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        timeout_seconds = self._worker_job_timeout_seconds(check, settings)
+        message = f"执行节点超过单任务总时长限制：{int(timeout_seconds)} 秒，已强制释放执行槽"
+        safe_message = mask_text(message, settings)
+        timestamp = storage.now_iso()
+        return {
+            "id": run_id,
+            "check_id": int(check.get("id") or 0),
+            "check_name": str(check.get("name") or ""),
+            "check_type": str(check.get("type") or ""),
+            "status": "timeout",
+            "started_at": timestamp,
+            "finished_at": timestamp,
+            "duration_ms": int(timeout_seconds * 1000),
+            "error_message": safe_message,
+            "error_stack": None,
+            "logs": safe_message,
+            "screenshot_path": None,
+            "trace_path": None,
+            "response_path": None,
+            "request_snapshot": None,
+            "response_snapshot": None,
+            "trigger": trigger,
+            # A worker that ran out of budget says nothing about the target, so
+            # it must not count toward the target's failure confirmation.
+            "failure_kind": "runner",
+            "affects_health": False,
+            "runner_browser_version": "",
+            "browser_type": str(check.get("_browser_type") or ""),
+        }
 
     async def _execute_worker_run(
         self,
@@ -1509,6 +1579,9 @@ class CheckRunner:
         runner = target.runner
         runner_id = str(runner.get("runner_id") or storage.LOCAL_RUNNER_ID)
         if runner_id != storage.LOCAL_RUNNER_ID:
+            health_check = self._runner_health_checks.get(runner_id)
+            if health_check is not None:
+                await asyncio.shield(health_check)
             latest_runner = storage.get_probe_runner(runner_id)
             if latest_runner:
                 runner = latest_runner
@@ -1614,8 +1687,9 @@ class CheckRunner:
         try:
             result = await self._call_remote_runner(runner, check_payload, trigger, run_id)
         except Exception as exc:
+            logger.warning("worker_request_failed runner_id=%r run_id=%s error_type=%s", runner_id, run_id, type(exc.__cause__ or exc).__name__)
             if not check.get("_library_validation"):
-                storage.mark_probe_runner_unavailable(runner_id)
+                await self._recheck_runner_after_failure(runner)
             unavailable = self._finish_runner_unavailable(run_id, check, trigger, runner, f"执行节点调用失败：{exc}")
             if not check.get("_library_validation"):
                 unavailable = await self._notify_system_result(
@@ -1653,6 +1727,42 @@ class CheckRunner:
         if check.get("_library_validation"):
             storage.update_run_notification(run_id, "not_required", channel=None, error=None, sent_at=None)
         return storage.get_run(run_id) or finished or run
+
+    async def _recheck_runner_after_failure(self, runner: dict[str, Any]) -> None:
+        """Check connectivity once; never replay a possibly executed worker POST."""
+        runner_id = str(runner["runner_id"])
+        task = self._runner_health_checks.get(runner_id)
+        if task is None:
+            task = asyncio.create_task(self._recover_runner_health(runner), name=f"runner-recovery-{runner_id}")
+            self._runner_health_checks[runner_id] = task
+        await asyncio.shield(task)
+
+    async def _recover_runner_health(self, runner: dict[str, Any]) -> None:
+        runner_id = str(runner["runner_id"])
+        try:
+            health = None
+            try:
+                async with asyncio.timeout(RUNNER_RECOVERY_TIMEOUT_SECONDS):
+                    health = await fetch_runner_health(runner)
+            except Exception as exc:
+                logger.warning("worker_health_recheck_failed runner_id=%r error_type=%s", runner_id, type(exc).__name__)
+            if health is not None:
+                # Leave the authoritative state alone: this request never marked
+                # it offline, and another poll/admin action may have changed it.
+                logger.info("worker_health_recheck_ok runner_id=%r", runner_id)
+                return
+            current = storage.get_probe_runner(runner_id)
+            # A failed check of stale configuration must not overwrite a later
+            # health poll, disable, update, rotation or relay transition.
+            if not current or not current.get("enabled"):
+                return
+            if current.get("status") in {"updating", "auth_failed", *storage.RELAY_PRE_ACTIVATION_STATUSES}:
+                return
+            if any(current.get(key) != runner.get(key) for key in ("address", "token_hash", "relay_token_version", "last_disconnect_reason", "updated_at")):
+                return
+            storage.mark_probe_runner_unavailable(runner_id)
+        finally:
+            self._runner_health_checks.pop(runner_id, None)
 
     async def _call_remote_runner(self, runner: dict[str, Any], check: dict[str, Any], trigger: str, run_id: int) -> dict[str, Any]:
         try:
@@ -1802,7 +1912,9 @@ class CheckRunner:
         if status_run.get("affects_health") and status_run.get("failure_kind") != "runner":
             transition = storage.update_check_status(int(check["id"]), status_run)
             transition["trigger"] = trigger
-            await notifier.maybe_notify(check, status_run, transition)
+            # Pass the full node matrix, not just the representative run, so the
+            # alert can say which nodes disagreed.
+            await notifier.maybe_notify(check, status_run, transition, group_runs=runs)
         return status_run
 
     @staticmethod
@@ -1821,10 +1933,9 @@ class CheckRunner:
     async def _notify_runner_unavailable_if_needed(self, runner: dict[str, Any], check: dict[str, Any]) -> None:
         if check.get("_library_validation"):
             return
-        latest = storage.get_probe_runner(str(runner.get("runner_id") or "")) or runner
-        if not storage.should_notify_probe_runner_unavailable(latest):
-            return
-        await notifier.notify_runner_unavailable(latest, [check])
+        # Shared with the background health poll so either discovery path
+        # raises the alert exactly once.
+        await notifier.notify_runner_unavailable_if_needed(runner, [check])
 
     @staticmethod
     def _script_module_references(check: dict[str, Any]) -> set[str]:

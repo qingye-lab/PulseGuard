@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
+import random
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
 import websockets
 
-from .config import RELAY_MAX_BODY_BYTES, RELAY_MAX_FRAME_BYTES, RELAY_STREAM_IDLE_TIMEOUT_SECONDS
+from .config import RELAY_HELLO_TIMEOUT_SECONDS, RELAY_MAX_BODY_BYTES, RELAY_MAX_FRAME_BYTES, RELAY_STREAM_IDLE_TIMEOUT_SECONDS
 from .relay_tunnel import TunnelStream, decode_data_message, insecure_fingerprint_context, json_dumps, json_loads, pump_reader_to_sender
+
+logger = logging.getLogger(__name__)
+WORKER_CONNECT_TIMEOUT_SECONDS = 5
 
 
 def _env(name: str, default: str = "") -> str:
@@ -87,8 +93,8 @@ async def _pump_worker_to_relay(
                 max_bytes=RELAY_MAX_BODY_BYTES,
                 idle_timeout_seconds=RELAY_STREAM_IDLE_TIMEOUT_SECONDS,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("relay_worker_stream_failed stream_id=%r error_type=%s", stream_id, type(exc).__name__)
     finally:
         await _close_stream_best_effort(streams, stream_id)
 
@@ -98,9 +104,10 @@ async def _open_worker_stream(stream_id: str, websocket: Any, send_lock: asyncio
         raise RuntimeError("invalid relay message")
     host, port = _worker_endpoint()
     try:
-        reader, writer = await asyncio.open_connection(host, port)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=WORKER_CONNECT_TIMEOUT_SECONDS)
     except Exception as exc:
-        await _send_json_best_effort(websocket, send_lock, {"type": "error", "stream_id": stream_id, "message": str(exc)[:500]})
+        logger.warning("relay_worker_connect_failed stream_id=%r error_type=%s", stream_id, type(exc).__name__)
+        await _send_json_best_effort(websocket, send_lock, {"type": "error", "stream_id": stream_id, "reason": "worker_connect_failed", "error_type": type(exc).__name__})
         return
     stream = TunnelStream(reader=reader, writer=writer)
     streams[stream_id] = stream
@@ -114,12 +121,14 @@ async def _handle_relay_data_message(stream_id: str, message: dict[str, Any], st
     if not stream:
         return
     if not stream.record_received(len(data), RELAY_MAX_BODY_BYTES):
+        logger.warning("relay_worker_stream_failed stream_id=%r reason=byte_limit", stream_id)
         await _close_stream_best_effort(streams, stream_id)
         return
     try:
         stream.writer.write(data)
         await asyncio.wait_for(stream.writer.drain(), timeout=RELAY_STREAM_IDLE_TIMEOUT_SECONDS)
-    except Exception:
+    except Exception as exc:
+        logger.warning("relay_worker_stream_failed stream_id=%r error_type=%s", stream_id, type(exc).__name__)
         await _close_stream_best_effort(streams, stream_id)
 
 
@@ -182,9 +191,10 @@ async def run_once() -> None:
             send_lock,
             {"type": "hello", "runner_id": runner_id, "relay_token": relay_token, "relay_token_version": token_version},
         )
-        ready = json_loads(await websocket.recv())
+        ready = json_loads(await asyncio.wait_for(websocket.recv(), timeout=RELAY_HELLO_TIMEOUT_SECONDS))
         if ready.get("type") != "ready":
             raise RuntimeError("relay server did not accept the connection")
+        logger.info("relay_connected runner_id=%r", runner_id)
         heartbeat = asyncio.create_task(_heartbeat(websocket, send_lock))
         try:
             async for raw in websocket:
@@ -197,15 +207,24 @@ async def run_once() -> None:
 
 
 async def main_loop() -> None:
+    delay = 1.0
     while True:
+        started = time.monotonic()
         try:
             await run_once()
         except Exception as exc:
-            print(f"relay client disconnected: {exc}", flush=True)
-            await asyncio.sleep(5)
+            logger.warning("relay_disconnected runner_id=%r error_type=%s", _env("PULSEGUARD_RUNNER_ID"), type(exc).__name__)
+        else:
+            logger.info("relay_disconnected runner_id=%r reason=connection_closed", _env("PULSEGUARD_RUNNER_ID"))
+        if time.monotonic() - started >= 60:
+            delay = 1.0
+        # Also back off on a clean close; otherwise rejected/closed sessions can spin.
+        await asyncio.sleep(random.uniform(delay * 0.8, delay))
+        delay = min(delay * 2, 30.0)
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     asyncio.run(main_loop())
 
 

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from backend.app.context import RunContext, RunFailure
+from backend.app.resource_pool import ProbeResourcePool
 from backend.app.runner import CheckRunner
 
 
@@ -378,6 +379,71 @@ class RunContextProbeHelperTests(unittest.TestCase):
 
 
 class RunContextPoolTests(unittest.TestCase):
+    def test_repeated_cancellation_waits_for_context_release(self) -> None:
+        async def scenario() -> None:
+            resources = FakeResourcePool()
+            ctx = RunContext({"type": "ui", "entry_url": "https://example.com"}, 1, {}, None, resources=resources)
+            await ctx.new_page()
+            started, release = asyncio.Event(), asyncio.Event()
+            original_close = resources.browser.contexts[0].close
+
+            async def slow_close():
+                started.set()
+                await release.wait()
+                await original_close()
+
+            resources.browser.contexts[0].close = slow_close
+            task = asyncio.create_task(ctx.close(False))
+            try:
+                await asyncio.wait_for(started.wait(), 1)
+                for _ in range(2):
+                    task.cancel()
+                    await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 1)
+                self.assertEqual(resources.released_context, resources.context_lease)
+                self.assertTrue(resources.browser.contexts[0].closed)
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(scenario())
+
+    def test_hanging_context_close_still_releases_lease_and_http_client(self) -> None:
+        async def scenario() -> None:
+            from backend.tests.test_resource_pool import FakePlaywright, browser_pool, settings
+
+            runner_settings = settings()
+            resources = ProbeResourcePool(api_pool_size=1, browser_pool_sizes_value={"chromium": 1})
+            pool = browser_pool(FakePlaywright(), size=1)
+            resources.browsers["chromium"] = pool
+            await pool.start(runner_settings)
+            lease = await pool.acquire_context(runner_settings, {})
+            ctx = RunContext({"type": "ui"}, 1, runner_settings, None, resources=resources)
+            ctx._browser_context = lease.context
+            ctx._browser_context_lease = lease
+
+            async def hanging_close():
+                await asyncio.Event().wait()
+
+            lease.context.close = hanging_close
+            try:
+                with patch("backend.app.context.RESOURCE_CLEANUP_TIMEOUT_SECONDS", 0.02), patch(
+                    "backend.app.resource_pool.RESOURCE_CLEANUP_TIMEOUT_SECONDS", 0.02
+                ), patch.object(ctx.http, "close", new=AsyncMock()) as close_http:
+                    with self.assertRaises(TimeoutError):
+                        await asyncio.wait_for(ctx.close(False), 1)
+                    close_http.assert_awaited_once()
+                self.assertEqual(pool.snapshot()["in_use"], 0)
+                self.assertIsNone(ctx._browser_context_lease)
+                self.assertTrue(ctx._close_task.done())
+            finally:
+                await resources.shutdown()
+
+        asyncio.run(scenario())
+
     def test_pooled_browser_keeps_browser_and_closes_isolated_context(self) -> None:
         resources = FakeResourcePool()
         ctx = RunContext(

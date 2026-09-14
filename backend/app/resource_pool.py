@@ -11,6 +11,8 @@ from .browser_types import browser_pool_size_for, prewarmed_browser_types, setti
 from .variables import resolve_text
 from .viewport import browser_context_options, browser_viewport
 
+RESOURCE_CLEANUP_TIMEOUT_SECONDS = 5.0
+
 
 class ResourcePoolError(Exception):
     """Expected failure while preparing shared runner resources."""
@@ -205,30 +207,41 @@ class BrowserPool:
             if lease is self._browser_lease and (not healthy or not self._browser_connected(lease.browser)):
                 self._retire_browser_when_idle = True
             try:
-                await self._reconcile_locked()
+                async with asyncio.timeout(RESOURCE_CLEANUP_TIMEOUT_SECONDS):
+                    await self._reconcile_locked()
             except ResourcePoolError:
                 pass
-            self._condition.notify_all()
+            except (TimeoutError, asyncio.CancelledError):
+                self._retire_browser_when_idle = True
+                raise
+            finally:
+                self._condition.notify_all()
         await self._stop_playwright_if_idle()
 
     async def release_context(self, lease: BrowserContextLease, *, healthy: bool = True) -> None:
         async with self._condition:
             self._active_contexts.discard(lease)
             released_current_browser = self._browser_lease is not None and lease.browser is self._browser_lease.browser
-            await self._close_context(lease)
             if not healthy:
                 self._retire_browser_when_idle = True
-            elif released_current_browser:
-                self._completed_contexts_since_launch += 1
-                if self._completed_contexts_since_launch >= self._recycle_after_runs:
-                    self._retire_browser_when_idle = True
             try:
-                if healthy and not self._closing and not self._retire_browser_when_idle and self._browser_lease is not None:
-                    await self._fill_contexts_locked(lease.context_options)
-                await self._reconcile_locked()
+                async with asyncio.timeout(RESOURCE_CLEANUP_TIMEOUT_SECONDS):
+                    await self._close_context(lease)
+                    if healthy and released_current_browser:
+                        self._completed_contexts_since_launch += 1
+                        if self._completed_contexts_since_launch >= self._recycle_after_runs:
+                            self._retire_browser_when_idle = True
+                    if healthy and not self._closing and not self._retire_browser_when_idle and self._browser_lease is not None:
+                        await self._fill_contexts_locked(lease.context_options)
+                    await self._reconcile_locked()
             except ResourcePoolError:
                 pass
-            self._condition.notify_all()
+            except (TimeoutError, asyncio.CancelledError):
+                self._retire_browser_when_idle = True
+                raise
+            finally:
+                # A failed close or refill must still wake capacity waiters.
+                self._condition.notify_all()
         await self._stop_playwright_if_idle()
 
     async def shutdown(self) -> None:
@@ -355,7 +368,7 @@ class BrowserPool:
         await self._close_ready_contexts_locked()
         if self._browser_lease is not None:
             try:
-                await self._browser_lease.browser.close()
+                await asyncio.wait_for(self._browser_lease.browser.close(), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
             except Exception:
                 pass
             finally:
@@ -364,7 +377,7 @@ class BrowserPool:
 
     async def _close_context(self, lease: BrowserContextLease) -> None:
         try:
-            await lease.context.close()
+            await asyncio.wait_for(lease.context.close(), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
         except Exception:
             pass
 
@@ -377,7 +390,7 @@ class BrowserPool:
                 self._config = None
         if playwright is not None:
             try:
-                await playwright.stop()
+                await asyncio.wait_for(playwright.stop(), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
             except Exception:
                 pass
 

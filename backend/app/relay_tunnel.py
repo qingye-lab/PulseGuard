@@ -46,6 +46,7 @@ async def pump_reader_to_sender(
     idle_timeout_seconds: float | None = None,
 ) -> None:
     sent_bytes = 0
+    close_reason = "eof"
     try:
         while True:
             if idle_timeout_seconds is None:
@@ -54,15 +55,25 @@ async def pump_reader_to_sender(
                 try:
                     chunk = await asyncio.wait_for(reader.read(65536), timeout=idle_timeout_seconds)
                 except TimeoutError:
+                    close_reason = "idle_timeout"
                     break
             if not chunk:
+                if sent_bytes == 0:
+                    close_reason = "eof_before_data"
                 break
             sent_bytes += len(chunk)
             if max_bytes is not None and sent_bytes > max_bytes:
+                close_reason = "byte_limit"
                 break
             await send_json({"type": "data", "stream_id": stream_id, "data": base64.b64encode(chunk).decode("ascii")})
+    except asyncio.CancelledError:
+        close_reason = "cancelled"
+        raise
+    except Exception:
+        close_reason = "io_error"
+        raise
     finally:
-        await send_json({"type": "close", "stream_id": stream_id})
+        await send_json({"type": "close", "stream_id": stream_id, "reason": close_reason})
 
 
 def decode_data_message(message: dict[str, Any]) -> bytes:

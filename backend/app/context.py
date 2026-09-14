@@ -11,7 +11,7 @@ from jsonschema import ValidationError, validate
 
 from . import network_checks
 from .artifacts import ArtifactStore
-from .resource_pool import ProbeResourcePool, ResourcePoolError
+from .resource_pool import RESOURCE_CLEANUP_TIMEOUT_SECONDS, ProbeResourcePool, ResourcePoolError
 from .script_modules import ModuleBundleError, ModuleRuntime, ScriptStaticError, compile_script_entry, normalize_module_bundle
 from .variables import RuntimeVariables, mask_data, mask_text, resolve_data, resolve_text, resolve_url
 from .viewport import browser_context_options, normalize_viewport_mode, viewport_for_mode
@@ -256,6 +256,7 @@ class RunContext:
         self._browser_context: Any = None
         self._trace_started = False
         self._pages: list[Any] = []
+        self._close_task: asyncio.Task[None] | None = None
 
     @property
     def entry_url(self) -> str:
@@ -482,9 +483,27 @@ class RunContext:
         self.response_snapshot["timings"] = timings
 
     async def close(self, failed: bool) -> None:
+        # A watchdog may cancel its caller while artifacts or browser cleanup
+        # are in progress. Finish the owned cleanup before releasing admission
+        # capacity, including when shutdown cancels the caller again.
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close(failed), name=f"pulseguard-run-cleanup-{self.run_id}")
+        cancelled = False
+        try:
+            while not self._close_task.done():
+                try:
+                    await asyncio.shield(self._close_task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            self._close_task.result()
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
+
+    async def _close(self, failed: bool) -> None:
         if failed and self.check.get("type") == "ui" and self._pages and not self.screenshot_path:
             try:
-                await self.screenshot(self._pages[-1], "failure")
+                await asyncio.wait_for(self.screenshot(self._pages[-1], "failure"), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
             except Exception as exc:
                 self.log(f"截图保存失败：{exc}")
 
@@ -492,10 +511,10 @@ class RunContext:
             try:
                 if failed:
                     trace_file, relative = self.artifacts.trace_target(self.run_id)
-                    await self._browser_context.tracing.stop(path=str(trace_file))
+                    await asyncio.wait_for(self._browser_context.tracing.stop(path=str(trace_file)), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
                     self.trace_path = relative
                 else:
-                    await self._browser_context.tracing.stop()
+                    await asyncio.wait_for(self._browser_context.tracing.stop(), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
             except Exception as exc:
                 self.log(f"Trace 保存失败：{exc}")
             finally:
@@ -510,26 +529,38 @@ class RunContext:
         browser_context_error: Exception | None = None
         if self._browser_context:
             try:
-                await self._browser_context.close()
+                await asyncio.wait_for(self._browser_context.close(), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
             except Exception as exc:
                 browser_context_error = exc
             finally:
                 self._browser_context = None
-        if self._browser_context_lease is not None and self.resources is not None:
-            await self.resources.release_browser_context(self._browser_context_lease, healthy=browser_context_error is None)
-            self._browser_context_lease = None
-            self._browser = None
-        if self._browser_lease is not None and self.resources is not None:
-            await self.resources.release_browser(self._browser_lease, healthy=browser_context_error is None)
-            self._browser_lease = None
-            self._browser = None
-        elif self._browser:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
-        await self.http.close()
+        try:
+            if self._browser_context_lease is not None and self.resources is not None:
+                try:
+                    await self.resources.release_browser_context(self._browser_context_lease, healthy=browser_context_error is None)
+                finally:
+                    self._browser_context_lease = None
+                    self._browser = None
+            if self._browser_lease is not None and self.resources is not None:
+                try:
+                    await self.resources.release_browser(self._browser_lease, healthy=browser_context_error is None)
+                finally:
+                    self._browser_lease = None
+                    self._browser = None
+            elif self._browser:
+                try:
+                    await asyncio.wait_for(self._browser.close(), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
+                finally:
+                    self._browser = None
+        finally:
+            try:
+                if self._playwright:
+                    try:
+                        await asyncio.wait_for(self._playwright.stop(), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
+                    finally:
+                        self._playwright = None
+            finally:
+                await asyncio.wait_for(self.http.close(), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
         if browser_context_error is not None:
             raise browser_context_error
 

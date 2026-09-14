@@ -13,6 +13,28 @@ HEALTH_STATES = {
     "disabled",
 }
 
+# `stale` answers "is the observation fresh?", not "is the target healthy?".
+# It is a display status only: it must never be fed back into the failure or
+# recovery confirmation machinery, or an expired observation would silently
+# discard an open incident and let the next single success look like a full
+# recovery.
+OBSERVATION_ONLY_STATES = {"stale"}
+
+
+def effective_health_status(previous: dict[str, Any] | None) -> str:
+    """Return the last health verdict, ignoring observation-freshness markers.
+
+    `health_status` is the authoritative column.  Rows written before that
+    column existed only carry `monitor_status`, so fall back to it and degrade
+    a legacy `stale` row to `unknown` rather than inventing a verdict.
+    """
+    previous = previous or {}
+    health = str(previous.get("health_status") or "").strip()
+    if health in HEALTH_STATES and health not in OBSERVATION_ONLY_STATES:
+        return health
+    monitor = str(previous.get("monitor_status") or "unknown").strip() or "unknown"
+    return "unknown" if monitor in OBSERVATION_ONLY_STATES else monitor
+
 
 def run_metadata(trigger: str) -> dict[str, Any]:
     normalized = str(trigger or "manual").strip() or "manual"
@@ -33,7 +55,7 @@ def next_health_state(
     settings: dict[str, Any],
 ) -> dict[str, Any]:
     previous = previous or {}
-    previous_state = str(previous.get("monitor_status") or "unknown")
+    previous_state = effective_health_status(previous)
     previous_failures = int(previous.get("consecutive_failures") or 0)
     previous_successes = int(previous.get("consecutive_successes") or 0)
     status = str(run.get("status") or "")

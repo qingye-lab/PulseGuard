@@ -154,6 +154,10 @@ _RUN_CLEANUP_BATCH_SQL = """SELECT id FROM runs
 _TAG_SPLIT_PATTERN = re.compile(r"[,\s]+")
 LOCAL_RUNNER_ID = "local"
 RUNNER_HEARTBEAT_TIMEOUT_SECONDS = 120
+# How long to wait before retrying an offline-node alert whose delivery failed.
+# Long enough that a flapping webhook cannot be retried on every health poll,
+# short enough that a genuine outage is still reported promptly.
+RUNNER_UNAVAILABLE_NOTIFY_RETRY_SECONDS = 300
 RUNNER_ROLES = {"local", "child"}
 RUNNER_SELECTION_MODES = {"selected_parallel", "round_robin_all"}
 DEPLOYMENT_STATE_KEY = "deployment_window"
@@ -783,6 +787,7 @@ def _init_db() -> None:
                 last_error TEXT,
                 last_notified_at TEXT,
                 monitor_status TEXT NOT NULL DEFAULT 'unknown',
+                health_status TEXT,
                 consecutive_successes INTEGER NOT NULL DEFAULT 0,
                 last_scheduled_at TEXT,
                 last_scheduled_run_id INTEGER,
@@ -897,6 +902,7 @@ def _init_db() -> None:
                 was_available INTEGER NOT NULL DEFAULT 0,
                 unavailable_since TEXT,
                 unavailable_notified_at TEXT,
+                unavailable_notify_failed_at TEXT,
                 created_at TEXT NOT NULL DEFAULT '',
                 last_seen_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -3160,7 +3166,8 @@ def upsert_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
                 """
                 UPDATE probe_runners
                 SET unavailable_since = NULL,
-                    unavailable_notified_at = NULL
+                    unavailable_notified_at = NULL,
+                    unavailable_notify_failed_at = NULL
                 WHERE runner_id = ?
                 """,
                 (runner_id,),
@@ -3427,6 +3434,7 @@ def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = 
                 deploy_command_expires_at = CASE WHEN ? = 'relay' THEN NULL ELSE deploy_command_expires_at END,
                 unavailable_since = NULL,
                 unavailable_notified_at = NULL,
+                unavailable_notify_failed_at = NULL,
                 worker_health_last_success_at = ?,
                 was_available = 1,
                 last_seen_at = ?,
@@ -3950,7 +3958,7 @@ def mark_probe_runner_unavailable_notified(runner_id: str) -> dict[str, Any] | N
         cursor = conn.execute(
             """
             UPDATE probe_runners
-            SET unavailable_notified_at = ?, updated_at = ?
+            SET unavailable_notified_at = ?, unavailable_notify_failed_at = NULL, updated_at = ?
             WHERE runner_id = ?
             """,
             (timestamp, timestamp, runner_id),
@@ -3963,9 +3971,37 @@ def mark_probe_runner_unavailable_notified(runner_id: str) -> dict[str, Any] | N
 def should_notify_probe_runner_unavailable(runner: dict[str, Any]) -> bool:
     if not bool(runner.get("enabled")) or str(runner.get("role") or "") == "local" or runner.get("available") or runner.get("unavailable_notified_at"):
         return False
+    # A delivery that failed outright leaves the node unreported, so it stays
+    # eligible.  Rate-limit the retry so an unreachable webhook cannot turn the
+    # health poll into a send loop.
+    if _timestamp_is_fresh(runner.get("unavailable_notify_failed_at"), RUNNER_UNAVAILABLE_NOTIFY_RETRY_SECONDS):
+        return False
     if str(runner.get("connection_mode") or "manual") == "relay":
         return bool(runner.get("was_available")) and str(runner.get("status") or "") in {"unavailable", "unhealthy", "auth_failed"}
     return True
+
+
+def mark_probe_runner_unavailable_notify_failed(runner_id: str) -> dict[str, Any] | None:
+    """Record that an offline alert could not be delivered.
+
+    Deliberately distinct from `mark_probe_runner_unavailable_notified`: the
+    operator was never told, so the node must remain eligible for a later
+    attempt instead of being treated as reported.
+    """
+    runner_id = _normalize_runner_id(runner_id)
+    timestamp = now_iso()
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET unavailable_notify_failed_at = ?, updated_at = ?
+            WHERE runner_id = ?
+            """,
+            (timestamp, timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
 
 
 def next_runner_cursor(scope: str, count: int) -> int:
@@ -4035,9 +4071,9 @@ def update_check_status(check_id: int, run: dict[str, Any]) -> dict[str, Any]:
             INSERT INTO check_status (
                 check_id, current_status, consecutive_failures, last_success_at,
                 last_failed_at, last_run_at, last_run_id, last_error, last_notified_at,
-                monitor_status, consecutive_successes, last_scheduled_at,
+                monitor_status, health_status, consecutive_successes, last_scheduled_at,
                 last_scheduled_run_id, last_state_changed_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(check_id) DO UPDATE SET
                 current_status = excluded.current_status,
                 consecutive_failures = excluded.consecutive_failures,
@@ -4047,6 +4083,7 @@ def update_check_status(check_id: int, run: dict[str, Any]) -> dict[str, Any]:
                 last_run_id = excluded.last_run_id,
                 last_error = excluded.last_error,
                 monitor_status = excluded.monitor_status,
+                health_status = excluded.health_status,
                 consecutive_successes = excluded.consecutive_successes,
                 last_scheduled_at = excluded.last_scheduled_at,
                 last_scheduled_run_id = excluded.last_scheduled_run_id,
@@ -4063,6 +4100,7 @@ def update_check_status(check_id: int, run: dict[str, Any]) -> dict[str, Any]:
                 run["id"],
                 run.get("error_message"),
                 (previous_dict or {}).get("last_notified_at"),
+                current_status,
                 current_status,
                 transition["consecutive_successes"],
                 timestamp,
@@ -4103,6 +4141,10 @@ def refresh_stale_statuses(check_id: int | None = None, project_id: int | None =
             return 0
     with _connect() as conn:
         timestamp = now_iso()
+        # health_status is deliberately left untouched: expiry says the
+        # observation is old, not that the target recovered.  Overwriting it
+        # here would drop an open incident and let the next single success skip
+        # recovery confirmation entirely.
         cursor = conn.execute(
             f"""
             UPDATE check_status
@@ -5717,6 +5759,7 @@ def _ensure_check_status_columns(conn: sqlite3.Connection) -> None:
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(check_status)").fetchall()}
     columns = {
         "monitor_status": "TEXT NOT NULL DEFAULT 'unknown'",
+        "health_status": "TEXT",
         "consecutive_successes": "INTEGER NOT NULL DEFAULT 0",
         "last_scheduled_at": "TEXT",
         "last_scheduled_run_id": "INTEGER",
@@ -5744,6 +5787,15 @@ def _ensure_check_status_columns(conn: sqlite3.Connection) -> None:
             consecutive_failures = 0,
             consecutive_successes = 0
         WHERE current_status = 'suspected' OR monitor_status = 'suspected'
+        """
+    )
+    # Normalize legacy verdicts before seeding the authoritative health column.
+    # Expired observations have no recoverable verdict in this column alone.
+    conn.execute(
+        """
+        UPDATE check_status
+        SET health_status = monitor_status
+        WHERE COALESCE(health_status, '') = '' AND monitor_status NOT IN ('stale', '')
         """
     )
 
@@ -5776,6 +5828,7 @@ def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
         "was_available": "INTEGER NOT NULL DEFAULT 0",
         "unavailable_since": "TEXT",
         "unavailable_notified_at": "TEXT",
+        "unavailable_notify_failed_at": "TEXT",
         "created_at": "TEXT NOT NULL DEFAULT ''",
     }
     for name, column_type in columns.items():

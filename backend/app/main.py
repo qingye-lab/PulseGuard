@@ -33,6 +33,7 @@ from .browser_types import enabled_browser_types, normalize_browser_types
 from .schemas import ApiInspectRequest, BrowserInstallRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ProjectAlertSettingsUpdate, ProjectCreate, ProjectUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, RunnerProvisionRequest, ScriptLibraryDraftUpdate, ScriptLibraryPublishRequest, ScriptLibraryRollbackRequest, ScriptLibrarySaveRequest, ScriptLibraryValidationCreate, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
 from . import script_library_service
 from .variables import mask_data, mask_text
+from .worker_client import fetch_runner_health as _fetch_runner_health, http_response_detail as _http_response_detail, worker_request as _worker_request
 
 
 HEARTBEAT_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$")
@@ -1972,13 +1973,6 @@ def _runner_deploy_command(runner: dict[str, Any], relay_status: dict[str, Any],
     return "\n".join(lines)
 
 
-async def _fetch_runner_health(runner: dict[str, Any]) -> dict[str, Any]:
-    payload = await _worker_request(runner, "GET", "/api/worker/health", timeout=5)
-    if not isinstance(payload, dict) or not payload.get("ok"):
-        raise RuntimeError("Runner health response is invalid")
-    return payload
-
-
 async def _sync_enabled_browser_type_installation(settings: dict[str, Any]) -> None:
     browser_types = enabled_browser_types(settings)
     try:
@@ -2008,43 +2002,6 @@ async def _install_missing_enabled_browser_types_on_runner(runner: dict[str, Any
     if not missing:
         return
     await _worker_request(runner, "POST", "/api/worker/browser-types/install", {"browser_types": missing}, timeout=10)
-
-
-async def _worker_request(
-    runner: dict[str, Any],
-    method: str,
-    path: str,
-    payload: dict[str, Any] | None = None,
-    timeout: float = 10,
-) -> dict[str, Any]:
-    runner_id = str(runner.get("runner_id") or "")
-    try:
-        storage.ensure_probe_runner_transport_allowed(runner)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    token = storage.get_probe_runner_token(runner_id)
-    address = str(runner.get("address") or "").strip().rstrip("/")
-    if not address or not token:
-        raise RuntimeError("Runner address or token is not configured")
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.request(
-                method,
-                f"{address}{path}",
-                json=payload if method.upper() != "GET" else None,
-                headers={"Authorization": f"Bearer {token}"},
-            )
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=400, detail=f"Runner 请求超时：{int(timeout)} 秒内未返回") from exc
-    except httpx.RequestError as exc:
-        detail = str(exc).strip() or exc.__class__.__name__
-        raise HTTPException(status_code=400, detail=f"Runner 请求失败：{detail}") from exc
-    if response.status_code >= 400:
-        raise HTTPException(status_code=400, detail=f"Runner 请求失败：HTTP {response.status_code}: {_http_response_detail(response)}")
-    data = response.json()
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="Runner 响应格式无效")
-    return data
 
 
 def _worker_update_status_for_health() -> dict[str, Any]:
@@ -2089,24 +2046,12 @@ async def _worker_updater_request(method: str, path: str, payload: dict[str, Any
     return data
 
 
-def _http_response_detail(response: httpx.Response) -> str:
-    try:
-        data = response.json()
-    except ValueError:
-        text = response.text.strip()
-    else:
-        if isinstance(data, dict):
-            text = str(data.get("detail") or data.get("message") or "").strip()
-        else:
-            text = str(data).strip()
-    return text[:500] if text else "远程服务返回错误"
-
-
 async def _poll_runner_health(
     runner: dict[str, Any],
     health_semaphore: asyncio.Semaphore,
     install_semaphore: asyncio.Semaphore,
     install_tasks: dict[str, asyncio.Task[Any]],
+    notification_tasks: dict[str, asyncio.Task[Any]],
 ) -> None:
     runner_id = str(runner.get("runner_id") or "")
     if not runner_id:
@@ -2118,7 +2063,11 @@ async def _poll_runner_health(
     except asyncio.CancelledError:
         raise
     except Exception:
-        storage.mark_probe_runner_unavailable(runner_id)
+        latest = storage.mark_probe_runner_unavailable(runner_id)
+        # The poll is often the first thing to notice a node is gone.  Dispatch
+        # will now skip that node entirely, so if the alert is not raised here
+        # it is never raised at all.
+        _schedule_runner_unavailable_notification(latest or runner_id, notification_tasks)
         return
 
     try:
@@ -2134,10 +2083,11 @@ async def _poll_runner_health_round(
     health_semaphore: asyncio.Semaphore,
     install_semaphore: asyncio.Semaphore,
     install_tasks: dict[str, asyncio.Task[Any]],
+    notification_tasks: dict[str, asyncio.Task[Any]],
 ) -> None:
     tasks = {
         asyncio.create_task(
-            _poll_runner_health(runner, health_semaphore, install_semaphore, install_tasks),
+            _poll_runner_health(runner, health_semaphore, install_semaphore, install_tasks, notification_tasks),
             name=f"pulseguard-runner-health-{runner.get('runner_id') or 'unknown'}",
         )
         for runner in runners
@@ -2148,6 +2098,27 @@ async def _poll_runner_health_round(
             await asyncio.gather(*tasks)
     finally:
         await _cancel_background_tasks(tasks)
+
+
+def _schedule_runner_unavailable_notification(
+    runner: dict[str, Any] | str,
+    tasks: dict[str, asyncio.Task[Any]],
+) -> None:
+    runner_id = str(runner if isinstance(runner, str) else runner.get("runner_id") or "")
+    if not runner_id or runner_id in tasks:
+        return
+
+    async def deliver() -> None:
+        try:
+            await notifier.notify_runner_unavailable_if_needed(runner_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Unable to send offline alert for runner %s", runner_id)
+        finally:
+            tasks.pop(runner_id, None)
+
+    tasks[runner_id] = asyncio.create_task(deliver(), name=f"pulseguard-runner-offline-alert-{runner_id}")
 
 
 def _schedule_runner_browser_install(
@@ -2209,6 +2180,7 @@ async def _runner_health_poll_loop() -> None:
     health_semaphore = asyncio.Semaphore(RUNNER_HEALTH_MAX_CONCURRENCY)
     install_semaphore = asyncio.Semaphore(RUNNER_BROWSER_INSTALL_MAX_CONCURRENCY)
     install_tasks: dict[str, asyncio.Task[Any]] = {}
+    notification_tasks: dict[str, asyncio.Task[Any]] = {}
     try:
         while True:
             try:
@@ -2217,15 +2189,16 @@ async def _runner_health_poll_loop() -> None:
                     for runner in storage.list_enabled_probe_runners()
                     if str(runner.get("role") or "") == "child"
                 ]
-                await _poll_runner_health_round(runners, health_semaphore, install_semaphore, install_tasks)
+                await _poll_runner_health_round(runners, health_semaphore, install_semaphore, install_tasks, notification_tasks)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Runner health poll failed")
             await asyncio.sleep(RUNNER_HEALTH_POLL_SECONDS)
     finally:
-        await _cancel_background_tasks(set(install_tasks.values()))
+        await _cancel_background_tasks(set(install_tasks.values()) | set(notification_tasks.values()))
         install_tasks.clear()
+        notification_tasks.clear()
 
 
 def _log_worker_startup_info() -> None:

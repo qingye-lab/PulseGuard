@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+import zlib
+from datetime import datetime, timedelta
 from typing import Any
 
 from apscheduler.schedulers.base import STATE_PAUSED
@@ -68,10 +69,19 @@ class PulseScheduler:
         if not check or not check.get("enabled") or not project or project.get("status") != "active":
             return
 
+        interval_seconds = max(5, int(check.get("interval_seconds") or 300))
+        offset = self._stagger_offset_seconds(check_id, interval_seconds)
         self.scheduler.add_job(
             self._run_scheduled,
             "interval",
-            seconds=max(5, int(check.get("interval_seconds") or 300)),
+            seconds=interval_seconds,
+            # Without a per-check offset every check sharing an interval is
+            # registered at the same instant and fires as one burst, so a burst
+            # larger than the queue turns real observations into skips.  The
+            # offset is derived from the check id so restarts keep the same
+            # slot instead of reshuffling the whole fleet.
+            start_date=datetime.now().astimezone() + timedelta(seconds=offset),
+            jitter=self._stagger_jitter_seconds(interval_seconds),
             id=job_id,
             args=[check_id],
             max_instances=1,
@@ -79,6 +89,18 @@ class PulseScheduler:
             misfire_grace_time=30,
             replace_existing=True,
         )
+
+    @staticmethod
+    def _stagger_offset_seconds(check_id: int, interval_seconds: int) -> int:
+        """Spread a check's first fire deterministically across its own period."""
+        interval_seconds = max(1, int(interval_seconds))
+        digest = zlib.crc32(f"pulseguard-check-{int(check_id)}".encode("utf-8"))
+        return digest % interval_seconds
+
+    @staticmethod
+    def _stagger_jitter_seconds(interval_seconds: int) -> int:
+        """Small per-fire dispersion so drift cannot re-converge the fleet."""
+        return max(1, min(30, int(max(1, int(interval_seconds)) * 0.1)))
 
     async def _run_scheduled(self, check_id: int) -> None:
         await self.runner.run_check(check_id, trigger="scheduled")
@@ -94,6 +116,28 @@ class PulseScheduler:
             "scheduled_checks": len(jobs),
             "next_due_at": min(next_times).isoformat(timespec="seconds") if next_times else None,
             "overdue_jobs": overdue,
+            "capacity": self._capacity_status(jobs),
+        }
+
+    @staticmethod
+    def _capacity_status(jobs: list[Any]) -> dict[str, Any]:
+        """Report scheduled demand so queue skips can be attributed, not guessed.
+
+        Staggering spreads a burst but does not create throughput.  Surfacing
+        the required run rate lets an operator see whether skipped runs mean a
+        burst collision or genuinely insufficient capacity.
+        """
+        intervals: list[int] = []
+        for job in jobs:
+            interval = getattr(getattr(job, "trigger", None), "interval", None)
+            seconds = getattr(interval, "total_seconds", None)
+            if callable(seconds):
+                intervals.append(max(1, int(seconds())))
+        required_per_minute = sum(60.0 / interval for interval in intervals)
+        return {
+            "required_runs_per_minute": round(required_per_minute, 2),
+            "shortest_interval_seconds": min(intervals) if intervals else None,
+            "measured_checks": len(intervals),
         }
 
     @staticmethod

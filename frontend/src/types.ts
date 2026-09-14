@@ -804,6 +804,11 @@ export interface RuntimeStatus {
     scheduled_checks: number;
     next_due_at?: string | null;
     overdue_jobs: number;
+    capacity?: {
+      required_runs_per_minute: number;
+      shortest_interval_seconds: number | null;
+      measured_checks: number;
+    } | null;
   };
   node_role?: "main" | "worker" | string;
 }

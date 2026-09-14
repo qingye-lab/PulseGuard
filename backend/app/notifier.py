@@ -24,9 +24,15 @@ class AlertDeliveryError(RuntimeError):
 
 ALERTABLE_RUN_STATUSES = {"ok", "failed", "timeout"}
 WEBHOOK_TYPES = {"feishu", "wecom", "dingtalk"}
+_RUNNER_UNAVAILABLE_IN_FLIGHT: set[str] = set()
 
 
-async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: dict[str, Any]) -> None:
+async def maybe_notify(
+    check: dict[str, Any],
+    run: dict[str, Any],
+    transition: dict[str, Any],
+    group_runs: list[dict[str, Any]] | None = None,
+) -> None:
     global_settings = storage.get_settings()
     project_id = int(check.get("project_id") or run.get("project_id") or 0)
     if project_id <= 0:
@@ -76,7 +82,7 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
         _record_notification(run, "suppressed", channel=channel_summary, error=_suppression_reason(transition, alert_settings))
         return
 
-    title, text = _format_message(check, run, transition, is_recovery, alert_settings)
+    title, text = _format_message(check, run, transition, is_recovery, alert_settings, group_runs=group_runs)
     failures: list[tuple[str, Exception]] = []
     sent_channels: list[dict[str, Any]] = []
 
@@ -105,15 +111,52 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
     storage.update_last_notified(int(check["id"]), sent_at)
 
 
-async def notify_runner_unavailable(runner: dict[str, Any], checks: list[dict[str, Any]]) -> None:
+async def notify_runner_unavailable_if_needed(
+    runner: dict[str, Any] | str,
+    checks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Single entry point for "this node just became unreachable".
+
+    Both the background health poll and the dispatch path funnel through here,
+    so a node discovered offline by either one produces exactly one alert.
+    Manual deactivation and already-reported nodes are filtered by
+    `should_notify_probe_runner_unavailable`, which also rate-limits retries
+    after a failed delivery.
+    """
+    runner_id = str(runner if isinstance(runner, str) else runner.get("runner_id") or "")
+    if not runner_id:
+        return {"status": "skipped", "reason": "unknown_runner"}
+    # Polling and dispatch share one event loop. Claim before any await so an
+    # in-flight delivery cannot be duplicated by the other discovery path.
+    if runner_id in _RUNNER_UNAVAILABLE_IN_FLIGHT:
+        return {"status": "skipped", "reason": "in_progress"}
+    _RUNNER_UNAVAILABLE_IN_FLIGHT.add(runner_id)
+    try:
+        try:
+            latest = storage.get_probe_runner(runner_id)
+        except Exception:
+            latest = None
+        if latest is None:
+            latest = runner if isinstance(runner, dict) else None
+        if not isinstance(latest, dict):
+            return {"status": "skipped", "reason": "unknown_runner"}
+        if not storage.should_notify_probe_runner_unavailable(latest):
+            return {"status": "skipped", "reason": "not_required"}
+        return await notify_runner_unavailable(latest, checks or [])
+    finally:
+        _RUNNER_UNAVAILABLE_IN_FLIGHT.discard(runner_id)
+
+
+async def notify_runner_unavailable(runner: dict[str, Any], checks: list[dict[str, Any]]) -> dict[str, Any]:
+    runner_id = str(runner.get("runner_id") or "")
     settings = storage.get_settings()
     if not settings.get("system_alerts_enabled"):
-        storage.mark_probe_runner_unavailable_notified(str(runner.get("runner_id") or ""))
-        return
+        storage.mark_probe_runner_unavailable_notified(runner_id)
+        return {"status": "disabled", "sent": False}
     channels = _system_notification_channels(settings)
     if not channels:
-        storage.mark_probe_runner_unavailable_notified(str(runner.get("runner_id") or ""))
-        return
+        storage.mark_probe_runner_unavailable_notified(runner_id)
+        return {"status": "no_channels", "sent": False}
     title = "PulseGuard 执行节点不可用"
     text = _format_runner_unavailable_message(runner, checks)
     failures: list[tuple[str, Exception]] = []
@@ -125,7 +168,23 @@ async def notify_runner_unavailable(runner: dict[str, Any], checks: list[dict[st
             failures.append((_channel_display_name(channel), exc))
         else:
             sent_channels.append(channel)
-    storage.mark_probe_runner_unavailable_notified(str(runner.get("runner_id") or ""))
+    if not sent_channels:
+        # Nobody was told.  Record the failed attempt rather than the delivery,
+        # so the node stays eligible for a retry once the cooldown expires.
+        storage.mark_probe_runner_unavailable_notify_failed(runner_id)
+        return {
+            "status": "failed",
+            "sent": False,
+            "channel": _channels_summary(channels),
+            "error": _delivery_error_summary(failures, settings),
+        }
+    storage.mark_probe_runner_unavailable_notified(runner_id)
+    return {
+        "status": "sent",
+        "sent": True,
+        "channel": _channels_summary(sent_channels),
+        "error": _delivery_error_summary(failures, settings) if failures else None,
+    }
 
 
 async def notify_system_error(event: dict[str, Any], settings: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -600,6 +659,7 @@ def _format_message(
     transition: dict[str, Any],
     recovery: bool,
     settings: dict[str, Any],
+    group_runs: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     check_type = "UI" if check["type"] == "ui" else "API"
     title = "PulseGuard 探活恢复" if recovery else "PulseGuard 探活失败"
@@ -625,7 +685,58 @@ def _format_message(
                 f"- 耗时：{run.get('duration_ms') or 0}ms",
             ]
         )
+    lines.extend(_node_matrix_lines(group_runs, settings))
     return title, "\n".join(lines)
+
+
+def _node_matrix_lines(group_runs: list[dict[str, Any]] | None, settings: dict[str, Any]) -> list[str]:
+    """Describe how each node voted when more than one took part.
+
+    The aggregate verdict names a single representative run, which hides the
+    most useful fact a multi-node probe produces: whether every node agrees, or
+    only one region is affected.
+    """
+    runs = [run for run in (group_runs or []) if isinstance(run, dict)]
+    if len(runs) < 2:
+        return []
+    ok = 0
+    target_failures = 0
+    runner_issues = 0
+    for run in runs:
+        status = str(run.get("status") or "")
+        if status == "ok":
+            ok += 1
+        elif str(run.get("failure_kind") or "") == "target" and status in {"failed", "timeout"}:
+            target_failures += 1
+        else:
+            runner_issues += 1
+    lines = [
+        "",
+        f"- 节点结果：{len(runs)} 个节点，成功 {ok}，目标失败 {target_failures}，执行异常 {runner_issues}",
+    ]
+    for run in runs:
+        lines.append(f"  - {_node_result_line(run, settings)}")
+    return lines
+
+
+def _node_result_line(run: dict[str, Any], settings: dict[str, Any]) -> str:
+    name = str(run.get("runner_name") or run.get("runner_id") or "local").strip() or "local"
+    region = str(run.get("runner_region") or "").strip()
+    label = f"{name}（{region}）" if region else name
+    status = str(run.get("status") or "unknown")
+    failure_kind = str(run.get("failure_kind") or "none")
+    if status == "ok":
+        return f"{label}：成功"
+    verdict = "目标失败" if failure_kind == "target" else "执行异常"
+    detail = mask_text(str(run.get("error_message") or ""), settings).strip()
+    if detail:
+        return f"{label}：{verdict}（{status}）- {_brief(detail)}"
+    return f"{label}：{verdict}（{status}）"
+
+
+def _brief(text: str, limit: int = 120) -> str:
+    single_line = " ".join(text.split())
+    return single_line if len(single_line) <= limit else f"{single_line[:limit]}…"
 
 
 def _format_runner_unavailable_message(runner: dict[str, Any], checks: list[dict[str, Any]]) -> str:

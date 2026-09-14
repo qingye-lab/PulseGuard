@@ -303,6 +303,16 @@ uv run python -m backend.app.worker --rotate-token --token-file data/worker-toke
 - **节点不可用**：核对主节点保存的地址和 Token；
 - **运行记录显示 Runner 异常**：优先检查节点状态、浏览器依赖和 worker 日志，不按业务目标失败处理。
 
+### Relay 短暂断连
+
+远程任务调用失败后，主节点会执行一次最多 5 秒的认证健康复核。同一节点的并发失败共用一次复核，已选中该节点的后续派发等待复核结束，再检查最新可调度状态。复核成功时不把单次调用失败升级成整节点离线；复核失败时标记不可用。原任务保留异常结果，不自动重放，避免子节点已执行但响应丢失时重复执行。脚本库验证不修改节点状态。
+
+Relay 的每节点 TCP 流上限为 `max(max_concurrency, PULSEGUARD_RELAY_MAX_CONCURRENT_STREAMS) + 4`，额外空间用于健康检查、更新和证据请求；这不是请求分类隔离，辅助请求同样受总上限约束。它不提高实际任务并发数。relay-client 的 worker 建连最多等待 5 秒，等待主节点 ready 使用 `PULSEGUARD_RELAY_HELLO_TIMEOUT_SECONDS`。断连后按约 1、2、4 秒逐步退避，最高 30 秒并带抖动；连接持续至少 60 秒后重置退避，正常关闭也不会立即循环重连。
+
+主节点服务日志记录 `worker_request_failed`（runner_id、run_id）和 `worker_health_recheck_*`。Relay 服务日志记录 `relay_connected`、`relay_disconnected`（runner_id、session_id）、`relay_stream_rejected`、`relay_peer_stream_failed`（stream_id、原因）。原因包括 `worker_connect_failed`、`eof_before_data`、`idle_timeout`、`byte_limit`、WebSocket 关闭码等。按时间与 runner_id 对齐主节点、Relay 和客户端日志；run_id 与 stream_id 尚无直接映射。日志不记录任务内容、Token 或任意对端错误文本。重连仍清空界面的当前断连原因，历史事件从服务日志查询。
+
+systemd 环境查询 `journalctl -u pulseguard.service -u pulseguard-relay.service --since "30 minutes ago"`；Docker 环境分别查询主服务、Relay 服务和 `pulseguard-relay-client` 的容器日志。确认部署环境为 journal/容器日志配置持久保留。主节点更新即可获得健康复核和连接容量优化；详细流关闭原因、客户端建连超时和退避需要同时更新 relay-client。新增诊断字段可被现有客户端/服务端忽略，不改变 worker API 或数据表。
+
 ## 验证命令
 
 快速验证（后端测试、前端行为测试、类型检查）：
