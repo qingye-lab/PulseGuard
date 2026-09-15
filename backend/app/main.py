@@ -21,7 +21,7 @@ from pydantic import ValidationError
 
 from .api_assertions import ApiInspectionFailure, inspect_api_response
 from .ui_diagnostics import UiInspectionFailure
-from . import config_transfer, failure_summary, notifier, run_comparison, storage
+from . import config_transfer, failure_summary, notifier, request_timing, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
 from .frontend_assets import FrontendAssets
 from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TEAM_NAME, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_PRINT_TOKEN, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs, relay_control_token
@@ -167,6 +167,7 @@ async def lifespan(app: FastAPI):
 ensure_runtime_dirs()
 
 app = FastAPI(title="PulseGuard", version="0.1.0", lifespan=lifespan)
+app.add_middleware(request_timing.RequestTimingMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -174,6 +175,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Server-Timing", "X-Request-ID"],
 )
 
 app.mount("/artifacts/screenshots", StaticFiles(directory=SCREENSHOTS_DIR), name="screenshots")
@@ -195,6 +197,7 @@ def _project_context(
         raise HTTPException(status_code=400, detail="X-PulseGuard-Project-Id 必须是正整数")
     if not storage.get_project(project_id):
         raise HTTPException(status_code=404, detail="项目不存在")
+    request_timing.record_count("project_id", project_id)
     return project_id
 
 
@@ -231,6 +234,7 @@ def _active_library_project_context(
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
+    request_timing.handler_started()
     return {"status": "ok", "name": APP_DISPLAY_NAME, "team": TEAM_NAME}
 
 
@@ -642,6 +646,7 @@ def heartbeat_detail(key: str) -> dict[str, Any]:
 
 @app.get("/api/overview")
 def overview(project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    request_timing.handler_started()
     return storage.get_overview(project_id)
 
 
@@ -887,7 +892,14 @@ async def test_runner_connection(runner_id: str) -> dict[str, Any]:
 
 @app.get("/api/status-page")
 def status_page(project_id: int = Depends(_project_context)) -> dict[str, Any]:
+    request_timing.handler_started()
     return _status_page_payload(project_id)
+
+
+@app.get("/api/maintenance")
+def maintenance_status() -> dict[str, Any]:
+    request_timing.handler_started()
+    return _maintenance_payload(storage.get_settings())
 
 
 @app.get("/api/read-only/snapshot")
@@ -1418,6 +1430,7 @@ def runs_page(
     page_size: int = Query(default=20, ge=1, le=100),
     project_id: int = Depends(_project_context),
 ) -> dict[str, Any]:
+    request_timing.handler_started()
     if type and type not in {"ui", "api"}:
         raise HTTPException(status_code=400, detail="任务类型无效")
     if status and status not in {"ok", "failed", "timeout", "skipped", "running", "pending", "preparation_failed"}:
@@ -2277,7 +2290,7 @@ def _read_only_run_payload(run: dict[str, Any] | None, settings: dict[str, Any])
 
 def _status_page_payload(project_id: int) -> dict[str, Any]:
     settings = storage.get_settings()
-    overview = storage.get_overview(project_id)
+    summary = storage.get_status_summary(project_id)
     checks = [
         _status_check_payload(check, settings)
         for check in storage.list_checks(refresh_stale=False, project_id=project_id)
@@ -2291,18 +2304,22 @@ def _status_page_payload(project_id: int) -> dict[str, Any]:
         "summary": {
             "checks_total": len(checks),
             "checks_enabled": sum(1 for check in checks if check["enabled"]),
-            "checks_failing": int(overview.get("failing_count") or 0),
-            "runs_today": int(overview.get("today_runs") or 0),
+            "checks_failing": int(summary.get("failing_count") or 0),
+            "runs_today": int(summary.get("today_runs") or 0),
         },
-        "maintenance": {
-            "enabled": bool(settings.get("maintenance_enabled")),
-            "title": mask_text(str(settings.get("maintenance_title") or ""), settings),
-            "message": mask_text(str(settings.get("maintenance_message") or ""), settings),
-            "starts_at": str(settings.get("maintenance_starts_at") or ""),
-            "ends_at": str(settings.get("maintenance_ends_at") or ""),
-        },
+        "maintenance": _maintenance_payload(settings),
         "checks": checks,
         "recent_incidents": incidents,
+    }
+
+
+def _maintenance_payload(settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": bool(settings.get("maintenance_enabled")),
+        "title": mask_text(str(settings.get("maintenance_title") or ""), settings),
+        "message": mask_text(str(settings.get("maintenance_message") or ""), settings),
+        "starts_at": str(settings.get("maintenance_starts_at") or ""),
+        "ends_at": str(settings.get("maintenance_ends_at") or ""),
     }
 
 

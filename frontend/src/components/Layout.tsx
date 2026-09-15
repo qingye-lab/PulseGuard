@@ -164,10 +164,10 @@ export function Layout() {
     let disposed = false;
     const loadMaintenance = () => {
       api
-        .statusPage()
-        .then((snapshot) => {
+        .maintenance()
+        .then((nextMaintenance) => {
           if (!disposed) {
-            setMaintenance(snapshot.maintenance);
+            setMaintenance(nextMaintenance);
             setServiceConnected(true);
           }
         })

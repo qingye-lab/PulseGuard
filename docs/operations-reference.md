@@ -421,11 +421,25 @@ PULSEGUARD_TREND_BACKFILL_ON_STARTUP=true
 
 启动一次后应恢复默认关闭。
 
+## 控制台慢请求诊断
+
+控制台主要 GET 接口（`health`、`projects`、`settings`、`project-alert-settings`、`runtime`、`checks`、`runners`、`runs-page`、`overview`、`status-page`、`maintenance`）返回 `X-Request-ID` 和 `Server-Timing`。服务器处理达到 500 ms 时，应用日志额外输出一条 `slow_api_request` JSON；可按响应中的请求 ID 关联日志。日志只记录固定路由、状态、耗时、项目 ID 和计数，不包含查询字符串、请求头、SQL 或业务正文。
+
+- `server`：从 ASGI 中间件接收请求到发送响应头的时间，不包含浏览器排队、公网传输和进入应用前的等待；日志的 `duration_ms` 则到应用处理返回为止。
+- `dispatch`：健康、分页、概览、状态页和维护接口进入处理函数前的时间，包含项目依赖校验及线程分派，不等于纯线程队列等待。
+- `db_gate` / `db_writer`：等待应用维护门和写连接锁；`db_connect` / `db_setup` / `db_finalize`：连接、PRAGMA/事务准备、提交/回滚/关闭的累计耗时。SQLite 内部锁等待可能体现在具体 SQL 或连接设置阶段。
+- `runs_count` / `runs_fetch`：分页精确总数和当前页读取；`overview_summary` / `overview_trends`：摘要与趋势统计。阶段存在包含关系，不能相加当作总耗时。
+
+复现偶发长尾时，同时保留浏览器 Timing、`X-Request-ID`、对应慢日志和主机 I/O/CPU 时段。详见 [2026-09-14 性能分析及本地修复验证](reviews/2026-09-14-volcano-api-performance.md)。
+
 ## 常用接口
 
 | 接口 | 用途 |
 | --- | --- |
 | `GET /api/health` | 应用健康检查 |
+| `GET /api/maintenance` | 实例共享的维护公告；返回 `enabled`、`title`、`message`、`starts_at`、`ends_at`，无需项目请求头 |
+| `GET /api/status-page` | 当前项目状态、摘要、事件及维护公告；无需计算概览趋势 |
+| `GET /api/runs-page` / `GET /api/overview` | 当前项目的精确分页与概览 |
 | `GET /api/projects` / `POST /api/projects` | 项目列表与创建 |
 | `GET /api/database-health` | 只读数据库容量与空闲页健康指标 |
 | `GET /api/metrics.json` | JSON 指标 |

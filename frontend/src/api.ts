@@ -251,6 +251,7 @@ export const api = {
   overview: () => request<Overview>("/api/overview"),
   runtime: () => request<RuntimeStatus>("/api/runtime"),
   statusPage: () => request<StatusPageSnapshot>("/api/status-page"),
+  maintenance: () => request<StatusPageSnapshot["maintenance"]>("/api/maintenance"),
   checks: (type: CheckType) => request<Check[]>(`/api/checks?type=${type}`),
   check: (id: number) => request<Check>(`/api/checks/${id}`),
   createCheck: (payload: CheckPayload) =>

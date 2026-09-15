@@ -324,11 +324,20 @@ PULSEGUARD_TREND_BACKFILL_ON_STARTUP=true
 
 Disable it again after the one-time startup.
 
+## Console request timings
+
+The main console GET endpoints (`health`, `projects`, `settings`, `project-alert-settings`, `runtime`, `checks`, `runners`, `runs-page`, `overview`, `status-page`, `maintenance`) return `Server-Timing` and a generated `X-Request-ID`. Requests taking at least 500 ms produce a `slow_api_request` JSON log with fixed route, status, durations, project ID and counts; query strings, headers, SQL and business payloads are excluded.
+
+`server` ends at response headers and excludes browser/network time and waiting before ASGI entry. `dispatch`, present on health/page/overview/status/maintenance handlers, includes dependency resolution and thread dispatch. Database gate/writer waits, connection/setup/finalization, pagination count/fetch and overview summary/trends have separate timings. These phases can overlap and must not be added together. Correlate long-tail browser timings with the request ID, server log and host I/O/CPU metrics. See the [performance investigation and local verification](reviews/2026-09-14-volcano-api-performance.md).
+
 ## API reference
 
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/health` | Application health |
+| `GET /api/maintenance` | Instance-wide maintenance notice: `enabled`, `title`, `message`, `starts_at`, `ends_at`; no project header required |
+| `GET /api/status-page` | Current project status, summary, incidents and maintenance, without overview trend computation |
+| `GET /api/runs-page` / `GET /api/overview` | Current project exact pagination and overview |
 | `GET /api/projects` / `POST /api/projects` | List and create projects |
 | `GET /api/database-health` | Read-only database capacity and free-page health |
 | `GET /api/metrics.json` | JSON metrics |

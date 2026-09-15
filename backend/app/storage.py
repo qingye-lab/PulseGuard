@@ -11,7 +11,7 @@ import threading
 import time as time_module
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, ExitStack
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -52,6 +52,7 @@ from .script_library import (
 )
 from .schemas import normalize_project_alert_settings_values, normalize_settings_values
 from .variables import is_sensitive_variable_name
+from . import request_timing
 
 
 class DatabaseRestoreRecoveryError(RuntimeError):
@@ -1009,6 +1010,17 @@ def _init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_page_filter_started ON runs(observation_kind, check_type, status, started_at DESC, id DESC)"
+        )
+        # Console counts and trends must not visit wide log/snapshot rows just to
+        # test project/observation/health filters. Keep pagination's stable tie order.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_project_kind_started "
+            "ON runs(project_id, observation_kind, started_at DESC, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_project_health_cover "
+            "ON runs(project_id, affects_health, started_at DESC, id DESC, "
+            "check_id, check_type, status, failure_kind, duration_ms)"
         )
         cleanup_index = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_runs_cleanup_terminal'"
@@ -4342,11 +4354,15 @@ def list_runs_page(
     clauses, params = _run_filter_clauses(filters)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     with _connect(read_only=True) as conn:
-        total = int(conn.execute(f"SELECT COUNT(*) AS count FROM runs{where}", params).fetchone()["count"])
-        rows = conn.execute(
-            f"SELECT {_run_summary_select()} FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
-            [*params, page_size, (page - 1) * page_size],
-        ).fetchall()
+        with request_timing.phase("runs_count"):
+            total = int(conn.execute(f"SELECT COUNT(*) AS count FROM runs{where}", params).fetchone()["count"])
+        with request_timing.phase("runs_fetch"):
+            rows = conn.execute(
+                f"SELECT {_run_summary_select()} FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+    request_timing.record_count("runs_matches", total)
+    request_timing.record_count("runs_rows", len(rows))
     return {
         "items": [_normalize_run(row) for row in rows],
         "total": total,
@@ -4885,48 +4901,74 @@ def _preserve_environment_variable_secrets(values: dict[str, Any]) -> dict[str, 
     return next_values
 
 
-def get_overview(project_id: int | None = None) -> dict[str, Any]:
+def get_status_summary(project_id: int | None = None) -> dict[str, Any]:
     refresh_stale_statuses(project_id=project_id)
+    with _connect(read_only=True) as conn:
+        return _overview_summary(conn, project_id)
+
+
+@request_timing.phase("overview_summary")
+def _overview_summary(conn: sqlite3.Connection, project_id: int | None) -> dict[str, Any]:
     today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     check_scope_sql, check_scope_params = _project_scope_sql(project_id)
     check_alias_scope_sql, check_alias_scope_params = _project_scope_sql(project_id, "c.project_id")
     run_scope_sql, run_scope_params = _project_scope_sql(project_id)
-    with _connect(read_only=True) as conn:
-        ui_count = conn.execute(
-            f"SELECT COUNT(*) AS count FROM checks WHERE type = 'ui'{check_scope_sql}",
-            check_scope_params,
-        ).fetchone()["count"]
-        api_count = conn.execute(
-            f"SELECT COUNT(*) AS count FROM checks WHERE type = 'api'{check_scope_sql}",
-            check_scope_params,
-        ).fetchone()["count"]
-        state_counts = {
-            str(row["monitor_status"] or "unknown"): int(row["count"])
-            for row in conn.execute(
-                f"""
-                SELECT COALESCE(s.monitor_status, 'unknown') AS monitor_status, COUNT(*) AS count
-                FROM checks c
-                LEFT JOIN check_status s ON s.check_id = c.id
-                WHERE c.enabled = 1{check_alias_scope_sql}
-                GROUP BY COALESCE(s.monitor_status, 'unknown')
-                """,
-                check_alias_scope_params,
-            ).fetchall()
-        }
-        failing_count = conn.execute(
+    ui_count = conn.execute(
+        f"SELECT COUNT(*) AS count FROM checks WHERE type = 'ui'{check_scope_sql}",
+        check_scope_params,
+    ).fetchone()["count"]
+    api_count = conn.execute(
+        f"SELECT COUNT(*) AS count FROM checks WHERE type = 'api'{check_scope_sql}",
+        check_scope_params,
+    ).fetchone()["count"]
+    state_counts = {
+        str(row["monitor_status"] or "unknown"): int(row["count"])
+        for row in conn.execute(
             f"""
-            SELECT COUNT(*) AS count
-            FROM check_status s
-            JOIN checks c ON c.id = s.check_id
-            WHERE c.enabled = 1 AND s.monitor_status = 'failing'
-              {check_alias_scope_sql}
+            SELECT COALESCE(s.monitor_status, 'unknown') AS monitor_status, COUNT(*) AS count
+            FROM checks c
+            LEFT JOIN check_status s ON s.check_id = c.id
+            WHERE c.enabled = 1{check_alias_scope_sql}
+            GROUP BY COALESCE(s.monitor_status, 'unknown')
             """,
             check_alias_scope_params,
-        ).fetchone()["count"]
-        today_runs = conn.execute(
-            f"SELECT COUNT(*) AS count FROM runs WHERE check_id > 0 AND affects_health = 1 AND started_at >= ?{run_scope_sql}",
-            (today, *run_scope_params),
-        ).fetchone()["count"]
+        ).fetchall()
+    }
+    failing_count = conn.execute(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM check_status s
+        JOIN checks c ON c.id = s.check_id
+        WHERE c.enabled = 1 AND s.monitor_status = 'failing'
+          {check_alias_scope_sql}
+        """,
+        check_alias_scope_params,
+    ).fetchone()["count"]
+    today_runs = conn.execute(
+        f"SELECT COUNT(*) AS count FROM runs WHERE check_id > 0 AND affects_health = 1 AND started_at >= ?{run_scope_sql}",
+        (today, *run_scope_params),
+    ).fetchone()["count"]
+
+    return {
+        "ui_count": ui_count,
+        "api_count": api_count,
+        "failing_count": failing_count,
+        "suspected_failing_count": state_counts.get("suspected_failing", 0),
+        "suspected_recovery_count": state_counts.get("suspected_recovery", 0),
+        "suspected_count": state_counts.get("suspected_failing", 0) + state_counts.get("suspected_recovery", 0),
+        "unknown_count": state_counts.get("unknown", 0),
+        "stale_count": state_counts.get("stale", 0),
+        "healthy_count": state_counts.get("healthy", 0),
+        "today_runs": today_runs,
+    }
+
+
+def get_overview(project_id: int | None = None) -> dict[str, Any]:
+    refresh_stale_statuses(project_id=project_id)
+    check_alias_scope_sql, check_alias_scope_params = _project_scope_sql(project_id, "c.project_id")
+    run_scope_sql, run_scope_params = _project_scope_sql(project_id)
+    with _connect(read_only=True) as conn:
+        summary = _overview_summary(conn, project_id)
         latest_run = conn.execute(
             f"SELECT {_run_summary_select()} FROM runs WHERE check_id > 0 AND affects_health = 1{run_scope_sql} ORDER BY started_at DESC, id DESC LIMIT 1",
             run_scope_params,
@@ -4964,16 +5006,7 @@ def get_overview(project_id: int | None = None) -> dict[str, Any]:
         trends = _overview_trends(conn, project_id=project_id)
 
     return {
-        "ui_count": ui_count,
-        "api_count": api_count,
-        "failing_count": failing_count,
-        "suspected_failing_count": state_counts.get("suspected_failing", 0),
-        "suspected_recovery_count": state_counts.get("suspected_recovery", 0),
-        "suspected_count": state_counts.get("suspected_failing", 0) + state_counts.get("suspected_recovery", 0),
-        "unknown_count": state_counts.get("unknown", 0),
-        "stale_count": state_counts.get("stale", 0),
-        "healthy_count": state_counts.get("healthy", 0),
-        "today_runs": today_runs,
+        **summary,
         "latest_run": _normalize_run(latest_run) if latest_run else None,
         "latest_recovered": dict(recovered) if recovered else None,
         "recent_failures": [_normalize_run(row) for row in failures],
@@ -4981,6 +5014,7 @@ def get_overview(project_id: int | None = None) -> dict[str, Any]:
     }
 
 
+@request_timing.phase("overview_trends")
 def _overview_trends(
     conn: sqlite3.Connection, now: datetime | None = None, project_id: int | None = None
 ) -> list[dict[str, Any]]:
@@ -5044,6 +5078,8 @@ def _overview_trends(
     for metrics in metrics_by_type.values():
         metrics["durations"].sort()
         metrics["recent_durations"].sort()
+
+    request_timing.record_count("trend_rows", sum(metrics["runs"] for metrics in metrics_by_type.values()))
 
     return [
         {
@@ -5678,28 +5714,38 @@ def _connect(*, read_only: bool = False) -> Iterator[sqlite3.Connection]:
         return
     # Always enter the maintenance gate before the writer lock. A read transaction
     # keeps multi-query responses consistent while other connections commit to WAL.
-    with _DATABASE_ACCESS.shared(), (nullcontext() if read_only else _LOCK):
-        if read_only:
-            # mode=ro also prevents close-time automatic checkpoints. query_only
-            # alone would still leave a writable connection outside the writer lock.
-            conn = sqlite3.connect(f"{Path(DB_PATH).resolve().as_uri()}?mode=ro", uri=True, timeout=30)
-        else:
-            conn = sqlite3.connect(DB_PATH, timeout=30)
-        try:
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.row_factory = sqlite3.Row
+    with ExitStack() as access:
+        with request_timing.phase("db_gate"):
+            access.enter_context(_DATABASE_ACCESS.shared())
+        if not read_only:
+            with request_timing.phase("db_writer"):
+                access.enter_context(_LOCK)
+        with request_timing.phase("db_connect"):
             if read_only:
-                conn.execute("PRAGMA query_only=ON")
-                conn.execute("BEGIN")
+                # mode=ro also prevents close-time automatic checkpoints. query_only
+                # alone would still leave a writable connection outside the writer lock.
+                conn = sqlite3.connect(f"{Path(DB_PATH).resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+            else:
+                conn = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            with request_timing.phase("db_setup"):
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.row_factory = sqlite3.Row
+                if read_only:
+                    conn.execute("PRAGMA query_only=ON")
+                    conn.execute("BEGIN")
             yield conn
-            conn.commit()
+            with request_timing.phase("db_finalize"):
+                conn.commit()
         except BaseException:
-            conn.rollback()
+            with request_timing.phase("db_finalize"):
+                conn.rollback()
             raise
         finally:
-            conn.close()
+            with request_timing.phase("db_finalize"):
+                conn.close()
 
 
 def _ensure_check_columns(conn: sqlite3.Connection) -> None:
