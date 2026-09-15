@@ -98,8 +98,10 @@ $target = "$($remote.user)@$($remote.ip)"
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("pulseguard-sync-" + [guid]::NewGuid().ToString("N"))
 $stage = Join-Path $tempRoot "stage"
 $payload = Join-Path $tempRoot "pulseguard-main-data.tar.gz"
-$remotePayload = "$RemoteRoot/pulseguard-main-data.tar.gz"
-$remoteScript = "$RemoteRoot/apply-main-data-sync.sh"
+$syncId = [guid]::NewGuid().ToString("N")
+$remotePayload = "/tmp/pulseguard-main-data-$syncId.tar.gz"
+$remoteScript = "/tmp/apply-main-data-sync-$syncId.sh"
+$remoteBackupTool = "/tmp/pulseguard-deployment-backups-$syncId.py"
 
 New-Item -ItemType Directory -Force -Path (Join-Path $stage "data") | Out-Null
 try {
@@ -150,23 +152,30 @@ if [ "`${mode}" = "auto" ]; then
   fi
 fi
 mkdir -p /opt/pulseguard-backups data reports
-backup_items=""
-[ -d data ] && backup_items="`${backup_items} data"
-[ -d reports ] && backup_items="`${backup_items} reports"
-if [ -n "`${backup_items}" ]; then
-  # Intentional word splitting: backup_items is assembled only from fixed directory names.
-  tar -czf "/opt/pulseguard-backups/data-before-sync-`${stamp}.tar.gz" -C "$RemoteRoot" `${backup_items}
-fi
+python3 -c 'import sys; assert sys.version_info >= (3, 11), "backup tooling requires Python 3.11+"'
 if [ "`${mode}" = "systemd" ]; then
   systemctl stop pulseguard.service pulseguard-relay.service || true
+  if systemctl is-active --quiet pulseguard.service || systemctl is-active --quiet pulseguard-relay.service; then
+    echo "services must be stopped before creating a sync recovery point" >&2
+    exit 1
+  fi
 else
-  docker compose -f docker-compose.yml -f docker-compose.relay.yml stop pulseguard pulseguard-relay || true
+  docker compose -f docker-compose.yml -f docker-compose.relay.yml stop pulseguard pulseguard-relay
+fi
+if ! python3 "$remoteBackupTool" create --id "$syncId" --app-root "$RemoteRoot" --include-reports; then
+  if [ "`${mode}" = "systemd" ]; then
+    systemctl start pulseguard.service pulseguard-relay.service
+  else
+    docker compose -f docker-compose.yml -f docker-compose.relay.yml up -d --no-build
+  fi
+  exit 1
 fi
 work="/opt/pulseguard-sync-`${stamp}"
 rm -rf "`${work}"
 mkdir -p "`${work}"
 tar -xzf "$remotePayload" -C "`${work}"
 if [ -f "`${work}/data/pulseguard.db" ]; then
+  rm -f data/pulseguard.db-wal data/pulseguard.db-shm
   cp -f "`${work}/data/pulseguard.db" data/pulseguard.db
 fi
 if [ -f "`${work}/data/runner-token.key" ]; then
@@ -196,6 +205,7 @@ fi
     Write-Host "Uploading data payload to $target. OpenSSH may prompt for the remote password."
     Invoke-Native -File "scp" -Arguments @($payload, "${target}:$remotePayload")
     Invoke-Native -File "scp" -Arguments @($remoteApplyPath, "${target}:$remoteScript")
+    Invoke-Native -File "scp" -Arguments @((Join-Path $PSScriptRoot "deployment_backups.py"), "${target}:$remoteBackupTool")
     Invoke-Native -File "ssh" -Arguments @($target, "bash $remoteScript")
 
     $remoteUrl = "http://$($remote.ip):8787"
@@ -214,7 +224,9 @@ fi
             if ($remoteChecks.Count -ne $localChecks.Count -or $remoteCheckFingerprint -ne $localCheckFingerprint) {
                 throw "remote check definitions do not match local backup after sync"
             }
-            Invoke-RestMethod -Method GET -Uri "$remoteUrl/api/settings" -TimeoutSec 30 | Out-Null
+            $remoteSettings = Invoke-RestMethod -Method GET -Uri "$remoteUrl/api/settings" -TimeoutSec 30
+            $retention = [int]$remoteSettings.database_backup_retention
+            Invoke-Native -File "ssh" -Arguments @($target, "python3 '$remoteBackupTool' complete --id '$syncId' --retention $retention")
             Write-Host "Verified check definitions: $($remoteChecks.Count)"
             Write-Host "Remote PulseGuard is healthy: $remoteUrl"
             return

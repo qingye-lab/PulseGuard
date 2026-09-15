@@ -4547,13 +4547,16 @@ def _database_backup_info(path: Any) -> dict[str, Any]:
 
 def _cleanup_database_backups(preserve_filenames: set[str] | None = None) -> None:
     retention = max(1, int(get_settings().get("database_backup_retention", 7)))
-    preserved = preserve_filenames or set()
-    removable = [
-        path
-        for path in sorted(BACKUPS_DIR.glob("pulseguard-*.db"), reverse=True)
-        if path.name not in preserved
-    ]
-    for path in removable[retention:]:
+    backups = sorted(
+        (path for path in BACKUPS_DIR.glob("pulseguard-*.db") if path.is_file() and not path.is_symlink()),
+        key=lambda path: (path.stat().st_mtime_ns, path.name),
+        reverse=True,
+    )
+    preserved = {path.name for path in backups} & (preserve_filenames or set())
+    removable = [path for path in backups if path.name not in preserved]
+    # New backups count toward the limit. A restore must keep both its source
+    # and safety copy, even when the configured limit is only one.
+    for path in removable[max(0, retention - len(preserved)):]:
         path.unlink(missing_ok=True)
 
 

@@ -68,6 +68,19 @@ The deploy script must upload payloads and its apply script outside `/opt/pulseg
 
 ## Disk Recovery
 
+### Deployment backup retention
+
+For both standard and directed/incremental releases, use `scripts/deployment_backups.py`
+instead of creating ad hoc backups. Stop instance and Relay writers, then call `create`
+with a unique 32-character lowercase hexadecimal release ID and `--app-root`.
+Use `--include-reports` for data sync. Recovery points include a compressed database,
+full source, and runtime keys/Relay state; do not replace the source archive with a patch.
+After health and data acceptance, call `complete` with the same ID and the current
+`/api/settings` value of `database_backup_retention`. This counts the new recovery point
+toward the limit and prunes only older completed managed groups. Never complete a failed
+deployment. Pending, unknown, and legacy backups require explicit operator review.
+See `docs/decisions/2026-09-15-backup-retention.md` for commands and recovery boundaries.
+
 If the remote root filesystem is full, inspect first:
 
 ```sh

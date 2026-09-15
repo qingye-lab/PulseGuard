@@ -301,7 +301,8 @@ The script creates an online SQLite backup under `data/backups/`, checks its int
 ## Data boundaries
 
 - SQLite data lives under `data/`;
-- online backups live under `data/backups/`;
+- online backups live under `data/backups/`; `database_backup_retention` counts all retained copies, including the newly created one. The next backup creation prunes by file time. Restore sources and pre-restore safety copies are protected, so a restore can retain two copies when the limit is one;
+- deployment and data-sync recovery points use `scripts/deployment_backups.py` under `/opt/pulseguard-backups/managed-<id>/`. They share the online-backup retention setting but count separately. Only `complete`, after deployment health and data acceptance, prunes older completed points. See the [backup retention decision](decisions/2026-09-15-backup-retention.md);
 - restoring pauses new admissions and scheduling, then waits up to 30 seconds for accepted work; timeout returns 409 without restoring. Safety backup, restore, initialization, and failure compensation share exclusive maintenance access; client cancellation does not release admission protection early;
 - audited queries use read-only SQLite snapshots while writes are serialized; retention archives and deletes terminal runs in bounded atomic batches, preserves unfinished runs, and can resume without double-counting;
 - restoration is main-node-only; failed compensation or runtime settings reload returns 503 and keeps run admissions paused until operator recovery/configuration repair and restart. API/UI inspection previews are diagnostics, not persisted run admissions;

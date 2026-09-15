@@ -183,23 +183,17 @@ VIRTUAL_ENV="`${remote_root}/.venv" "`${uv_bootstrap}/bin/uv" sync \
   --default-index "`${pypi_mirror}"
 
 active_db="`${remote_root}/data/pulseguard.db"
-backup_db="/opt/pulseguard-backups/pulseguard-before-deploy-`${stamp}.db"
 preflight_db="`${work}/pulseguard-migration-preflight.db"
 if [ -f "`${active_db}" ]; then
-  "`${remote_root}/.venv/bin/python" - "`${active_db}" "`${backup_db}" "`${preflight_db}" <<'PY'
-import hashlib
-import shutil
+  "`${remote_root}/.venv/bin/python" - "`${active_db}" "`${preflight_db}" <<'PY'
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 
-source_path, backup_path, preflight_path = map(Path, sys.argv[1:4])
-with sqlite3.connect(source_path, timeout=30) as source, sqlite3.connect(backup_path) as backup:
+source_path, preflight_path = map(Path, sys.argv[1:3])
+with closing(sqlite3.connect(source_path.as_uri() + '?mode=ro', uri=True, timeout=30)) as source, closing(sqlite3.connect(preflight_path)) as backup:
     source.backup(backup)
-shutil.copy2(backup_path, preflight_path)
-with backup_path.open("rb") as backup_file:
-    digest = hashlib.file_digest(backup_file, "sha256").hexdigest()
-print(f"database backup ready: {backup_path} sha256={digest}")
 PY
   PULSEGUARD_DB_PATH="`${preflight_db}" \
   PULSEGUARD_DATA_DIR="`${work}/migration-data" \
@@ -224,27 +218,24 @@ if [ "`${browser_install}" = "1" ]; then
 fi
 
 systemctl stop pulseguard.service pulseguard-relay.service 2>/dev/null || true
-source_backup="/opt/pulseguard-backups/source-before-deploy-`${stamp}.tar.gz"
-cutover_backup_db="/opt/pulseguard-backups/pulseguard-before-cutover-`${stamp}.db"
+if systemctl is-active --quiet pulseguard.service || systemctl is-active --quiet pulseguard-relay.service; then
+  echo "services must be stopped before creating a deployment recovery point" >&2
+  exit 1
+fi
+backup_dir="/opt/pulseguard-backups/managed-$remoteDeployId"
 cutover_db="`${work}/pulseguard-cutover.db"
-tar -czf "`${source_backup}" -C "`${remote_root}" --exclude=data --exclude=reports --exclude=.venv . 2>/dev/null || true
-echo "source backup ready: `${source_backup}"
+if ! "`${remote_root}/.venv/bin/python" "`${work}/scripts/deployment_backups.py" create --id "$remoteDeployId" --app-root "`${remote_root}"; then
+  systemctl start pulseguard.service pulseguard-relay.service 2>/dev/null || true
+  exit 1
+fi
 if [ -f "`${active_db}" ]; then
-  "`${remote_root}/.venv/bin/python" - "`${active_db}" "`${cutover_backup_db}" "`${cutover_db}" <<'PY'
-import hashlib
+  "`${remote_root}/.venv/bin/python" - "`${backup_dir}/database.db.gz" "`${cutover_db}" <<'PY'
+import gzip
 import shutil
-import sqlite3
 import sys
-from pathlib import Path
 
-source_path, backup_path, cutover_path = map(Path, sys.argv[1:4])
-with sqlite3.connect(source_path, timeout=30) as source, sqlite3.connect(backup_path) as backup:
-    source.execute("PRAGMA busy_timeout=30000")
-    source.backup(backup)
-shutil.copy2(backup_path, cutover_path)
-with backup_path.open("rb") as backup_file:
-    digest = hashlib.file_digest(backup_file, "sha256").hexdigest()
-print(f"cutover database backup ready: {backup_path} sha256={digest}")
+with gzip.open(sys.argv[1], 'rb') as source, open(sys.argv[2], 'wb') as target:
+    shutil.copyfileobj(source, target)
 PY
   set +e
   PULSEGUARD_DB_PATH="`${cutover_db}" \
@@ -350,14 +341,18 @@ rm -rf "`${work}" "`${payload}" "`${remote_script}"
             $health = Invoke-RestMethod -Method GET -Uri "$remoteUrl/api/health" -TimeoutSec 5
             $settings = Invoke-RestMethod -Method GET -Uri "$remoteUrl/api/settings" -TimeoutSec 10
             $relay = Invoke-RestMethod -Method GET -Uri "$remoteUrl/api/relay/status" -TimeoutSec 10
-            if ($health.status -eq "ok" -and $settings -and $relay) {
-                Write-Host "PulseGuard is healthy: $remoteUrl"
-                return
-            }
         }
         catch {
             Start-Sleep -Seconds 3
+            continue
         }
+        if ($health.status -eq "ok" -and $settings -and $relay) {
+            $retention = [int]$settings.database_backup_retention
+            Invoke-Native -File "ssh" -Arguments @($target, "'$RemoteRoot/.venv/bin/python' '$RemoteRoot/scripts/deployment_backups.py' complete --id '$remoteDeployId' --retention $retention")
+            Write-Host "PulseGuard is healthy; deployment backups retained: $retention. $remoteUrl"
+            return
+        }
+        Start-Sleep -Seconds 3
     } while ((Get-Date) -lt $deadline)
 
     throw "PulseGuard did not become healthy within 120 seconds: $remoteUrl"
