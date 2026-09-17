@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -596,6 +597,59 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(writer.closed)
         self.assertEqual(session.streams, {})
+
+    async def test_data_frame_keeps_session_when_credential_lookup_fails(self) -> None:
+        writer = FakeWriter()
+        websocket = FakeWebSocket()
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=websocket,  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+        session.streams["stream-1"] = relay_server.TunnelStream(  # type: ignore[arg-type]
+            reader=EmptyReader(),
+            writer=writer,
+        )
+
+        with patch(
+            "backend.app.relay_server.storage.verify_probe_runner_relay_token",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            keep_running = await relay_server._handle_data_message(
+                session,
+                {"type": "data", "stream_id": "stream-1", "data": "cGF5bG9hZA=="},
+            )
+
+        self.assertTrue(keep_running)
+        self.assertIsNone(websocket.close_kwargs)
+        self.assertEqual(writer.writes, [b"payload"])
+
+    async def test_new_stream_keeps_session_when_credential_lookup_fails(self) -> None:
+        writer = FakeWriter()
+        websocket = FakeWebSocket()
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=websocket,  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+
+        with patch(
+            "backend.app.relay_server.storage.verify_probe_runner_relay_token",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), patch("backend.app.relay_server.storage.get_settings", return_value={"max_concurrency": 1}):
+            await relay_server._tcp_client_connected(  # type: ignore[arg-type]
+                session,
+                EmptyReader(),
+                writer,
+            )
+
+        self.assertIsNone(websocket.close_kwargs)
+        self.assertIsNone(session.disconnect_reason)
+        self.assertIn('"type":"open"', websocket.messages[0])
 
     async def test_data_frame_rejects_invalid_payload_even_for_unknown_stream(self) -> None:
         session = relay_server.RelaySession(

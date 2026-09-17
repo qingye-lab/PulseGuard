@@ -137,7 +137,18 @@ def _clear_auth_failure(key: str) -> None:
 
 
 def _relay_session_credentials_valid(session: RelaySession) -> bool:
-    return bool(storage.verify_probe_runner_relay_token(session.runner_id, session.token, session.token_version))
+    try:
+        return bool(storage.verify_probe_runner_relay_token(session.runner_id, session.token, session.token_version))
+    except Exception as exc:
+        # A storage hiccup must not drop a session that was already authenticated at hello
+        # time: the next frame re-checks, and revocation goes through revoke_relay_session.
+        logger.warning(
+            "relay_credential_check_failed runner_id=%r session_id=%s error_type=%s",
+            session.runner_id,
+            session.session_id,
+            type(exc).__name__,
+        )
+        return True
 
 
 async def _close_writer_best_effort(writer: asyncio.StreamWriter) -> None:

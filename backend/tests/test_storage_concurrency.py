@@ -51,6 +51,34 @@ class StorageConcurrencyTests(unittest.TestCase):
             writer.result(timeout=5)
         self.assertEqual(storage.get_settings()["run_retention_days"], 99)
 
+    def test_relay_token_verification_finishes_while_writer_transaction_is_still_open(self) -> None:
+        # The relay server verifies session credentials on every heartbeat and data frame.
+        # Waiting for the writer lock there stalls, and eventually kills, a live tunnel.
+        with patch.object(storage, "RELAY_INTERNAL_PORT_START", 19001), patch.object(storage, "RELAY_INTERNAL_PORT_END", 19002):
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+        runner_id = provisioned["runner_id"]
+        relay_token = provisioned["relay_token"]
+        version = int(provisioned["relay_token_version"])
+        writer_ready = threading.Event()
+        release_writer = threading.Event()
+
+        def write() -> None:
+            with storage._connect() as conn:
+                conn.execute("UPDATE settings SET value = '99' WHERE key = 'run_retention_days'")
+                writer_ready.set()
+                self.assertTrue(release_writer.wait(5))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writer = pool.submit(write)
+            try:
+                self.assertTrue(writer_ready.wait(5))
+                verified = pool.submit(storage.verify_probe_runner_relay_token, runner_id, relay_token, version).result(timeout=2)
+                self.assertIsNotNone(verified)
+                self.assertFalse(writer.done())
+            finally:
+                release_writer.set()
+            writer.result(timeout=5)
+
     def test_read_transaction_keeps_snapshot_across_concurrent_commit(self) -> None:
         with storage._connect(read_only=True) as conn:
             before = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]

@@ -3684,8 +3684,11 @@ def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) ->
     token = str(token or "").strip()
     if not token:
         return None
-    with _connect() as conn:
-        _expire_probe_runner_provisions(conn)
+    # Relay sessions verify on every heartbeat and data frame, so this stays read-only:
+    # expiring provisions here would queue behind the writer lock and stall live tunnels.
+    # The expiry rules below mirror _expire_probe_runner_provisions, which the runner
+    # endpoints still run to persist the resulting state.
+    with _connect(read_only=True) as conn:
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
     if not row:
         return None
@@ -3695,6 +3698,8 @@ def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) ->
     if str(row["connection_mode"] or "") != "relay":
         return None
     if not int(row["enabled"] or 0):
+        return None
+    if str(row["relay_previous_token_hash"] or "") and _timestamp_is_past(row["relay_previous_token_expires_at"]):
         return None
     matched_current = int(version or 0) == expected_version and secrets.compare_digest(expected_hash, token_digest)
     matched_previous = _previous_relay_token_matches(row, token_digest, int(version or 0))
