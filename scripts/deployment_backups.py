@@ -109,8 +109,18 @@ def create(root: Path, backup_id: str, app_root: Path, *, include_reports: bool 
                 if path.exists():
                     archive.add(path, arcname=name, filter=runtime_filter)
         files = {p.name: {"sha256": _digest(p), "bytes": p.stat().st_size} for p in target.iterdir()}
+        # Wall clocks can repeat (notably on Windows) or move backwards. Creation
+        # is serialized by the root lock, so preserve a strict order in manifests.
+        created_ns = time.time_ns()
+        for previous in root.glob("managed-*"):
+            if previous == target:
+                continue
+            try:
+                created_ns = max(created_ns, _manifest(previous)["created_ns"] + 1)
+            except (OSError, ValueError, TypeError):
+                continue
         _write_manifest(target, {
-            "format": FORMAT, "id": backup_id, "created_ns": time.time_ns(),
+            "format": FORMAT, "id": backup_id, "created_ns": created_ns,
             "state": "pending", "files": files,
         })
     return target

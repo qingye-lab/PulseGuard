@@ -348,6 +348,7 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
     if (scope === "system") {
       return {
         run_retention_days: settings.run_retention_days,
+        run_detail_retention_days: settings.run_detail_retention_days,
         screenshot_retention_days: settings.screenshot_retention_days,
         trace_retention_days: settings.trace_retention_days,
         response_retention_days: settings.response_retention_days,
@@ -1118,11 +1119,12 @@ export function SettingsPage({ tabOverride }: { tabOverride?: SettingsTab } = {}
               <div className="settings-system-grid">
                 <Card type="inner" title={<Space size={8}><Database size={16} /><span>数据保留</span></Space>}>
                   <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-                    <NumberItem label="运行记录保留" value={settings.run_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("run_retention_days", value)} />
+                    <NumberItem label="轻量执行记录保留" value={settings.run_retention_days} min={1} max={3650} suffix="天" onChange={(value) => update("run_retention_days", value)} />
+                    <NumberItem label="日志与请求响应详情保留" value={settings.run_detail_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("run_detail_retention_days", value)} />
                     <NumberItem label="截图保留" value={settings.screenshot_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("screenshot_retention_days", value)} />
                     <NumberItem label="Trace 保留" value={settings.trace_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("trace_retention_days", value)} />
                     <NumberItem label="Response Body 保留" value={settings.response_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("response_retention_days", value)} />
-                    <NumberItem label="同错失败保留" value={settings.similar_failure_retention_count} min={1} max={100} suffix="条" onChange={(value) => update("similar_failure_retention_count", value)} />
+                    <NumberItem label="同错失败详情保留" value={settings.similar_failure_retention_count} min={1} max={100} suffix="条" onChange={(value) => update("similar_failure_retention_count", value)} />
                     <NumberItem label="数据库备份保留" value={settings.database_backup_retention} min={1} max={30} suffix="份" onChange={(value) => update("database_backup_retention", value)} />
                     <Form.Item label="记录失败 Trace">
                       <Switch aria-label="记录失败 Trace" checked={settings.trace_artifacts_enabled} onChange={(value) => update("trace_artifacts_enabled", value)} />

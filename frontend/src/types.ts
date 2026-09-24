@@ -613,6 +613,7 @@ export interface Run {
   trace_path?: string | null;
   response_path?: string | null;
   deduplicated_count?: number;
+  details_pruned_at?: string | null;
   request_snapshot?: string | null;
   response_snapshot?: string | null;
   runner_id?: string | null;
@@ -761,6 +762,7 @@ export interface SettingsValues {
   browser_proxy: string;
   browser_viewport: string;
   run_retention_days: number;
+  run_detail_retention_days: number;
   screenshot_retention_days: number;
   trace_retention_days: number;
   response_retention_days: number;

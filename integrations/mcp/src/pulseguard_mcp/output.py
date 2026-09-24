@@ -13,7 +13,8 @@ CHECK_FIELDS = (
 RUN_FIELDS = (
     "id", "project_id", "check_id", "check_name", "check_type", "status", "failure_kind", "trigger",
     "observation_kind", "affects_health", "started_at", "finished_at", "duration_ms", "error_message",
-    "notification_status", "runner_id", "runner_name", "run_group_id", "browser_type",
+    "notification_status", "notification_error", "notification_sent_at", "runner_id", "runner_name", "run_group_id", "browser_type",
+    "details_pruned_at", "deduplicated_count",
 )
 SECRET_KEY = re.compile(r"authorization|cookie|password|passwd|secret|token|api[-_]?key|webhook", re.I)
 URL = re.compile(r"https?://[^\s<>\"']+", re.I)

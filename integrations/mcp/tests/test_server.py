@@ -81,7 +81,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             async with Client(create_server(settings), raise_exceptions=True) as client:
                 tools = {tool.name: tool for tool in (await client.list_tools()).tools}
             self.assertEqual("run_check" in tools, enabled)
-            self.assertEqual(len(tools), 10 if enabled else 9)
+            self.assertEqual(len(tools), 19 if enabled else 15)
             self.assertTrue(tools["get_run"].annotations.read_only_hint)
             self.assertIn("project_id", tools["get_run"].input_schema["required"])
             if enabled:
@@ -185,6 +185,72 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         result, requests = await self.invoke("run_check", {"project_id": 1, "check_id": 10})
         self.assertTrue(result.is_error)
         self.assertEqual(requests, [])
+
+    async def test_independent_platform_execution_and_configuration_capabilities(self):
+        for execution, configuration, platform in ((False, False, False), (True, False, False),
+                                                    (False, True, False), (False, False, True)):
+            settings = replace(SETTINGS, allow_execution=execution, allow_configuration=configuration, allow_platform_read=platform)
+            async with Client(create_server(settings), raise_exceptions=True) as client:
+                names = {tool.name for tool in (await client.list_tools()).tools}
+            self.assertEqual("set_check_enabled" in names, configuration)
+            self.assertEqual("confirm_recovery" in names, execution)
+            self.assertEqual("list_runners" in names, platform)
+            self.assertEqual("get_platform_status" in names, platform)
+
+    async def test_expanded_filters_and_retained_record_warning(self):
+        result, requests = await self.invoke("list_runs", {
+            "project_id": 1, "check_type": "api", "status": "preparation_failed",
+            "start": "2026-07-01T00:00:00+08:00", "end": "2026-10-01T00:00:00+08:00",
+            "runner_id": "edge", "observation_kind": "observation", "trigger": "scheduled", "run_group_id": "rg-1",
+        }, handler=lambda _: httpx.Response(200, json={"items": [], "page": 1, "page_size": 20, "total": 0}))
+        self.assertFalse(result.is_error)
+        self.assertEqual(requests[0].url.params["type"], "api")
+        self.assertEqual(requests[0].url.params["runner_id"], "edge")
+        self.assertEqual(result.structured_content["coverage"], "retained_records_only")
+        invalid, calls = await self.invoke("list_runs", {"project_id": 1, "start": "2026-07-01"})
+        self.assertTrue(invalid.is_error)
+        self.assertEqual(calls, [])
+
+    async def test_historical_statistics_preserve_incompleteness_and_scope(self):
+        args = {"project_id": 1, "start": "2026-07-01T00:00:00+08:00", "end": "2026-10-01T00:00:00+08:00"}
+        payload = {"project_id": 1, "total": 12, "sources": {"retained": 2, "archived": 10},
+                   "coverage": {"complete": False}, "warnings": ["Legacy gap"]}
+        result, calls = await self.invoke("get_run_statistics", args, handler=lambda _: httpx.Response(200, json=payload))
+        self.assertEqual(result.structured_content, payload)
+        self.assertEqual(calls[0].url.path, "/api/run-statistics")
+        denied, calls = await self.invoke("get_run_statistics", {**args, "project_id": 2})
+        self.assertTrue(denied.is_error)
+        self.assertEqual(calls, [])
+        crossed, _ = await self.invoke("get_run_statistics", args, handler=lambda _: httpx.Response(200, json={**payload, "project_id": 2}))
+        self.assertTrue(crossed.is_error)
+
+    async def test_configuration_cannot_be_enabled_by_execution_permission(self):
+        args = {"project_id": 1, "check_id": 10, "enabled": False}
+        denied, calls = await self.invoke("set_check_enabled", args, settings=replace(SETTINGS, allow_execution=True))
+        self.assertTrue(denied.is_error)
+        self.assertEqual(calls, [])
+        result, calls = await self.invoke("set_check_enabled", args, settings=replace(SETTINGS, allow_configuration=True),
+            handler=lambda _: httpx.Response(200, json={"id": 10, "project_id": 1, "enabled": False, "script": "private"}))
+        self.assertFalse(result.is_error)
+        self.assertEqual(calls[0].url.path, "/api/checks/10/disable")
+        self.assertNotIn("private", str(result))
+        failed, calls = await self.invoke("set_check_enabled", args, settings=replace(SETTINGS, allow_configuration=True),
+            handler=lambda _: httpx.Response(503, json={}))
+        self.assertTrue(failed.is_error)
+        self.assertIn("Configuration outcome unknown", str(failed))
+        self.assertEqual(len(calls), 1)
+
+    async def test_new_read_outputs_do_not_expose_global_audit_or_runner_secrets(self):
+        events = [{"id": 1, "project_id": None, "summary": "global-private"},
+                  {"id": 2, "project_id": 1, "summary": "changed", "payload": "raw-private"}]
+        result, _ = await self.invoke("list_audit_events", {"project_id": 1}, handler=lambda _: httpx.Response(200, json=events))
+        self.assertEqual(len(result.structured_content["items"]), 1)
+        self.assertNotIn("private", str(result))
+        result, _ = await self.invoke("list_runners", settings=replace(SETTINGS, allow_platform_read=True),
+            handler=lambda _: httpx.Response(200, json=[{"id": "local", "available": True,
+                "available_browser_types": ["chromium"], "token": "private", "metadata": {"command": "private"}}]))
+        self.assertTrue(result.structured_content["items"][0]["available"])
+        self.assertNotIn("private", str(result))
 
     async def test_execution_distinguishes_probe_failure_from_tool_failure(self):
         for status in ("ok", "failed", "skipped", "timeout"):

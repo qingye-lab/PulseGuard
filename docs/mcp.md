@@ -32,7 +32,9 @@ uv sync --locked --project integrations/mcp
       "env": {
         "PULSEGUARD_MCP_BASE_URL": "http://127.0.0.1:8787",
         "PULSEGUARD_MCP_PROJECT_IDS": "1",
-        "PULSEGUARD_MCP_ALLOW_EXECUTION": "false"
+        "PULSEGUARD_MCP_ALLOW_EXECUTION": "false",
+        "PULSEGUARD_MCP_ALLOW_CONFIGURATION": "false",
+        "PULSEGUARD_MCP_ALLOW_PLATFORM_READ": "false"
       }
     }
   }
@@ -41,7 +43,7 @@ uv sync --locked --project integrations/mcp
 
 首次连接后调用 `health`、`list_projects`、`list_checks`。需要执行能力时，由连接的
 管理者把 `PULSEGUARD_MCP_ALLOW_EXECUTION` 改为 `true` 并重启连接；工具列表才会增加
-`run_check`。查询和排障可以在默认只读配置下完成。
+`run_check` 和 `confirm_recovery`。任务启停与平台诊断有独立开关，查询和排障可以在默认项目只读配置下完成。
 
 ## 进程配置
 
@@ -50,6 +52,8 @@ uv sync --locked --project integrations/mcp
 | `PULSEGUARD_MCP_BASE_URL` | `http://127.0.0.1:8787`；服务根地址，可带反向代理路径前缀，不带 `/api` |
 | `PULSEGUARD_MCP_PROJECT_IDS` | 必填，逗号分隔的正整数；只有管理者明确配置 `*` 时允许所有项目 |
 | `PULSEGUARD_MCP_ALLOW_EXECUTION` | `false`；仅接受 `true` 或 `false` |
+| `PULSEGUARD_MCP_ALLOW_CONFIGURATION` | `false`；任务启停及预览/创建/编辑/版本恢复，不授予立即执行能力 |
+| `PULSEGUARD_MCP_ALLOW_PLATFORM_READ` | `false`；允许跨项目共享的平台/节点状态查询，与项目范围独立 |
 | `PULSEGUARD_MCP_API_TOKEN` | 可选，作为 Bearer 传给上游鉴权网关；不是 PulseGuard 只读快照 Token 或 Worker Token |
 | `PULSEGUARD_MCP_REQUEST_TIMEOUT` | 读取响应的超时秒数，默认 30，范围 1–120 |
 | `PULSEGUARD_MCP_EXECUTION_TIMEOUT` | 执行响应的超时秒数，默认 300，范围 1–1800 |
@@ -65,7 +69,7 @@ HTTPS；Token 不放进 URL、命令参数或提交到仓库的配置文件。
 鉴权网关保护。`PULSEGUARD_MCP_API_TOKEN` 仅在网关实际验证它时有效，不会凭空使后端
 具备认证。不要把本实现作为直接公开管理 API 的理由。
 
-## 首版工具
+## 工具
 
 工具名的客户端前缀可能不同，以下为协议中的原始名称。
 
@@ -73,14 +77,84 @@ HTTPS；Token 不放进 URL、命令参数或提交到仓库的配置文件。
 | --- | --- |
 | `health` | 服务可达性、项目范围和执行开关；不代表监测目标健康 |
 | `list_projects` | 分页返回进程范围内的项目 ID、名称和状态 |
-| `list_checks` | 按项目、类型、完整标签和启用状态筛选，提供分页 |
+| `list_checks` | 按项目、类型、完整标签、启用状态、任务名称和监控状态筛选，提供分页 |
 | `get_check` | 任务元信息、访问地址和健康状态，省略脚本、请求头和密钥配置 |
-| `list_runs` | 按项目、任务和状态分页读取运行记录；`failed` 包含失败和超时 |
+| `list_runs` | 按项目、任务、状态、时间、类型、来源、节点、触发方式、运行组、通知状态和名称分页；`failed` 包含失败和超时；total 只数保留记录 |
 | `get_run` | 运行结果、失败来源和产物是否存在，可按需读取有长度限制的日志 |
 | `get_failure_summary` | 服务端失败摘要、诊断信号与下一步 |
 | `compare_success` | 对比该任务最近成功运行；无基线时返回 `available=false` |
 | `get_screenshot` | 根据项目内的运行记录读取其 PNG 图片，最大 8 MiB |
 | `run_check` | 配置启用后出现；执行一个已有任务并等待返回 |
+| `get_project_overview` | 项目当前健康状态、过期/未知任务和近期失败 |
+| `get_run_statistics` | 指定时间的执行数，按类型/状态/日期分组，附归档来源与完整性说明 |
+| `get_monitoring_trends` | 健康观测成功率和耗时，不是全执行次数 |
+| `list_incidents` | 项目异常周期与恢复时间，限量列表 |
+| `list_audit_events` | 项目变更摘要，省略全局事件和原始配置 payload |
+| `confirm_recovery` | 执行开关控制；实际执行恢复确认，可能影响健康与告警 |
+| `set_check_enabled` | 配置开关控制；启用/停用已有任务 |
+| `get_platform_status` | 平台只读开关控制；实例调度、队列与数据库压力 |
+| `list_runners` | 平台只读开关控制；节点状态和浏览器能力，不导出 Token 或部署命令 |
+| `get_execution_batch` | 按批次 ID 或幂等键查询持久化回执、各项状态及关联运行 |
+| `submit_execution_batch` / `cancel_execution_batch` | 执行开关控制；幂等提交最多100项，取消未派发项 |
+| `get_check_edit_schema` / `get_check_edit_context` | 配置开关控制；完整字段 schema、现有任务哈希及非敏感上下文 |
+| `list_check_versions` | 配置开关控制；历史版本元数据，不导出原始配置 |
+| `preview_check_change` / `get_check_change` | 配置开关控制；静态验证创建/编辑/恢复，查询预览与应用回执 |
+| `apply_check_change` / `cancel_check_change` | 配置开关控制；应用已确认预览或丢弃未应用预览 |
+
+默认 15 个只读工具；仅启用执行后 19 个；三个开关全开时 29 个。
+平台工具不接受 project_id：它们有意提供实例级状态，不能认为项目白名单已将其隔离。
+不提供任意 HTTP/SQL/Shell、任务删除、平台密钥编辑或部署。任务定义覆盖 CheckCreate 的全部字段；
+原有敏感正文不导出，通过部分字段更新保留，或以用户提供的新内容替换。
+
+### 持久化批次与完整任务编辑
+
+批次 API：POST `/api/execution-batches`（idempotency_key + check_ids），GET 同路径按
+idempotency_key 查回执，GET `/{batch_id}`，POST `/{batch_id}/cancel`。
+项目和键唯一；同键不同集合返回409，相同集合返回原回执。全局最多1000待处理项，2个派发协程复用
+现有 CheckRunner，节点/浏览器扇出仍由它负责；任务定义在派发前校验，变化则 rejected。
+回执保留轻量最终状态、代表运行 ID 和可查询的关联 run_ids/trigger，不重复保存日志。
+重启只继续 queued，running 标为 unknown，不自动重试。取消只将 queued 改为 cancelled。
+finished 不等于通过，需查看逐项 result_status。请求幂等不代表目标系统副作用 exactly-once，
+也不是锁定项目变量/公共方法历史快照的重放。部署/数据库维护期间暂停派发。
+
+编辑 API：GET `/api/check-edit-schema`、`/api/checks/{id}/edit-context`；POST
+`/api/check-changes/preview` 接受 changes、可选 check_id/expected_hash/version_id。
+创建默认 enabled=false，更新是部分字段合并，恢复必须指定本任务版本且 changes 为空。
+预览持久化30分钟、最多100个待确认项；不执行用户脚本，检查模型约束、浏览器可用配置及 Python 语法。
+GET `/api/check-changes/{id}` 查询；POST `/{id}/apply` 带 expected_digest，在同一写事务内校验
+当前定义哈希、保存配置、版本和审计并记录回执。相同预览重复应用不会创建重复任务或版本，且会修复
+可能遗漏的调度同步。POST `/{id}/cancel` 只丢弃 pending。应用后删除候选正文，过期候选在启动/清理/
+下一次预览时清除；历史版本沿用既有存储策略。
+
+MCP 不导出脚本/Headers/Body/断言/告警原文；预览会标记这些字段变更但省略正文，不可将标记回填。
+静态验证不等于运行验证。启用任务会产生后续调度，必须属于用户授权范围。
+数据库恢复会取消快照里的 queued 和 pending 预览、将 running 标未知，避免快照重放；恢复前后
+幂等账本可能回退，操作者仍须核对目标侧效果。回执不自动清理，以免键被复用；大量自动化调用时需评估增长。
+
+### 执行统计与保留边界
+
+`GET /api/run-statistics`（对应 MCP `get_run_statistics`）使用必填的显式时区 start/end，
+区间 `[start,end)`，最长 3660 天。日期分组与旧日归档使用服务端本地时区；响应返回转换后的
+边界与时区。查询依次读取 runs 和 run_archives 的同一 SQLite 只读快照，清理归档也在单个
+事务内移动计数，避免重复计入或遗漏。`total` 包含 pending/running/skipped/preparation_failed，
+只统计 check_id>0 的任务记录；`executed_terminal_count` 只包含 ok/failed/timeout。
+
+归档仅有日/项目/类型/状态粒度。任务、节点、observation_kind 或日内边界无法从归档精确恢复，
+不兼容部分不会计入，返回 excluded_archive_count 与 warnings。策略启用前历史、旧版同错合并
+和缺失数据均不能声称完整；不把没有时间戳的 deduplicated_count 分摊或再次计数。
+`coverage.complete` 表示当前保留/归档策略下可覆盖请求，并非对人工删除或外部导入完整性的证明。
+跨项目统计应逐一查询获准访问的项目并说明覆盖范围，不是跨项目原子快照。
+
+`list_runs` 时间范围沿用 `[start,end]`，显式时区由服务端转换后筛选；其 total 不包含归档。
+`get_monitoring_trends` 仅计算健康观测，排除节点失败和跳过，桶边界可能超出请求时刻。
+
+轻量执行记录默认保留 365 天（可设 1–3650），日志/调用栈/请求响应快照默认 30 天（1–365）。
+旧实例升级时将原记录期限沿用为详情期限，并将轻量期限提升至至少 365 天；后续启动不覆盖
+用户设置。详情期限不超过轻量期限。同错策略只清理多余详情，不再删除执行行。
+截图、Trace、Response Body 文件仍按各自期限清理；`details_pruned_at` 标明日志/快照已清理，
+不能据此推断附件一定不存在。轻量行到期后沿用日归档，旧版已删除明细无法补回。
+SQLite 清理后空闲页可复用，但数据库文件不保证立刻缩小，不自动执行 VACUUM。
+新的统计端点需要相应服务端版本；旧服务端返回不支持时不会降级伪造全历史统计。
 
 所有项目工具必须传正整数 `project_id`；查询不在配置范围内的项目会在发出 HTTP
 请求前拒绝。上游 API 继续验证资源归属。每页最多 100 条。上游目前不支持任务列表
@@ -96,6 +170,10 @@ JSON 文本输出会省略非必要字段、遮盖已知敏感字段与 URL 查�
 `run_check` 复用现有 `POST /api/checks/{check_id}/run`，会执行当前保存的任务定义。
 这是正式观测：可以运行用户脚本、向目标发送有副作用的请求、改变健康状态并发送告警。
 首版不提供独立验证模式，不修改现有服务端触发来源（记录仍为 `manual`）。
+
+`confirm_recovery` 复用恢复确认接口，亦需执行授权。`set_check_enabled` 复用任务启停接口，
+必须单独启用配置权限且得到用户对应授权；结果未知时先用 get_check 核对状态，不自动重试。
+单次 run_check/confirm_recovery 仍不幂等；可靠重复提交请使用上面的持久化批次与配置预览接口。
 
 成功调用工具与探活通过是两件事。正常返回中 `passed` 仅在运行状态为 `ok` 时为
 `true`；`failed`、`timeout`、`skipped` 均为 `false`。权限、网络、响应格式等工具错误
@@ -141,4 +219,5 @@ uv build --project integrations/mcp
 `PULSEGUARD_TEST_BACKEND_PYTHON` 指定已安装后端依赖的 Python 解释器。
 
 协议实现采用 [官方 MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)。
-设计边界见 [决策记录](./decisions/2026-09-09-skill-mcp.md)。
+设计边界见 [初始决策](./decisions/2026-09-09-skill-mcp.md) 和
+[运营能力与分层保留决策](./decisions/2026-09-24-mcp-run-history.md)。

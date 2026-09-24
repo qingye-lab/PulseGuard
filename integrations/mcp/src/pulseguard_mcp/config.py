@@ -14,6 +14,8 @@ class Settings:
     api_token: str = field(default="", repr=False)
     request_timeout: int = 30
     execution_timeout: int = 300
+    allow_configuration: bool = False
+    allow_platform_read: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -47,6 +49,12 @@ class Settings:
         execution = env.get("PULSEGUARD_MCP_ALLOW_EXECUTION", "false").strip().lower()
         if execution not in {"true", "false"}:
             raise ValueError("PULSEGUARD_MCP_ALLOW_EXECUTION must be true or false")
+        flags = {}
+        for name in ("ALLOW_CONFIGURATION", "ALLOW_PLATFORM_READ"):
+            value = env.get("PULSEGUARD_MCP_" + name, "false").strip().lower()
+            if value not in {"true", "false"}:
+                raise ValueError("PULSEGUARD_MCP_" + name + " must be true or false")
+            flags[name] = value == "true"
         token = env.get("PULSEGUARD_MCP_API_TOKEN", "").strip()
         if "\r" in token or "\n" in token:
             raise ValueError("PULSEGUARD_MCP_API_TOKEN must be a single line")
@@ -56,6 +64,8 @@ class Settings:
             base_url=base_url, project_ids=scope, allow_execution=execution == "true", api_token=token,
             request_timeout=_seconds(env, "PULSEGUARD_MCP_REQUEST_TIMEOUT", 30, 120),
             execution_timeout=_seconds(env, "PULSEGUARD_MCP_EXECUTION_TIMEOUT", 300, 1800),
+            allow_configuration=flags["ALLOW_CONFIGURATION"],
+            allow_platform_read=flags["ALLOW_PLATFORM_READ"],
         )
 
 

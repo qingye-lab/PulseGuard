@@ -679,10 +679,11 @@ class RepeatedFailureCompactionTests(unittest.TestCase):
             runs = storage.list_runs({"check_id": int(check["id"])}, limit=10)
             latest = storage.get_run(created_ids[-1])
 
-            self.assertEqual([run["id"] for run in runs], list(reversed(created_ids[-3:])))
+            self.assertEqual([run["id"] for run in runs], list(reversed(created_ids)))
             assert latest is not None
-            self.assertEqual(latest["deduplicated_count"], 2)
+            self.assertEqual(latest["deduplicated_count"], 0)
             for run_id in created_ids[:2]:
+                self.assertIsNotNone(storage.get_run(run_id)["details_pruned_at"])
                 self.assertTrue(all(not path.exists() for path in artifact_paths[run_id]))
             for run_id in created_ids[-3:]:
                 self.assertTrue(all(path.exists() for path in artifact_paths[run_id]))

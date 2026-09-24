@@ -14,12 +14,14 @@ from pydantic import Field
 from .client import ApiError, PulseGuardClient
 from .config import Settings
 from .output import CHECK_FIELDS, project_fields, run_summary, sanitize
+from .operations import register_operations, validate_dates
+from .workflows import register_workflows
 
 
 PositiveId = Annotated[int, Field(gt=0, strict=True)]
 PageSize = Annotated[int, Field(ge=1, le=100, strict=True)]
 CheckType = Literal["api", "ui"]
-RunStatus = Literal["ok", "failed", "timeout", "skipped", "running", "pending"]
+RunStatus = Literal["ok", "failed", "timeout", "skipped", "running", "pending", "preparation_failed"]
 READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 EXECUTE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True)
 
@@ -66,6 +68,8 @@ def create_server(settings: Settings, api: PulseGuardClient | None = None) -> MC
             "service": clean(project_fields(result, ("status", "version", "node_role"))),
             "project_scope": "*" if settings.project_ids is None else sorted(settings.project_ids),
             "execution_enabled": settings.allow_execution,
+            "configuration_enabled": settings.allow_configuration,
+            "platform_read_enabled": settings.allow_platform_read,
         }
 
     @server.tool(annotations=READ)
@@ -86,6 +90,8 @@ def create_server(settings: Settings, api: PulseGuardClient | None = None) -> MC
         project_id: PositiveId, check_type: CheckType | None = None,
         tag: Annotated[str, Field(max_length=100)] = "", enabled_only: bool = False,
         page: PositiveId = 1, page_size: PageSize = 20,
+        q: Annotated[str, Field(max_length=200)] = "",
+        monitor_status: Annotated[str, Field(max_length=50)] = "",
     ) -> dict[str, Any]:
         """List task metadata and health in one project. Tag matches one whole token, case-insensitively."""
         tag = tag.strip().lower()
@@ -98,6 +104,8 @@ def create_server(settings: Settings, api: PulseGuardClient | None = None) -> MC
         checks = [
             item for item in checks if (not enabled_only or item.get("enabled"))
             and (not tag or tag in re.split(r"[\s,]+", str(item.get("tags") or "").lower()))
+            and (not q or q.casefold() in str(item.get("name") or "").casefold())
+            and (not monitor_status or item.get("monitor_status") == monitor_status)
         ]
         start = (page - 1) * page_size
         return clean({
@@ -117,14 +125,28 @@ def create_server(settings: Settings, api: PulseGuardClient | None = None) -> MC
     async def list_runs(
         project_id: PositiveId, check_id: PositiveId | None = None, status: RunStatus | None = None,
         page: PositiveId = 1, page_size: PageSize = 20,
+        start: str | None = None, end: str | None = None, check_type: CheckType | None = None,
+        observation_kind: Literal["observation", "verification", "draft"] | None = None,
+        runner_id: Annotated[str, Field(max_length=200)] = "",
+        trigger: Annotated[str, Field(max_length=100)] = "",
+        run_group_id: Annotated[str, Field(max_length=200)] = "",
+        notification_status: Annotated[str, Field(max_length=50)] = "",
+        q: Annotated[str, Field(max_length=200)] = "",
     ) -> dict[str, Any]:
-        """Page through recorded runs, newest first. 'failed' follows the API and includes failures and timeouts."""
+        """Retained records only, NOT lifetime totals. 'failed' includes timeouts. start/end are inclusive.
+        Use get_run_statistics for historical totals and archive coverage. Pruned rows retain status, not full evidence.
+        """
+        validate_dates(start, end)
         result = await request("GET", "/api/runs-page", project_id=project_id, params={
             "check_id": check_id, "status": status, "page": page, "page_size": page_size,
+            "start": start, "end": end, "type": check_type, "observation_kind": observation_kind,
+            "runner_id": runner_id, "trigger": trigger, "run_group_id": run_group_id,
+            "notification_status": notification_status, "q": q,
         })
         return clean({
             "items": [run_summary(owned(item, project_id)) for item in result["items"]],
             "total": result["total"], "page": result["page"], "page_size": result["page_size"],
+            "coverage": "retained_records_only", "interval": "[start,end]",
         })
 
     @server.tool(annotations=READ)
@@ -180,6 +202,8 @@ def create_server(settings: Settings, api: PulseGuardClient | None = None) -> MC
                 "run": run_summary(result),
             })
 
+    register_operations(server, settings, request, clean, owned, READ, EXECUTE)
+    register_workflows(server, settings, request, clean, owned, READ, EXECUTE)
     return server
 
 

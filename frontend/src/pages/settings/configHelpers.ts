@@ -126,6 +126,7 @@ export function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
   };
   const retention = {
     run_retention_days: values.run_retention_days,
+    run_detail_retention_days: values.run_detail_retention_days,
     screenshot_retention_days: values.screenshot_retention_days,
     trace_retention_days: values.trace_retention_days,
     response_retention_days: values.response_retention_days,

@@ -9,7 +9,7 @@ import secrets
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -145,18 +145,24 @@ async def lifespan(app: FastAPI):
     background_tasks: set[asyncio.Task[Any]] = set()
     app.state.background_tasks = background_tasks
     scheduler = None
+    batch_executor = None
     try:
         _track_background_task(app, _sync_enabled_browser_type_installation(storage.get_settings()))
         if NODE_ROLE != "worker":
             scheduler = PulseScheduler(runner)
             app.state.scheduler = scheduler
             scheduler.start()
+            from .automation_jobs import BatchExecutor
+            batch_executor = BatchExecutor(runner)
+            batch_executor.start()
             _track_background_task(app, _runner_health_poll_loop())
         else:
             app.state.scheduler = None
             _log_worker_startup_info()
         yield
     finally:
+        if batch_executor is not None:
+            await batch_executor.stop()
         await _cancel_background_tasks(background_tasks)
         await shutdown_browser_installation()
         if scheduler is not None:
@@ -1457,6 +1463,23 @@ def runs_page(
     )
 
 
+@app.get("/api/run-statistics")
+def run_statistics(
+    start: str, end: str,
+    type: Literal["ui", "api"] | None = None,
+    observation_kind: Literal["observation", "verification", "draft"] | None = None,
+    check_id: int | None = Query(default=None, gt=0), runner_id: str | None = None,
+    include_archived: bool = True, project_id: int = Depends(_project_context),
+) -> dict[str, Any]:
+    from .run_statistics import get_run_statistics
+    try:
+        return get_run_statistics(project_id, start, end, check_type=type,
+                                  observation_kind=observation_kind, check_id=check_id,
+                                  runner_id=runner_id, include_archived=include_archived)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/runs/{run_id}")
 def run_detail(run_id: int, project_id: int = Depends(_project_context)) -> dict[str, Any]:
     run = storage.get_run(run_id, project_id=project_id)
@@ -2474,6 +2497,10 @@ async def sqlite_operational_error_handler(_: Request, exc: sqlite3.OperationalE
     else:
         detail = "数据库操作失败"
     return JSONResponse(status_code=503, content={"detail": detail})
+
+
+from .automation_routes import register as register_automation_routes
+register_automation_routes(app, _project_context, _active_project_context, _validated_check_data)
 
 
 @app.get("/")

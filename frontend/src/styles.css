@@ -6035,6 +6035,10 @@ tr:last-child td {
     grid-template-columns: 212px minmax(0, 1fr);
   }
 
+  .settings-system-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .monitoring-header-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

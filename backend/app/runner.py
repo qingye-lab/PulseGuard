@@ -188,11 +188,16 @@ class CheckRunner:
         self._refresh_local_runner_browser_capabilities(settings)
 
     async def run_check(
-        self, check_id: int, trigger: str = "scheduled", project_id: int | None = None
+        self, check_id: int, trigger: str = "scheduled", project_id: int | None = None,
+        *, expected_definition_hash: str | None = None,
     ) -> dict[str, Any]:
         check = storage.get_check(check_id, project_id=project_id)
         if not check:
             raise ValueError("任务不存在")
+        if expected_definition_hash is not None:
+            from .automation_jobs import definition_hash, DispatchRejected
+            if not check.get("enabled") or definition_hash(check) != expected_definition_hash:
+                raise DispatchRejected("任务配置或启停状态已变化，批次未执行此任务")
         project = storage.get_project(int(check["project_id"]))
         if not project or project.get("status") != "active":
             raise ValueError("归档项目不能执行任务")

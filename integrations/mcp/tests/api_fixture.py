@@ -28,6 +28,8 @@ def main() -> None:
     from backend.app import storage
     from backend.app.main import app
     from backend.app.runner import CheckRunner
+    from backend.app.scheduler import PulseScheduler
+    from backend.app.automation_jobs import BatchExecutor
     from backend.app.schemas import CheckCreate
 
     storage.init_db()
@@ -62,6 +64,9 @@ def main() -> None:
         runner = CheckRunner()
         await runner.start()
         app.state.runner = runner
+        app.state.scheduler = PulseScheduler(runner)  # Not started; no scheduled target requests.
+        batches = BatchExecutor(runner)
+        batches.start()
         # Exercise real API, storage and runner; omit unrelated scheduler/node pollers.
         try:
             (root / "ready.json").write_text(json.dumps({
@@ -70,6 +75,7 @@ def main() -> None:
             }), encoding="utf-8")
             yield
         finally:
+            await batches.stop()
             await runner.shutdown()
 
     app.router.lifespan_context = lifespan

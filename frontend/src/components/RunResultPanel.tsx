@@ -215,6 +215,7 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true, 
           </Descriptions.Item>
           {!compactNodeDetail && <Descriptions.Item label="任务 ID">{isDraftRun ? "草稿调试" : run.check_id}</Descriptions.Item>}
           <Descriptions.Item label="运行记录">#{run.id}</Descriptions.Item>
+          {run.details_pruned_at && <Descriptions.Item label="详情保留" span="filled">已清理日志与请求响应详情 · {formatDate(run.details_pruned_at)}</Descriptions.Item>}
           {!compactNodeDetail && run.run_group_id && <Descriptions.Item label="运行分组">{run.run_group_id}</Descriptions.Item>}
           <Descriptions.Item label="开始时间">{formatDate(run.started_at)}</Descriptions.Item>
           <Descriptions.Item label="结束时间">{formatDate(run.finished_at)}</Descriptions.Item>

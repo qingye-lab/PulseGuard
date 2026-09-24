@@ -44,6 +44,8 @@ def build_failure_summary(
         "check_name": run.get("check_name"),
         "status": status,
         "failure_kind": failure_kind,
+        "details_pruned_at": run.get("details_pruned_at"),
+        "evidence_available": not bool(run.get("details_pruned_at")),
         "summary": summary,
         "signals": signals,
         "next_steps": next_steps,

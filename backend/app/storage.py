@@ -182,6 +182,7 @@ RUN_SUMMARY_COLUMNS = (
     "response_path",
     "failure_fingerprint",
     "deduplicated_count",
+    "details_pruned_at",
     "runner_id",
     "runner_name",
     "runner_address",
@@ -252,7 +253,7 @@ LIBRARY_PROJECT_TABLES = (
     "script_library_validation_checks",
     "script_library_validation_meta",
 )
-ALL_PROJECT_SCOPED_TABLES = (*PROJECT_SCOPED_TABLES, *LIBRARY_PROJECT_TABLES)
+ALL_PROJECT_SCOPED_TABLES = (*PROJECT_SCOPED_TABLES, *LIBRARY_PROJECT_TABLES, "execution_batches", "check_change_drafts")
 
 
 def now_iso() -> str:
@@ -980,6 +981,11 @@ def _init_db() -> None:
             "INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (?, ?)",
             (SCRIPT_LIBRARY_SCHEMA_VERSION, now_iso()),
         )
+        _migrate_run_retention(conn)
+        from .automation_jobs import init_schema as init_batch_schema
+        from .check_changes import init_schema as init_change_schema
+        init_batch_schema(conn)
+        init_change_schema(conn)
         _ensure_default_settings(conn)
         _migrate_read_only_tokens(conn)
         _ensure_local_probe_runner(conn)
@@ -3023,15 +3029,15 @@ def _compact_repeated_failure_runs(conn: sqlite3.Connection, current: sqlite3.Ro
     rows = conn.execute(
         """
         SELECT id, status, error_message, failure_kind, failure_fingerprint,
-               deduplicated_count, screenshot_path, trace_path, response_path
+               details_pruned_at, screenshot_path, trace_path, response_path
         FROM runs INDEXED BY idx_runs_check_id_desc
         WHERE check_id = ?
           AND id <= ?
           AND observation_kind = 'observation'
           AND affects_health = 1
-        ORDER BY id DESC
+        ORDER BY id DESC LIMIT ?
         """,
-        (check_id, current_id),
+        (check_id, current_id, retention + 1),
     ).fetchall()
 
     matching_tail: list[sqlite3.Row] = []
@@ -3042,56 +3048,16 @@ def _compact_repeated_failure_runs(conn: sqlite3.Connection, current: sqlite3.Ro
     if len(matching_tail) <= retention:
         return []
 
-    victims = matching_tail[retention:]
-    victim_ids = [int(row["id"]) for row in victims]
-    rolled_deduplicated_count = sum(int(row["deduplicated_count"] or 0) for row in matching_tail[1:])
-    removed_count = len(victims) + rolled_deduplicated_count
+    # Preserve each execution's identity and counters; only redundant evidence expires.
+    victims = [row for row in matching_tail[retention:] if not row["details_pruned_at"]]
     artifact_paths = [
         path
         for row in victims
         for path in (row["screenshot_path"], row["trace_path"], row["response_path"])
         if path
     ]
-    placeholders = ", ".join("?" for _ in victim_ids)
-    conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", victim_ids)
-    conn.execute(
-        f"""
-        UPDATE check_status
-        SET last_run_id = CASE WHEN last_run_id IN ({placeholders}) THEN NULL ELSE last_run_id END,
-            last_scheduled_run_id = CASE WHEN last_scheduled_run_id IN ({placeholders}) THEN NULL ELSE last_scheduled_run_id END
-        WHERE last_run_id IN ({placeholders}) OR last_scheduled_run_id IN ({placeholders})
-        """,
-        [*victim_ids, *victim_ids, *victim_ids, *victim_ids],
-    )
-    kept_ids = [int(row["id"]) for row in matching_tail[:retention]]
-    if kept_ids:
-        oldest_kept_id = kept_ids[-1]
-        newest_kept_id = kept_ids[0]
-        conn.execute(
-            f"""
-            UPDATE anomaly_cycles
-            SET first_run_id = CASE WHEN first_run_id IN ({placeholders}) THEN ? ELSE first_run_id END,
-                last_run_id = CASE WHEN last_run_id IN ({placeholders}) THEN ? ELSE last_run_id END
-            WHERE first_run_id IN ({placeholders}) OR last_run_id IN ({placeholders})
-            """,
-            [*victim_ids, oldest_kept_id, *victim_ids, newest_kept_id, *victim_ids, *victim_ids],
-        )
-    previous_deduplicated_ids = [
-        int(row["id"])
-        for row in matching_tail[1:retention]
-        if int(row["deduplicated_count"] or 0) > 0
-    ]
-    if previous_deduplicated_ids:
-        previous_placeholders = ", ".join("?" for _ in previous_deduplicated_ids)
-        conn.execute(
-            f"UPDATE runs SET deduplicated_count = 0 WHERE id IN ({previous_placeholders})",
-            previous_deduplicated_ids,
-        )
-    if removed_count:
-        conn.execute(
-            "UPDATE runs SET deduplicated_count = COALESCE(deduplicated_count, 0) + ? WHERE id = ?",
-            (removed_count, current_id),
-        )
+    for offset in range(0, len(victims), _CLEANUP_BATCH_SIZE):
+        _prune_run_details(conn, [int(row["id"]) for row in victims[offset:offset + _CLEANUP_BATCH_SIZE]], artifacts=True)
     return artifact_paths
 
 
@@ -4408,11 +4374,21 @@ def _run_filter_clauses(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
         params.append(int(filters["check_id"]))
     if filters.get("start"):
         clauses.append("started_at >= ?")
-        params.append(filters["start"])
+        params.append(_run_time_boundary(filters["start"]))
     if filters.get("end"):
         clauses.append("started_at <= ?")
-        params.append(filters["end"])
+        params.append(_run_time_boundary(filters["end"]))
     return clauses, params
+
+
+def _run_time_boundary(value: str) -> str:
+    # runs uses server-local ISO timestamps. Preserve legacy date-only filters,
+    # but normalize explicit offsets before indexed string comparisons.
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return parsed.astimezone().isoformat() if parsed.tzinfo else value
 
 
 def list_anomaly_cycles(
@@ -4532,6 +4508,8 @@ def _restore_database_backup(filename: str) -> dict[str, Any]:
     try:
         _copy_database(source_path, Path(DB_PATH))
         init_db()
+        from .automation_jobs import invalidate_after_restore
+        invalidate_after_restore()
     except BaseException:
         # Keep the exclusive gate until the original, already initialized state is
         # restored. In particular, never publish a partially migrated database.
@@ -5596,8 +5574,25 @@ def cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
 
 
 def _cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
+    from .check_changes import _expire
+    with _connect() as conn:
+        _expire(conn)
     settings = settings or get_settings()
-    retention_days = int(settings.get("run_retention_days", 30))
+    retention_days = int(settings.get("run_retention_days", DEFAULT_SETTINGS["run_retention_days"]))
+    detail_days = min(retention_days, int(settings.get("run_detail_retention_days", DEFAULT_SETTINGS["run_detail_retention_days"])))
+    detail_cutoff = (datetime.now().astimezone() - timedelta(days=detail_days)).isoformat(timespec="seconds")
+    # The partial index avoids rescanning already compacted history every hour.
+    while True:
+        with _connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            ids = [int(row[0]) for row in conn.execute(
+                """SELECT id FROM runs WHERE details_pruned_at IS NULL AND created_at < ?
+                   AND status IN ('ok', 'failed', 'timeout', 'skipped', 'preparation_failed')
+                   ORDER BY created_at, id LIMIT ?""", (detail_cutoff, _CLEANUP_BATCH_SIZE)
+            )]
+            if not ids:
+                break
+            _prune_run_details(conn, ids)
     cutoff = (datetime.now().astimezone() - timedelta(days=retention_days)).isoformat(timespec="seconds")
     removed_runs = 0
     while True:
@@ -5631,6 +5626,19 @@ def _cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
             for column, paths in removed_artifacts.items():
                 _clear_artifact_paths(conn, column, paths)
     return removed_runs + removed_artifact_count
+
+
+def _prune_run_details(conn: sqlite3.Connection, run_ids: list[int], *, artifacts: bool = False) -> None:
+    if not run_ids:
+        return
+    placeholders = ", ".join("?" for _ in run_ids)
+    artifact_sql = ", screenshot_path = NULL, trace_path = NULL, response_path = NULL" if artifacts else ""
+    conn.execute(
+        f"""UPDATE runs SET logs = NULL, error_stack = NULL, request_snapshot = NULL,
+            response_snapshot = NULL, error_message = substr(error_message, 1, 1000),
+            notification_error = substr(notification_error, 1, 1000), details_pruned_at = ?
+            {artifact_sql} WHERE id IN ({placeholders})""", [now_iso(), *run_ids]
+    )
 
 
 def _archive_runs(conn: sqlite3.Connection, run_ids: list[int]) -> None:
@@ -5793,10 +5801,14 @@ def _ensure_run_columns(conn: sqlite3.Connection) -> None:
         "affects_health": "INTEGER NOT NULL DEFAULT 1",
         "run_group_id": "TEXT",
         "trend_recorded_at": "TEXT",
+        "details_pruned_at": "TEXT",
     }
     for name, column_type in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {column_type}")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_runs_unpruned ON runs(created_at, id)
+                    WHERE details_pruned_at IS NULL
+                    AND status IN ('ok', 'failed', 'timeout', 'skipped', 'preparation_failed')""")
 
 
 def _ensure_trend_rollup_columns(conn: sqlite3.Connection) -> None:
@@ -6004,6 +6016,19 @@ def _ensure_project_alert_settings(conn: sqlite3.Connection, project_id: int) ->
             now_iso(),
         ),
     )
+
+
+def _migrate_run_retention(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS run_history_policy (id INTEGER PRIMARY KEY CHECK(id = 1), installed_at TEXT NOT NULL)")
+    conn.execute("INSERT OR IGNORE INTO run_history_policy(id, installed_at) VALUES (1, ?)", (now_iso(),))
+    if _read_setting_value(conn, "run_detail_retention_days") is not None:
+        return
+    previous = _read_setting_value(conn, "run_retention_days")
+    if previous is not None:
+        conn.execute("INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+                     ("run_detail_retention_days", json.dumps(previous), now_iso()))
+        conn.execute("UPDATE settings SET value = ?, updated_at = ? WHERE key = 'run_retention_days'",
+                     (json.dumps(max(365, int(previous))), now_iso()))
 
 
 def _ensure_default_settings(conn: sqlite3.Connection) -> None:

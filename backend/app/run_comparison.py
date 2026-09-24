@@ -35,6 +35,12 @@ def compare_with_previous_success(run_id: int) -> dict[str, Any]:
             "assertions": [],
         }
 
+    if current.get("details_pruned_at") or baseline.get("details_pruned_at"):
+        return {
+            "available": False, "message": "运行详情已按保留策略清理，无法比较请求和断言",
+            "current_run": _run_summary(current), "baseline_run": _run_summary(baseline),
+            "fields": [], "assertions": [],
+        }
     current_snapshot = _snapshot(current.get("response_snapshot"))
     baseline_snapshot = _snapshot(baseline.get("response_snapshot"))
     current_request = _snapshot(current.get("request_snapshot"))

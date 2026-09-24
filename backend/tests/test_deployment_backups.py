@@ -121,6 +121,19 @@ class DeploymentBackupTests(unittest.TestCase):
             self.complete(old, retention=1)
         self.assertTrue(new.exists())
 
+    def test_repeated_or_backwards_clock_cannot_invert_recovery_point_order(self) -> None:
+        for values in ((100, 100), (100, 50)):
+            with self.subTest(values=values), patch.object(backups.time, "time_ns", side_effect=values):
+                old = self.create()
+                new = self.create()
+            old_stamp = json.loads((old / "manifest.json").read_text())["created_ns"]
+            new_stamp = json.loads((new / "manifest.json").read_text())["created_ns"]
+            self.assertGreater(new_stamp, old_stamp)
+            self.complete(new, retention=1)
+            with self.assertRaisesRegex(ValueError, "newer deployment"):
+                self.complete(old, retention=1)
+            self.assertTrue(new.exists())
+
     def test_locked_root_and_escaping_paths_fail_closed(self) -> None:
         old = self.create()
         self.complete(old)
