@@ -26,7 +26,7 @@ uv sync --locked --project integrations/mcp
       "command": "uv",
       "args": [
         "run", "--locked", "--directory",
-        "C:/Users/Qa/Documents/PulseGuard/integrations/mcp",
+        "D:/project/PulseGuard/integrations/mcp",
         "pulseguard-mcp"
       ],
       "env": {
