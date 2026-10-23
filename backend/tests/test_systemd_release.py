@@ -72,6 +72,37 @@ class SystemdReleaseTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 release.validate_files({name: {}})
 
+    def test_source_changed_during_drain_is_preserved_and_release_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, work = Path(temporary) / 'app', Path(temporary) / 'release'
+            target = root / 'backend/app/example.py'
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b'baseline')
+            candidate = work / 'stage/backend/app/example.py'
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b'candidate')
+            manifest = {'id': 'a' * 32, 'files': {'backend/app/example.py': {
+                'baseline': release.digest(target), 'sha256': release.digest(candidate)}}}
+            stops = 0
+
+            def service(action):
+                nonlocal stops
+                if action == 'stop':
+                    stops += 1
+                    if stops == 1:
+                        target.write_bytes(b'concurrent source change')
+
+            with patch.object(release, 'api', return_value={'database_backup_retention': 2}), \
+                 patch.object(release.deployment_backups, '_manifest'), \
+                 patch.object(release.deployment_backups, 'complete'), \
+                 patch.object(release, 'fingerprint', return_value={}), \
+                 patch.object(release, 'drain'), patch.object(release, 'settle'), \
+                 patch.object(release, 'service', side_effect=service), \
+                 patch.object(release, 'start_services'):
+                with self.assertRaisesRegex(RuntimeError, 'Concurrent source change'):
+                    release.apply(root, work, manifest)
+            self.assertEqual(target.read_bytes(), b'concurrent source change')
+
     def test_console_checks_real_source_and_project_filters(self):
         calls = []
 

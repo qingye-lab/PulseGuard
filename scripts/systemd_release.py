@@ -236,7 +236,7 @@ def apply(root: Path, work: Path, manifest: dict) -> dict:
     # Verify without pruning before any cutover; acceptance remains pending.
     retention = int(api("/api/settings")["database_backup_retention"])
     deployment_backups.complete(backup.parent, manifest["id"], retention, dry_run=True)
-    originals = capture_originals(root, work, manifest["files"])
+    originals = None
     before = fingerprint(root / "data/pulseguard.db")
     protected = {p: digest(root / p) for p in (".env", "data/runner-token.key", "data/relay/relay.key",
                  "data/relay/relay.crt", "data/relay/control-token") if (root / p).exists()}
@@ -246,6 +246,7 @@ def apply(root: Path, work: Path, manifest: dict) -> dict:
         stopped = True
         started = time.monotonic()
         service("stop")
+        originals = capture_originals(root, work, manifest["files"])
         replace_files(root, work, manifest["files"])
         start_services()
         downtime = time.monotonic() - started
@@ -259,7 +260,8 @@ def apply(root: Path, work: Path, manifest: dict) -> dict:
     except BaseException:
         if stopped:
             service("stop")
-            restore_files(root, work, originals)
+            if originals is not None:
+                restore_files(root, work, originals)
             start_services()
         settle(reason)
         raise
