@@ -1486,6 +1486,20 @@ class RunnerStorageTests(unittest.TestCase):
                     (stale_relay_seen_at, first_id),
                 )
             relay_stale = storage.get_probe_runner(first_id)
+            # A transport restart or a killed relay host both land here; the node is
+            # only a failure once the outage outlasts the child reconnect window.
+            with storage._connect() as conn:
+                conn.execute(
+                    "UPDATE probe_runners SET relay_last_seen_at = ? WHERE runner_id = ?",
+                    (
+                        (
+                            datetime.now().astimezone()
+                            - timedelta(seconds=storage.RELAY_UNAVAILABLE_ALERT_GRACE_SECONDS + 1)
+                        ).isoformat(timespec="seconds"),
+                        first_id,
+                    ),
+                )
+            relay_past_grace = storage.get_probe_runner(first_id)
 
             second = storage.provision_probe_runner({"name": "Relay Two", "network_region": "edge"})
             second_id = str(second["runner_id"])
@@ -1504,7 +1518,8 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(relay_stale["status"], "unavailable")
         self.assertFalse(relay_stale["available"])
         self.assertFalse(storage.can_schedule_runner(relay_stale))
-        self.assertTrue(storage.should_notify_probe_runner_unavailable(relay_stale))
+        self.assertFalse(storage.should_notify_probe_runner_unavailable(relay_stale))
+        self.assertTrue(storage.should_notify_probe_runner_unavailable(relay_past_grace))
         self.assertEqual(health_stale["status"], "unhealthy")
         self.assertFalse(health_stale["available"])
         self.assertFalse(storage.can_schedule_runner(health_stale))
@@ -1903,6 +1918,68 @@ class SettingsVariableStorageTests(unittest.TestCase):
         self.assertEqual(preserved["value"], "token-secret-123")
         self.assertEqual(cleared["value"], "")
         self.assertFalse(public["value_set"])
+
+
+class _FlakyDatabaseAccess:
+    """Stand in for the maintenance lock so boot can be tested without a database."""
+
+    def __init__(self, lock_failures: int) -> None:
+        self.lock_failures = lock_failures
+        self.calls = 0
+
+    def exclusive(self) -> object:
+        self.calls += 1
+        locked = self.calls <= self.lock_failures
+
+        class _Gate:
+            def __enter__(self) -> None:
+                if locked:
+                    raise sqlite3.OperationalError("database is locked")
+
+            def __exit__(self, *_exc: object) -> bool:
+                return False
+
+        return _Gate()
+
+
+class InitDbLockRetryTests(unittest.TestCase):
+    """Lock contention at boot must be retried, not exit into a restart loop."""
+
+    def test_a_transient_lock_is_retried_and_the_boot_completes(self) -> None:
+        access = _FlakyDatabaseAccess(2)
+        with patch.object(storage, "_DATABASE_ACCESS", access), patch.object(
+            storage, "_init_db"
+        ) as init_db, patch.object(storage.time_module, "sleep") as sleep, self.assertLogs(
+            storage.logger, level="WARNING"
+        ) as logs:
+            storage.init_db(recover_interrupted=False)
+
+        self.assertEqual(access.calls, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
+        init_db.assert_called_once_with(recover_interrupted=False)
+        self.assertIn("init_db_locked", "\n".join(logs.output))
+
+    def test_a_persistent_lock_gives_up_after_the_retry_budget(self) -> None:
+        access = _FlakyDatabaseAccess(storage.INIT_DB_LOCK_ATTEMPTS)
+        with patch.object(storage, "_DATABASE_ACCESS", access), patch.object(
+            storage, "_init_db"
+        ), patch.object(storage.time_module, "sleep") as sleep:
+            with self.assertRaises(sqlite3.OperationalError):
+                storage.init_db()
+
+        self.assertEqual(access.calls, storage.INIT_DB_LOCK_ATTEMPTS)
+        self.assertEqual(len(sleep.call_args_list), len(storage.INIT_DB_LOCK_BACKOFF_SECONDS))
+
+    def test_an_unrelated_migration_error_fails_without_retrying(self) -> None:
+        access = _FlakyDatabaseAccess(0)
+        with patch.object(storage, "_DATABASE_ACCESS", access), patch.object(
+            storage, "_init_db", side_effect=sqlite3.OperationalError("no such column: run_count")
+        ) as init_db, patch.object(storage.time_module, "sleep") as sleep:
+            with self.assertRaises(sqlite3.OperationalError):
+                storage.init_db()
+
+        self.assertEqual(init_db.call_count, 1)
+        sleep.assert_not_called()
 
 
 def run_payload(status: str, error_message: str | None = None, duration_ms: int = 10) -> dict[str, object]:

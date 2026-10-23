@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from . import storage
+from .async_storage import call as storage_call
 from .schemas import NOTIFICATION_STATUSES
 from .variables import mask_text, resolve_text
 
@@ -33,19 +34,19 @@ async def maybe_notify(
     transition: dict[str, Any],
     group_runs: list[dict[str, Any]] | None = None,
 ) -> None:
-    global_settings = storage.get_settings()
+    global_settings = (await storage_call(storage.get_settings))
     project_id = int(check.get("project_id") or run.get("project_id") or 0)
     if project_id <= 0:
         settings = global_settings
     else:
-        project = storage.get_project(project_id)
+        project = (await storage_call(storage.get_project, project_id))
         if not project or project.get("status") != "active":
-            _record_notification(run, "disabled")
+            (await storage_call(_record_notification, run, "disabled"))
             return
-        project_settings = storage.get_project_alert_settings(project_id)
+        project_settings = (await storage_call(storage.get_project_alert_settings, project_id))
         settings = {**global_settings, **project_settings, "members": global_settings.get("members") or []}
     if not settings.get("alerts_enabled"):
-        _record_notification(run, "disabled")
+        (await storage_call(_record_notification, run, "disabled"))
         return
 
     alert_settings = _resolve_alert_settings(check, settings)
@@ -53,11 +54,11 @@ async def maybe_notify(
     members = _selected_members(alert_settings)
     channels = [_with_channel_mentions(channel, members) for channel in channels]
     if not channels:
-        _record_notification(run, "disabled", error=alert_settings.get("_alert_policy_error"))
+        (await storage_call(_record_notification, run, "disabled", error=alert_settings.get("_alert_policy_error")))
         return
 
     if run["status"] not in ALERTABLE_RUN_STATUSES:
-        _record_notification(run, "not_required")
+        (await storage_call(_record_notification, run, "not_required"))
         return
 
     should_send = False
@@ -79,7 +80,7 @@ async def maybe_notify(
 
     channel_summary = _channels_summary(channels)
     if not should_send:
-        _record_notification(run, "suppressed", channel=channel_summary, error=_suppression_reason(transition, alert_settings))
+        (await storage_call(_record_notification, run, "suppressed", channel=channel_summary, error=_suppression_reason(transition, alert_settings)))
         return
 
     title, text = _format_message(check, run, transition, is_recovery, alert_settings, group_runs=group_runs)
@@ -96,19 +97,19 @@ async def maybe_notify(
 
     sent_at = storage.now_iso() if sent_channels else None
     if failures:
-        _record_notification(
+        (await storage_call(_record_notification,
             run,
             "failed",
             channel=channel_summary,
             error=_delivery_error_summary(failures, settings),
             sent_at=sent_at,
-        )
+        ))
         if sent_at:
-            storage.update_last_notified(int(check["id"]), sent_at)
+            (await storage_call(storage.update_last_notified, int(check["id"]), sent_at))
         return
 
-    _record_notification(run, "sent", channel=channel_summary, sent_at=sent_at)
-    storage.update_last_notified(int(check["id"]), sent_at)
+    (await storage_call(_record_notification, run, "sent", channel=channel_summary, sent_at=sent_at))
+    (await storage_call(storage.update_last_notified, int(check["id"]), sent_at))
 
 
 async def notify_runner_unavailable_if_needed(
@@ -133,14 +134,14 @@ async def notify_runner_unavailable_if_needed(
     _RUNNER_UNAVAILABLE_IN_FLIGHT.add(runner_id)
     try:
         try:
-            latest = storage.get_probe_runner(runner_id)
+            latest = (await storage_call(storage.get_probe_runner, runner_id))
         except Exception:
             latest = None
         if latest is None:
             latest = runner if isinstance(runner, dict) else None
         if not isinstance(latest, dict):
             return {"status": "skipped", "reason": "unknown_runner"}
-        if not storage.should_notify_probe_runner_unavailable(latest):
+        if not (await storage_call(storage.should_notify_probe_runner_unavailable, latest)):
             return {"status": "skipped", "reason": "not_required"}
         return await notify_runner_unavailable(latest, checks or [])
     finally:
@@ -149,13 +150,13 @@ async def notify_runner_unavailable_if_needed(
 
 async def notify_runner_unavailable(runner: dict[str, Any], checks: list[dict[str, Any]]) -> dict[str, Any]:
     runner_id = str(runner.get("runner_id") or "")
-    settings = storage.get_settings()
+    settings = (await storage_call(storage.get_settings))
     if not settings.get("system_alerts_enabled"):
-        storage.mark_probe_runner_unavailable_notified(runner_id)
+        (await storage_call(storage.mark_probe_runner_unavailable_notified, runner_id))
         return {"status": "disabled", "sent": False}
     channels = _system_notification_channels(settings)
     if not channels:
-        storage.mark_probe_runner_unavailable_notified(runner_id)
+        (await storage_call(storage.mark_probe_runner_unavailable_notified, runner_id))
         return {"status": "no_channels", "sent": False}
     title = "PulseGuard 执行节点不可用"
     text = _format_runner_unavailable_message(runner, checks)
@@ -171,14 +172,14 @@ async def notify_runner_unavailable(runner: dict[str, Any], checks: list[dict[st
     if not sent_channels:
         # Nobody was told.  Record the failed attempt rather than the delivery,
         # so the node stays eligible for a retry once the cooldown expires.
-        storage.mark_probe_runner_unavailable_notify_failed(runner_id)
+        (await storage_call(storage.mark_probe_runner_unavailable_notify_failed, runner_id))
         return {
             "status": "failed",
             "sent": False,
             "channel": _channels_summary(channels),
             "error": _delivery_error_summary(failures, settings),
         }
-    storage.mark_probe_runner_unavailable_notified(runner_id)
+    (await storage_call(storage.mark_probe_runner_unavailable_notified, runner_id))
     return {
         "status": "sent",
         "sent": True,
@@ -189,7 +190,7 @@ async def notify_runner_unavailable(runner: dict[str, Any], checks: list[dict[st
 
 async def notify_system_error(event: dict[str, Any], settings: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
-        effective_settings = dict(settings or storage.get_settings())
+        effective_settings = dict(settings or (await storage_call(storage.get_settings)))
     except Exception:
         return {"sent": False, "reason": "settings_unavailable"}
     if not effective_settings.get("system_alerts_enabled"):

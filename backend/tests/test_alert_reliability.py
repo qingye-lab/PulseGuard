@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -360,6 +361,72 @@ class RunnerUnavailableDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         stale_failure = {**recent, "unavailable_notify_failed_at": "2000-01-01T00:00:00+00:00"}
         self.assertTrue(storage.should_notify_probe_runner_unavailable(stale_failure))
+
+
+class RelayRestartAlertSuppressionTests(unittest.TestCase):
+    """Restarting the relay transport is maintenance, not a child node failure."""
+
+    @staticmethod
+    def _relay_runner(**overrides: object) -> dict[str, object]:
+        runner: dict[str, object] = {
+            "runner_id": "edge-1",
+            "role": "child",
+            "enabled": True,
+            "available": False,
+            "status": "unavailable",
+            "connection_mode": "relay",
+            "was_available": True,
+            "unavailable_since": None,
+            "relay_last_seen_at": None,
+            "unavailable_notified_at": None,
+            "unavailable_notify_failed_at": None,
+        }
+        runner.update(overrides)
+        return runner
+
+    @staticmethod
+    def _ago(seconds: float) -> str:
+        return (datetime.now().astimezone() - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+    def test_a_relay_restart_inside_the_reconnect_window_is_not_reported(self) -> None:
+        runner = self._relay_runner(unavailable_since=self._ago(30))
+
+        self.assertFalse(storage.should_notify_probe_runner_unavailable(runner))
+
+    def test_an_outage_that_outlasts_the_reconnect_window_is_reported(self) -> None:
+        runner = self._relay_runner(unavailable_since=self._ago(storage.RELAY_UNAVAILABLE_ALERT_GRACE_SECONDS + 60))
+
+        self.assertTrue(storage.should_notify_probe_runner_unavailable(runner))
+
+    def test_a_host_that_never_reported_a_disconnect_is_measured_from_its_heartbeat(self) -> None:
+        without_disconnect = self._relay_runner(relay_last_seen_at=self._ago(30))
+        after_grace = self._relay_runner(
+            relay_last_seen_at=self._ago(storage.RELAY_UNAVAILABLE_ALERT_GRACE_SECONDS + 60)
+        )
+
+        self.assertFalse(storage.should_notify_probe_runner_unavailable(without_disconnect))
+        self.assertTrue(storage.should_notify_probe_runner_unavailable(after_grace))
+
+    def test_a_relay_outage_with_no_timestamp_at_all_is_still_reported(self) -> None:
+        runner = self._relay_runner()
+
+        self.assertTrue(storage.should_notify_probe_runner_unavailable(runner))
+
+    def test_a_relay_restart_never_produces_the_other_failure_states(self) -> None:
+        for status in ("unhealthy", "auth_failed"):
+            with self.subTest(status=status):
+                runner = self._relay_runner(status=status, unavailable_since=self._ago(1))
+                self.assertTrue(storage.should_notify_probe_runner_unavailable(runner))
+
+    def test_a_relay_node_that_was_never_available_is_not_reported(self) -> None:
+        runner = self._relay_runner(was_available=False, unavailable_since=self._ago(600))
+
+        self.assertFalse(storage.should_notify_probe_runner_unavailable(runner))
+
+    def test_a_manually_configured_node_keeps_alerting_on_the_first_failure(self) -> None:
+        runner = self._relay_runner(connection_mode="manual", unavailable_since=self._ago(1))
+
+        self.assertTrue(storage.should_notify_probe_runner_unavailable(runner))
 
 
 class WorkerExecutionTimeoutTests(unittest.IsolatedAsyncioTestCase):

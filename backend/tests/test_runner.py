@@ -496,6 +496,10 @@ class DraftRunnerTests(RunnerTestCase):
             return_value={"sent": False, "reason": "disabled"},
         ) as notify_system_error, patch(
             "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock, side_effect=RunnerEnvironmentFailure("browser failed")
+        ), patch(
+            "backend.app.ui_assertions.prepare_ui_prerequisites", new_callable=AsyncMock, return_value=Mock()
+        ), patch(
+            "backend.app.ui_assertions.navigate_ui_target", new_callable=AsyncMock
         ):
             runner = CheckRunner()
             result = asyncio.run(runner.run_check(18))
@@ -567,6 +571,10 @@ class DraftRunnerTests(RunnerTestCase):
             return_value={"sent": False, "reason": "disabled"},
         ) as notify_system_error, patch(
             "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock, side_effect=RuntimeError("Page.title: Target crashed")
+        ), patch(
+            "backend.app.ui_assertions.prepare_ui_prerequisites", new_callable=AsyncMock, return_value=Mock()
+        ), patch(
+            "backend.app.ui_assertions.navigate_ui_target", new_callable=AsyncMock
         ):
             runner = CheckRunner()
             result = asyncio.run(runner.run_check(19))
@@ -847,10 +855,15 @@ class RunnerQueueTests(RunnerTestCase):
                 first = asyncio.create_task(runner.run_check(1))
                 await first_started.wait()
                 second = asyncio.create_task(runner.run_check(2))
-                for _ in range(20):
-                    if runner.runtime_status()["queue"]["queued"] == 1:
-                        break
-                    await asyncio.sleep(0)
+                # Persistence now runs in threads; a fixed number of zero-time
+                # yields cannot prove the second request reached the queue.
+                async def second_is_queued() -> None:
+                    while runner.runtime_status()["queue"]["queued"] != 1:
+                        if second.done():
+                            raise AssertionError("Second request completed before entering the queue")
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(second_is_queued(), timeout=2)
                 third = await runner.run_check(3)
                 release_first.set()
                 results = [await first, await second, third]

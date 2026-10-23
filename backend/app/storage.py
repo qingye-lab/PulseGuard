@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -145,10 +146,13 @@ class _DatabaseAccess:
                 self._condition.notify_all()
 
 
+logger = logging.getLogger(__name__)
+
 _DATABASE_ACCESS = _DatabaseAccess()
 _LOCK = threading.RLock()
 _TRANSACTION = threading.local()
 _CLEANUP_BATCH_SIZE = 500
+_INCOMPLETE_RUN_IDS_SQL = "SELECT id FROM runs WHERE status IN ('pending', 'running')"
 _RUN_CLEANUP_BATCH_SQL = """SELECT id FROM runs
     WHERE created_at < ? AND status IN ('ok', 'failed', 'timeout', 'skipped', 'preparation_failed')
     ORDER BY created_at, id LIMIT ?"""
@@ -165,6 +169,11 @@ DEPLOYMENT_STATE_KEY = "deployment_window"
 RUNNER_CONNECTION_MODES = {"manual", "relay"}
 RELAY_PRE_ACTIVATION_STATUSES = {"pending_deployment", "expired", "connecting"}
 RELAY_HEARTBEAT_TIMEOUT_SECONDS = 60
+# A relay-server restart drops every child session at once, and each client
+# reconnects within about a minute.  The restart itself stamps
+# `unavailable_since`, so relay nodes only become alertable once the outage has
+# outlasted that reconnect window.
+RELAY_UNAVAILABLE_ALERT_GRACE_SECONDS = 180
 ENCRYPTED_RUNNER_TOKEN_PREFIX = "fernet:"
 RUN_SUMMARY_COLUMNS = (
     "id",
@@ -233,6 +242,7 @@ TREND_DISPLAY_BUCKET_SECONDS = (300, 900, 1800, 3600, 7200, 14400, 21600, 43200,
 TREND_SUMMARY_CHECK_IDS = {"ui": -1, "api": -2}
 PROJECT_SCHEMA_VERSION = 2
 SCRIPT_LIBRARY_SCHEMA_VERSION = 3
+RUN_COUNT_SCHEMA_VERSION = 4
 DEFAULT_PROJECT_NAME = "默认项目"
 PROJECT_SCOPED_TABLES = (
     "checks",
@@ -601,12 +611,44 @@ def _validate_project_migration(conn: sqlite3.Connection, project_id: int) -> No
             raise RuntimeError(f"项目迁移校验失败：{table} 存在未归属数据")
 
 
-def init_db() -> None:
-    with _DATABASE_ACCESS.exclusive():
-        _init_db()
+# Boot-time lock contention is retried: the API and relay units migrate one
+# SQLite file together, and a single `database is locked` used to exit both
+# processes into a systemd restart loop.
+INIT_DB_LOCK_ATTEMPTS = 5
+INIT_DB_LOCK_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
 
 
-def _init_db() -> None:
+def init_db(*, recover_interrupted: bool = True) -> None:
+    """Initialize storage; only an executor restart may settle its in-flight work."""
+    for attempt in range(INIT_DB_LOCK_ATTEMPTS):
+        try:
+            with _DATABASE_ACCESS.exclusive():
+                _init_db(recover_interrupted=recover_interrupted)
+        except sqlite3.OperationalError as exc:
+            if attempt == INIT_DB_LOCK_ATTEMPTS - 1 or not _is_locked_error(exc):
+                raise
+            delay = INIT_DB_LOCK_BACKOFF_SECONDS[attempt]
+            logger.warning(
+                "init_db_locked attempt=%s of %s retry_in_seconds=%s error=%s",
+                attempt + 1,
+                INIT_DB_LOCK_ATTEMPTS,
+                delay,
+                exc,
+            )
+            time_module.sleep(delay)
+        else:
+            return
+
+
+def _is_locked_error(exc: sqlite3.Error) -> bool:
+    message = str(exc)
+    return any(
+        marker in message
+        for marker in ("database is locked", "database table is locked", "database is busy")
+    )
+
+
+def _init_db(*, recover_interrupted: bool = True) -> None:
     ensure_runtime_dirs()
     if _legacy_project_schema_detected():
         raise RuntimeError(
@@ -989,8 +1031,9 @@ def _init_db() -> None:
         _ensure_default_settings(conn)
         _migrate_read_only_tokens(conn)
         _ensure_local_probe_runner(conn)
-        _mark_interrupted_runs(conn)
-        _mark_interrupted_library_validations(conn)
+        if recover_interrupted:
+            _mark_interrupted_runs(conn)
+            _mark_interrupted_library_validations(conn)
         _seed_demo_checks(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_health_started_check ON runs(affects_health, started_at DESC, check_id)")
         conn.execute(
@@ -1023,6 +1066,14 @@ def _init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_runs_project_kind_started "
             "ON runs(project_id, observation_kind, started_at DESC, id DESC)"
         )
+        # Tab filters (type/status) must also count and page from the index alone.
+        # Without the check_type/status terms SQLite falls back to one wide-row lookup
+        # per row in the whole project scope, which costs minutes on cold cache.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_project_page_filter_started "
+            "ON runs(project_id, observation_kind, check_type, status, started_at DESC, id DESC)"
+        )
+        _ensure_run_count_totals(conn)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_project_health_cover "
             "ON runs(project_id, affects_health, started_at DESC, id DESC, "
@@ -3960,7 +4011,23 @@ def should_notify_probe_runner_unavailable(runner: dict[str, Any]) -> bool:
     if _timestamp_is_fresh(runner.get("unavailable_notify_failed_at"), RUNNER_UNAVAILABLE_NOTIFY_RETRY_SECONDS):
         return False
     if str(runner.get("connection_mode") or "manual") == "relay":
-        return bool(runner.get("was_available")) and str(runner.get("status") or "") in {"unavailable", "unhealthy", "auth_failed"}
+        if not bool(runner.get("was_available")):
+            return False
+        status = str(runner.get("status") or "")
+        if status not in {"unavailable", "unhealthy", "auth_failed"}:
+            return False
+        if status != "unavailable":
+            # A transport restart can only produce `unavailable`; an unhealthy or
+            # mis-authenticated node is a real problem and stays immediate.
+            return True
+        # The relay server stamps `unavailable_since` when it restarts and the child
+        # reconnects well inside that window, so only a lasting outage is a failure.
+        # A host that died without ever reporting a disconnect leaves only its last
+        # heartbeat behind, which is the true start of that outage.
+        outage_start = runner.get("unavailable_since") or runner.get("relay_last_seen_at")
+        if outage_start is None:
+            return True
+        return _timestamp_is_older_than(outage_start, RELAY_UNAVAILABLE_ALERT_GRACE_SECONDS)
     return True
 
 
@@ -4314,6 +4381,60 @@ def list_runs(filters: dict[str, Any] | None = None, limit: int = 100, summary_o
         return [_normalize_run(row) for row in conn.execute(sql, params).fetchall()]
 
 
+def _ensure_run_count_totals(conn: sqlite3.Connection) -> None:
+    # Seed once under the same writer transaction that installs the triggers.
+    # The existing narrow covering index avoids reading log/snapshot payloads.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    triggers = {
+        "trg_runs_total_insert": """AFTER INSERT ON runs BEGIN
+            INSERT INTO run_count_totals(project_id, observation_kind, run_count)
+            VALUES (NEW.project_id, NEW.observation_kind, 1)
+            ON CONFLICT(project_id, observation_kind)
+            DO UPDATE SET run_count = run_count + 1;
+        END""",
+        "trg_runs_total_delete": """AFTER DELETE ON runs BEGIN
+            UPDATE run_count_totals SET run_count = run_count - 1
+            WHERE project_id = OLD.project_id AND observation_kind = OLD.observation_kind;
+            DELETE FROM run_count_totals WHERE project_id = OLD.project_id
+                AND observation_kind = OLD.observation_kind AND run_count = 0;
+        END""",
+        "trg_runs_total_scope": """AFTER UPDATE OF project_id, observation_kind ON runs
+        WHEN OLD.project_id IS NOT NEW.project_id OR OLD.observation_kind IS NOT NEW.observation_kind
+        BEGIN
+            UPDATE run_count_totals SET run_count = run_count - 1
+            WHERE project_id = OLD.project_id AND observation_kind = OLD.observation_kind;
+            DELETE FROM run_count_totals WHERE project_id = OLD.project_id
+                AND observation_kind = OLD.observation_kind AND run_count = 0;
+            INSERT INTO run_count_totals(project_id, observation_kind, run_count)
+            VALUES (NEW.project_id, NEW.observation_kind, 1)
+            ON CONFLICT(project_id, observation_kind)
+            DO UPDATE SET run_count = run_count + 1;
+        END""",
+    }
+    objects = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') AND "
+        "name IN ('run_count_totals', 'trg_runs_total_insert', 'trg_runs_total_delete', 'trg_runs_total_scope')"
+    )}
+    applied = conn.execute("SELECT 1 FROM schema_versions WHERE version = ?", (RUN_COUNT_SCHEMA_VERSION,)).fetchone()
+    conn.execute("""CREATE TABLE IF NOT EXISTS run_count_totals (
+        project_id INTEGER NOT NULL,
+        observation_kind TEXT NOT NULL,
+        run_count INTEGER NOT NULL CHECK(run_count >= 0),
+        PRIMARY KEY(project_id, observation_kind)
+    ) WITHOUT ROWID""")
+    if not applied or objects != {"run_count_totals", *triggers}:
+        conn.execute("DELETE FROM run_count_totals")
+        conn.execute("""INSERT INTO run_count_totals(project_id, observation_kind, run_count)
+            SELECT project_id, observation_kind, COUNT(*)
+            FROM runs INDEXED BY idx_runs_project_kind_started
+            GROUP BY project_id, observation_kind""")
+    for name, definition in triggers.items():
+        conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name} {definition}")
+    conn.execute("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                 (RUN_COUNT_SCHEMA_VERSION, now_iso()))
+
+
 def list_runs_page(
     filters: dict[str, Any] | None = None,
     page: int = 1,
@@ -4326,10 +4447,17 @@ def list_runs_page(
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     with _connect(read_only=True) as conn:
         with request_timing.phase("runs_count"):
-            total = int(conn.execute(f"SELECT COUNT(*) AS count FROM runs{where}", params).fetchone()["count"])
+            if all(clause in {"project_id = ?", "observation_kind = ?"} for clause in clauses):
+                # Exact totals and page rows share this read snapshot. Complex
+                # filters keep their original precise SQL count and semantics.
+                total = int(conn.execute(
+                    f"SELECT COALESCE(SUM(run_count), 0) AS count FROM run_count_totals{where}", params,
+                ).fetchone()["count"])
+            else:
+                total = int(conn.execute(f"SELECT COUNT(*) AS count FROM runs{where}", params).fetchone()["count"])
         with request_timing.phase("runs_fetch"):
             rows = conn.execute(
-                f"SELECT {_run_summary_select()} FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
+                _run_page_select(filters, where),
                 [*params, page_size, (page - 1) * page_size],
             ).fetchall()
     request_timing.record_count("runs_matches", total)
@@ -4340,6 +4468,24 @@ def list_runs_page(
         "page": page,
         "page_size": page_size,
     }
+
+
+def _run_page_select(filters: dict[str, Any], where: str) -> str:
+    active_filters = {key for key, value in filters.items() if value is not None and value != ""}
+    covered_filters = {"project_id", "observation_kind", "check_type", "status", "start", "end"}
+    if (filters.get("check_type") or filters.get("status")) and active_filters <= covered_filters:
+        # A time-ordered index can look cheap while reading thousands of wide
+        # rows to find a sparse status. Materialize only the selected IDs from
+        # the existing covering index, then fetch at most page_size wide rows.
+        # CROSS JOIN fixes page as the outer loop; the final sort is bounded.
+        return (
+            "WITH page AS MATERIALIZED ("
+            "SELECT id, started_at FROM runs INDEXED BY idx_runs_project_page_filter_started"
+            f"{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?) "
+            f"SELECT {_run_summary_select('r')} FROM page CROSS JOIN runs AS r "
+            "WHERE r.id = page.id ORDER BY page.started_at DESC, page.id DESC"
+        )
+    return f"SELECT {_run_summary_select()} FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
 
 
 def _run_filter_clauses(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
@@ -4426,7 +4572,9 @@ def create_database_backup(preserve_filename: str | None = None) -> dict[str, An
 def _create_database_backup(preserve_filename: str | None = None) -> dict[str, Any]:
     ensure_runtime_dirs()
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"pulseguard-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f')}.db"
+    # Wall clocks can repeat within one platform clock tick. A safety backup
+    # must never overwrite the restore source created earlier in that tick.
+    filename = f"pulseguard-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex}.db"
     target = BACKUPS_DIR / filename
     _copy_database(Path(DB_PATH), target)
     preserve_filenames = {target.name}
@@ -5547,9 +5695,12 @@ def _histogram_percentile(histogram: dict[str, int], percentile: float, min_samp
 
 
 def _backfill_trend_rollups(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
+    # History rows contain potentially large logs and snapshots. Stream only the
+    # fields used by rollups, preserving chronological order and the transaction.
+    cursor = conn.execute(
         """
-        SELECT *
+        SELECT id, project_id, check_id, check_type, status, started_at, duration_ms,
+               affects_health, observation_kind, failure_kind
         FROM runs
         WHERE trend_recorded_at IS NULL
           AND check_id > 0
@@ -5557,13 +5708,15 @@ def _backfill_trend_rollups(conn: sqlite3.Connection) -> None:
           AND status IN ('ok', 'failed', 'timeout')
         ORDER BY started_at ASC, id ASC
         """
-    ).fetchall()
-    if not rows:
-        return
+    )
     timestamp = now_iso()
-    for row in rows:
-        _record_trend_rollups(conn, row)
-        conn.execute("UPDATE runs SET trend_recorded_at = ? WHERE id = ?", (timestamp, int(row["id"])))
+    try:
+        while rows := cursor.fetchmany(_CLEANUP_BATCH_SIZE):
+            for row in rows:
+                _record_trend_rollups(conn, row)
+                conn.execute("UPDATE runs SET trend_recorded_at = ? WHERE id = ?", (timestamp, int(row["id"])))
+    finally:
+        cursor.close()
 
 
 def cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
@@ -5699,10 +5852,20 @@ def _clear_artifact_paths(conn: sqlite3.Connection, column: str, paths: list[str
         return
     if column not in {"screenshot_path", "trace_path", "response_path"}:
         raise ValueError(f"不支持的产物字段：{column}")
-    for offset in range(0, len(paths), _CLEANUP_BATCH_SIZE):
-        batch = paths[offset:offset + _CLEANUP_BATCH_SIZE]
-        placeholders = ", ".join("?" for _ in batch)
-        conn.execute(f"UPDATE runs SET {column} = NULL WHERE {column} IN ({placeholders})", batch)
+    # Artifact paths have no persistent index. A parameter batch would rescan
+    # every wide history row for each 500 files. Index the removed paths in a
+    # connection-local table, scan history once, then update matching primary keys.
+    # This needs no permanent index build or write amplification on every probe.
+    conn.execute("CREATE TEMP TABLE artifact_cleanup_paths(path TEXT PRIMARY KEY) WITHOUT ROWID")
+    try:
+        conn.executemany("INSERT OR IGNORE INTO temp.artifact_cleanup_paths(path) VALUES (?)", ((path,) for path in paths))
+        conn.execute(
+            f"""UPDATE runs SET {column} = NULL WHERE id IN (
+                SELECT id FROM runs WHERE {column} IN (SELECT path FROM temp.artifact_cleanup_paths)
+            )"""
+        )
+    finally:
+        conn.execute("DROP TABLE temp.artifact_cleanup_paths")
 
 
 @contextmanager
@@ -6162,14 +6325,9 @@ def _read_deployment_state(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def _discard_incomplete_runs(conn: sqlite3.Connection) -> int:
-    rows = conn.execute("SELECT id FROM runs WHERE status IN ('pending', 'running')").fetchall()
-    run_ids = [int(row["id"]) for row in rows]
-    if not run_ids:
-        return 0
-    placeholders = ", ".join("?" for _ in run_ids)
-    conn.execute(f"UPDATE check_status SET last_run_id = NULL WHERE last_run_id IN ({placeholders})", run_ids)
-    conn.execute(f"UPDATE check_status SET last_scheduled_run_id = NULL WHERE last_scheduled_run_id IN ({placeholders})", run_ids)
-    cursor = conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", run_ids)
+    conn.execute(f"UPDATE check_status SET last_run_id = NULL WHERE last_run_id IN ({_INCOMPLETE_RUN_IDS_SQL})")
+    conn.execute(f"UPDATE check_status SET last_scheduled_run_id = NULL WHERE last_scheduled_run_id IN ({_INCOMPLETE_RUN_IDS_SQL})")
+    cursor = conn.execute(f"DELETE FROM runs WHERE id IN ({_INCOMPLETE_RUN_IDS_SQL})")
     return cursor.rowcount
 
 
@@ -6179,7 +6337,7 @@ def _mark_interrupted_runs(conn: sqlite3.Connection) -> None:
         return
     timestamp = now_iso()
     conn.execute(
-        """
+        f"""
         UPDATE runs
         SET status = 'skipped',
             finished_at = COALESCE(finished_at, ?),
@@ -6187,7 +6345,7 @@ def _mark_interrupted_runs(conn: sqlite3.Connection) -> None:
             error_message = COALESCE(error_message, '服务启动时发现任务未完成，已标记为中断'),
             failure_kind = COALESCE(failure_kind, 'runner'),
             notification_status = COALESCE(notification_status, 'not_required')
-        WHERE status IN ('pending', 'running')
+        WHERE id IN ({_INCOMPLETE_RUN_IDS_SQL})
         """,
         (timestamp,),
     )
@@ -6593,6 +6751,15 @@ def _timestamp_is_fresh(value: Any, timeout_seconds: int) -> bool:
         return False
     age = datetime.now(parsed.tzinfo) - parsed
     return age.total_seconds() <= timeout_seconds
+
+
+def _timestamp_is_older_than(value: Any, timeout_seconds: int) -> bool:
+    try:
+        parsed = datetime.fromisoformat(str(value or ""))
+    except ValueError:
+        return False
+    age = datetime.now(parsed.tzinfo) - parsed
+    return age.total_seconds() > timeout_seconds
 
 
 def _timestamp_is_past(value: Any) -> bool:

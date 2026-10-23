@@ -7,6 +7,7 @@ import httpx
 from fastapi import HTTPException
 
 from . import storage
+from .async_storage import call as storage_call
 
 
 def http_response_detail(response: httpx.Response) -> str:
@@ -31,10 +32,10 @@ async def worker_request(
 ) -> dict[str, Any]:
     runner_id = str(runner.get("runner_id") or "")
     try:
-        storage.ensure_probe_runner_transport_allowed(runner)
+        (await storage_call(storage.ensure_probe_runner_transport_allowed, runner))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    token = storage.get_probe_runner_token(runner_id)
+    token = (await storage_call(storage.get_probe_runner_token, runner_id))
     address = str(runner.get("address") or "").strip().rstrip("/")
     if not address or not token:
         raise RuntimeError("Runner address or token is not configured")

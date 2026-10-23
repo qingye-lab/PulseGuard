@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from . import storage
+from .async_storage import call as storage_call
 from .script_library import ModuleLibraryError, referenced_module_names
 
 
@@ -61,16 +62,16 @@ async def _finish(
     diagnostics: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     try:
-        return storage.finish_project_library_validation(
+        return (await storage_call(storage.finish_project_library_validation,
             project_id,
             validation_id,
             status,
             checks=checks,
             diagnostics=diagnostics,
-        )
+        ))
     except Exception:
         logger.exception("Unable to finish script library validation %s/%s", project_id, validation_id)
-        return storage.get_project_library_validation(project_id, validation_id)
+        return (await storage_call(storage.get_project_library_validation, project_id, validation_id))
 
 
 async def run_project_library_validation(
@@ -80,7 +81,10 @@ async def run_project_library_validation(
 ) -> dict[str, Any] | None:
     """Execute one queued validation and always settle its persisted state."""
 
-    claimed = storage.claim_project_library_validation(project_id, validation_id)
+    claimed = (await storage_call(storage.claim_project_library_validation, project_id, validation_id,
+        _on_cancelled_result=lambda row: storage.finish_project_library_validation(
+            project_id, validation_id, 'cancelled', checks=[], diagnostics=[])
+            if row and row.get('status') == 'running' else None))
     if claimed is None:
         return None
     if str(claimed.get("status") or "") != "running":
@@ -89,7 +93,7 @@ async def run_project_library_validation(
     checks_result: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
     try:
-        snapshot = storage.get_project_library_validation_snapshot(project_id, validation_id)
+        snapshot = (await storage_call(storage.get_project_library_validation_snapshot, project_id, validation_id))
         if not snapshot:
             return await _finish(
                 project_id,
@@ -103,11 +107,11 @@ async def run_project_library_validation(
         checks = snapshot["checks"]
         bundle = snapshot["bundle"]
         include_disabled = bool(validation.get("include_disabled"))
-        static_diagnostics = storage.library_static_reference_diagnostics(
+        static_diagnostics = (await storage_call(storage.library_static_reference_diagnostics,
             project_id,
             modules,
             checks=checks,
-        )
+        ))
         if static_diagnostics:
             return await _finish(
                 project_id,
@@ -139,7 +143,7 @@ async def run_project_library_validation(
                 continue
             if not bool(check.get("enabled")) and not include_disabled:
                 continue
-            if storage.is_project_library_validation_cancel_requested(project_id, validation_id):
+            if (await storage_call(storage.is_project_library_validation_cancel_requested, project_id, validation_id)):
                 diagnostics.append(_diagnostic("validation_cancelled", "验证已取消"))
                 return await _finish(
                     project_id,
@@ -173,7 +177,7 @@ async def run_project_library_validation(
                         "check_id": check_id,
                     }
                 )
-            if storage.is_project_library_validation_cancel_requested(project_id, validation_id):
+            if (await storage_call(storage.is_project_library_validation_cancel_requested, project_id, validation_id)):
                 diagnostics.append(_diagnostic("validation_cancelled", "验证已取消"))
                 return await _finish(
                     project_id,

@@ -93,6 +93,28 @@ class MonitoringStateTests(unittest.TestCase):
 
 
 class MonitoringStorageTests(unittest.TestCase):
+    def test_backup_and_restore_sources_remain_distinct_when_clock_repeats(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, 'DB_PATH', Path(temp_dir) / 'pulseguard.db'
+        ), patch.object(storage, 'BACKUPS_DIR', Path(temp_dir) / 'backups'):
+            storage.init_db()
+            frozen = datetime.now().astimezone()
+            with patch.object(storage, 'datetime', wraps=datetime) as clock:
+                clock.now.return_value = frozen
+                first = storage.create_database_backup()
+                added = storage.create_check({
+                    'name': 'Distinct restore marker', 'type': 'api', 'enabled': True,
+                    'interval_seconds': 300, 'timeout_ms': 10000,
+                    'entry_url': 'https://example.com/restore-marker', 'method': 'GET',
+                    'headers_json': '{}', 'body': '', 'assertions_json': '[]',
+                    'setup_script': '', 'script': 'async def check(ctx):\n    pass\n', 'tags': '',
+                })
+                second = storage.create_database_backup()
+                self.assertNotEqual(first['filename'], second['filename'])
+                restored = storage.restore_database_backup(first['filename'])
+            self.assertNotEqual(first['filename'], restored['safety_backup']['filename'])
+            self.assertIsNone(storage.get_check(added['id']))
+
     def test_run_pagination_filters_observation_kind_and_backup_round_trip(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"

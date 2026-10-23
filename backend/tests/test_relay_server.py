@@ -388,6 +388,104 @@ class RelayServerEntryGuardTests(unittest.IsolatedAsyncioTestCase):
         mark_disconnected.assert_called_once_with("edge-1", "invalid relay message")
 
 
+class RelayServerCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        relay_server.ACTIVE_SESSIONS.clear()
+        relay_server.PUBLIC_CONNECTIONS = 0
+
+    async def _listening_session(self) -> tuple[relay_server.RelaySession, int]:
+        server = await asyncio.start_server(lambda _reader, writer: writer.close(), "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        websocket = SessionWebSocket([
+            '{"type":"hello","runner_id":"edge-1","relay_token":"relay-token","relay_token_version":1}',
+            '{"type":"bogus"}',
+        ])
+        session = relay_server.RelaySession("edge-1", "relay-token", 1, websocket, server)  # type: ignore[arg-type]
+        session.streams["stream-1"] = FakeStream()  # type: ignore[assignment]
+        self.addAsyncCleanup(session.close)
+        return session, port
+
+    async def _assert_listener_released(self, session: relay_server.RelaySession, port: int) -> None:
+        self.assertFalse(session.server.is_serving())
+        self.assertEqual(session.streams, {})
+        self.assertIsNotNone(session.websocket.close_kwargs)
+        server = await asyncio.start_server(lambda _reader, writer: writer.close(), "127.0.0.1", port)
+        server.close()
+        await server.wait_closed()
+
+    async def test_disconnect_storage_failure_releases_listener_and_connection_count(self) -> None:
+        session, port = await self._listening_session()
+        stream = session.streams["stream-1"]
+        relay_server.ACTIVE_SESSIONS["edge-1"] = session
+        with patch.object(relay_server.storage, "verify_probe_runner_relay_token", return_value={"allocated_internal_port": port}), patch.object(
+            relay_server, "_open_relay_session", new=AsyncMock(return_value=session)
+        ), patch.object(relay_server.storage, "mark_probe_runner_relay_connected"), patch.object(
+            relay_server.storage, "mark_probe_runner_relay_disconnected", side_effect=sqlite3.OperationalError("database is locked")
+        ):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                await relay_server.relay_connect(session.websocket)
+
+        self.assertNotIn("edge-1", relay_server.ACTIVE_SESSIONS)
+        self.assertEqual(relay_server.PUBLIC_CONNECTIONS, 0)
+        self.assertTrue(stream.closed)
+        await self._assert_listener_released(session, port)
+
+    async def test_disconnect_close_failure_still_releases_connection_count(self) -> None:
+        session, port = await self._listening_session()
+        relay_server.ACTIVE_SESSIONS["edge-1"] = session
+        with patch.object(relay_server.storage, "verify_probe_runner_relay_token", return_value={"allocated_internal_port": port}), patch.object(
+            relay_server, "_open_relay_session", new=AsyncMock(return_value=session)
+        ), patch.object(relay_server.storage, "mark_probe_runner_relay_connected"), patch.object(
+            relay_server.storage, "mark_probe_runner_relay_disconnected"
+        ), patch.object(session, "close", new=AsyncMock(side_effect=RuntimeError("cleanup failed"))):
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                await relay_server.relay_connect(session.websocket)
+
+        self.assertNotIn("edge-1", relay_server.ACTIVE_SESSIONS)
+        self.assertEqual(relay_server.PUBLIC_CONNECTIONS, 0)
+
+    async def test_disconnect_cancellation_still_releases_listener_and_connection_count(self) -> None:
+        session, port = await self._listening_session()
+        relay_server.ACTIVE_SESSIONS["edge-1"] = session
+        with patch.object(relay_server.storage, "verify_probe_runner_relay_token", return_value={"allocated_internal_port": port}), patch.object(
+            relay_server, "_open_relay_session", new=AsyncMock(return_value=session)
+        ), patch.object(relay_server.storage, "mark_probe_runner_relay_connected"), patch.object(
+            relay_server.storage, "mark_probe_runner_relay_disconnected", side_effect=asyncio.CancelledError
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await relay_server.relay_connect(session.websocket)
+
+        self.assertEqual(relay_server.PUBLIC_CONNECTIONS, 0)
+        await self._assert_listener_released(session, port)
+
+    async def test_revoke_storage_failure_releases_listener(self) -> None:
+        session, port = await self._listening_session()
+        relay_server.ACTIVE_SESSIONS["edge-1"] = session
+        with patch.object(relay_server.storage, "mark_probe_runner_relay_disconnected", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                await relay_server.revoke_relay_session("edge-1")
+
+        self.assertNotIn("edge-1", relay_server.ACTIVE_SESSIONS)
+        await self._assert_listener_released(session, port)
+
+    async def test_replacement_storage_failure_releases_port_for_next_connection(self) -> None:
+        session, port = await self._listening_session()
+        relay_server.ACTIVE_SESSIONS["edge-1"] = session
+        with patch.object(relay_server, "RELAY_INTERNAL_LISTEN_HOST", "127.0.0.1"), patch.object(
+            relay_server.storage, "mark_probe_runner_relay_disconnected", side_effect=sqlite3.OperationalError("database is locked")
+        ):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                await relay_server._open_relay_session("edge-1", "relay-token", 1, FakeWebSocket(), port, lambda _reader, writer: writer.close())  # type: ignore[arg-type]
+
+            self.assertNotIn("edge-1", relay_server.ACTIVE_SESSIONS)
+            await self._assert_listener_released(session, port)
+            new_session = await relay_server._open_relay_session("edge-1", "relay-token", 1, FakeWebSocket(), port, lambda _reader, writer: writer.close())  # type: ignore[arg-type]
+            self.assertIsNotNone(new_session)
+            self.addAsyncCleanup(new_session.close)
+            self.assertIs(relay_server.ACTIVE_SESSIONS["edge-1"], new_session)
+            self.assertTrue(new_session.server.is_serving())
+
+
 class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         relay_server.ACTIVE_SESSIONS.clear()
@@ -891,3 +989,73 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret-", text)
         self.assertNotIn("do-not-log", text)
         mark_disconnected.assert_called_once_with("edge-1", "websocket disconnected (code=1006)")
+
+
+class RelayFailureAttributionTests(unittest.IsolatedAsyncioTestCase):
+    """A tunnel teardown must say why it stopped, not just that something raised."""
+
+    @staticmethod
+    def _session(websocket: object, server: object) -> relay_server.RelaySession:
+        return relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=websocket,  # type: ignore[arg-type]
+            server=server,  # type: ignore[arg-type]
+        )
+
+    async def test_send_json_names_the_closing_state_instead_of_a_socket_error(self) -> None:
+        websocket = FakeWebSocket()
+        session = self._session(websocket, FakeServer())
+        session.closing = True
+
+        with self.assertRaises(RuntimeError) as failure:
+            await session.send_json({"type": "open", "stream_id": "stream-1"})
+
+        self.assertEqual(str(failure.exception), "relay session is closing")
+        self.assertEqual(websocket.messages, [])
+
+    async def test_an_incoming_tcp_connection_is_dropped_while_the_session_closes(self) -> None:
+        websocket = FakeWebSocket()
+        writer = FakeWriter()
+        session = self._session(websocket, FakeServer())
+        session.closing = True
+
+        with patch.object(session, "send_json", new=AsyncMock()) as send_json:
+            await relay_server._tcp_client_connected(session, EmptyReader(), writer)  # type: ignore[arg-type]
+
+        send_json.assert_not_awaited()
+        self.assertTrue(writer.closed)
+        self.assertEqual(session.streams, {})
+
+    async def test_a_failed_open_records_the_reason_the_stream_could_not_start(self) -> None:
+        session = self._session(FakeWebSocket(), FakeServer())
+        writer = FakeWriter()
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch.object(
+            session, "send_json", new=AsyncMock(side_effect=ConnectionResetError("peer closed without shutdown"))
+        ), self.assertLogs("uvicorn.error.relay", level="WARNING") as logs:
+            await relay_server._tcp_client_connected(session, EmptyReader(), writer)  # type: ignore[arg-type]
+
+        text = "\n".join(logs.output)
+        self.assertIn("relay_stream_failed", text)
+        self.assertIn("ConnectionResetError", text)
+        self.assertIn("peer closed without shutdown", text)
+
+    async def test_a_failed_stream_write_records_the_reason(self) -> None:
+        session = self._session(FakeWebSocket(), FakeServer())
+        session.streams["stream-1"] = relay_server.TunnelStream(  # type: ignore[arg-type]
+            reader=EmptyReader(), writer=FailingWriteWriter()
+        )
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), self.assertLogs(
+            "uvicorn.error.relay", level="WARNING"
+        ) as logs:
+            await relay_server._handle_data_message(
+                session,
+                {"type": "data", "stream_id": "stream-1", "data": "cGF5bG9hZA=="},
+            )
+
+        text = "\n".join(logs.output)
+        self.assertIn("relay_stream_failed", text)
+        self.assertIn("stream write failed", text)

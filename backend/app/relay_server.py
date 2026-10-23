@@ -12,6 +12,7 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 
 from . import storage
+from .async_storage import call as _storage_call
 from .config import (
     RELAY_CERT_FILE,
     RELAY_AUTH_BACKOFF_BASE_SECONDS,
@@ -32,7 +33,7 @@ from .config import (
     relay_control_token,
 )
 from .relay_cert import ensure_relay_certificate
-from .relay_tunnel import TunnelStream, decode_data_message, json_dumps, json_loads, pump_reader_to_sender
+from .relay_tunnel import TunnelStream, close_writer, decode_data_message, json_dumps, json_loads, pump_reader_to_sender
 
 
 app = FastAPI(title="PulseGuard Relay")
@@ -60,23 +61,49 @@ class RelaySession:
     streams: dict[str, TunnelStream] = field(default_factory=dict)
     disconnect_reason: str | None = None
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    closing: bool = False
+    _close_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     async def send_json(self, message: dict[str, Any]) -> None:
+        if self.closing:
+            # Starlette raises an opaque RuntimeError on a disconnecting socket,
+            # which is what the tunnel pump logged 604 times in one night.
+            raise RuntimeError("relay session is closing")
         async with self.send_lock:
             await self.websocket.send_text(json_dumps(message))
 
     async def close(self) -> None:
+        if self._close_task is None:
+            self.closing = True
+            self._close_task = asyncio.create_task(self._close())
+        cancelled = False
+        try:
+            while not self._close_task.done():
+                try:
+                    await asyncio.shield(self._close_task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            self._close_task.result()
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
+
+    async def _close(self) -> None:
+        self.closing = True
         try:
             self.server.close()
+        except Exception:
+            pass
+        streams = list(self.streams.values())
+        self.streams.clear()
+        if streams:
+            await asyncio.gather(*(stream.close() for stream in streams), return_exceptions=True)
+        # Python 3.12+ waits for accepted transports here. Close them first or
+        # server.wait_closed() and stream.close() wait on each other forever.
+        try:
             await self.server.wait_closed()
         except Exception:
             pass
-        for stream in list(self.streams.values()):
-            try:
-                await stream.close()
-            except Exception:
-                pass
-        self.streams.clear()
         try:
             await self.websocket.close()
         except Exception:
@@ -153,8 +180,7 @@ def _relay_session_credentials_valid(session: RelaySession) -> bool:
 
 async def _close_writer_best_effort(writer: asyncio.StreamWriter) -> None:
     try:
-        writer.close()
-        await writer.wait_closed()
+        await close_writer(writer)
     except Exception:
         pass
 
@@ -171,9 +197,11 @@ async def revoke_relay_session(runner_id: str, reason: str = "revoked") -> bool:
         session = ACTIVE_SESSIONS.pop(runner_id, None)
         if not session:
             return False
-        storage.mark_probe_runner_relay_disconnected(runner_id, reason)
-        logger.info("relay_revoked runner_id=%r", runner_id)
-        await session.close()
+        try:
+            await _storage_call(storage.mark_probe_runner_relay_disconnected, runner_id, reason)
+            logger.info("relay_revoked runner_id=%r", runner_id)
+        finally:
+            await session.close()
         return True
 
 
@@ -190,22 +218,28 @@ async def relay_control_revoke(payload: dict[str, Any], authorization: str = Hea
 
 
 async def _tcp_client_connected(session: RelaySession, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    if not _relay_session_credentials_valid(session):
-        session.disconnect_reason = "relay token rotated"
-        await _close_writer_best_effort(writer)
-        await _close_websocket_best_effort(session.websocket, code=4403, reason="relay token rotated")
-        return
-    async with session.stream_lock:
-        if len(session.streams) >= _max_concurrent_streams():
-            logger.warning("relay_stream_rejected runner_id=%r session_id=%s reason=stream_limit active_streams=%s", session.runner_id, session.session_id, len(session.streams))
-            await _close_writer_best_effort(writer)
-            return
-        stream_id = uuid.uuid4().hex
-        stream = TunnelStream(reader=reader, writer=writer)
-        session.streams[stream_id] = stream
+    stream_id: str | None = None
     try:
+        if session.closing:
+            return
+        if not await _storage_call(_relay_session_credentials_valid, session):
+            session.disconnect_reason = "relay token rotated"
+            await _close_websocket_best_effort(session.websocket, code=4403, reason="relay token rotated")
+            return
+        max_streams = await _storage_call(_max_concurrent_streams)
+        async with session.stream_lock:
+            if session.closing:
+                return
+            if len(session.streams) >= max_streams:
+                logger.warning("relay_stream_rejected runner_id=%r session_id=%s reason=stream_limit active_streams=%s", session.runner_id, session.session_id, len(session.streams))
+                return
+            stream_id = uuid.uuid4().hex
+            stream = TunnelStream(reader=reader, writer=writer)
+            session.streams[stream_id] = stream
         try:
             await session.send_json({"type": "open", "stream_id": stream_id})
+            if session.closing:
+                return
             task = asyncio.create_task(
                 pump_reader_to_sender(
                     stream_id,
@@ -218,9 +252,13 @@ async def _tcp_client_connected(session: RelaySession, reader: asyncio.StreamRea
             stream.tasks.add(task)
             await task
         except Exception as exc:
-            logger.warning("relay_stream_failed runner_id=%r session_id=%s stream_id=%s error_type=%s", session.runner_id, session.session_id, stream_id, type(exc).__name__)
+            logger.warning("relay_stream_failed runner_id=%r session_id=%s stream_id=%s error_type=%s error=%s", session.runner_id, session.session_id, stream_id, type(exc).__name__, str(exc)[:200])
     finally:
-        await _close_stream_best_effort(session, stream_id)
+        if stream_id is not None:
+            await _close_stream_best_effort(session, stream_id)
+        else:
+            # Authentication/capacity checks can be cancelled before registration.
+            await _close_writer_best_effort(writer)
 
 
 def _max_concurrent_streams() -> int:
@@ -237,7 +275,7 @@ async def _start_internal_server(handler: Any, port: int) -> asyncio.AbstractSer
 
 
 async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -> bool:
-    if not _relay_session_credentials_valid(session):
+    if not await _storage_call(_relay_session_credentials_valid, session):
         await _close_websocket_best_effort(session.websocket, code=4403, reason="relay token rotated")
         return False
     stream_id = str(message.get("stream_id") or "")
@@ -255,7 +293,7 @@ async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -
                 stream.writer.write(data)
                 await asyncio.wait_for(stream.writer.drain(), timeout=RELAY_STREAM_IDLE_TIMEOUT_SECONDS)
             except Exception as exc:
-                logger.warning("relay_stream_failed runner_id=%r session_id=%s stream_id=%r error_type=%s", session.runner_id, session.session_id, stream_id, type(exc).__name__)
+                logger.warning("relay_stream_failed runner_id=%r session_id=%s stream_id=%r error_type=%s error=%s", session.runner_id, session.session_id, stream_id, type(exc).__name__, str(exc)[:200])
                 close_stream = True
         if close_stream:
             await _close_stream_best_effort(session, stream_id)
@@ -291,9 +329,11 @@ async def _open_relay_session(
         old_session = ACTIVE_SESSIONS.get(runner_id)
         if old_session:
             ACTIVE_SESSIONS.pop(runner_id, None)
-            storage.mark_probe_runner_relay_disconnected(runner_id, "relay session replaced")
-            logger.info("relay_replaced runner_id=%r session_id=%s", runner_id, old_session.session_id)
-            await old_session.close()
+            try:
+                await _storage_call(storage.mark_probe_runner_relay_disconnected, runner_id, "relay session replaced")
+                logger.info("relay_replaced runner_id=%r session_id=%s", runner_id, old_session.session_id)
+            finally:
+                await old_session.close()
         server = await _start_internal_server(handler, port)
         session = RelaySession(runner_id=runner_id, token=token, token_version=token_version, websocket=websocket, server=server)
         ACTIVE_SESSIONS[runner_id] = session
@@ -329,10 +369,10 @@ async def relay_connect(websocket: WebSocket) -> None:
             await _close_websocket_best_effort(websocket, code=4400, reason="invalid hello")
             return
         token_version = int(token_version_text)
-        runner = storage.verify_probe_runner_relay_token(runner_id, token, token_version)
+        runner = await _storage_call(storage.verify_probe_runner_relay_token, runner_id, token, token_version)
         auth_key = _auth_failure_key(websocket, runner_id)
         if not runner:
-            storage.mark_probe_runner_relay_auth_failed(runner_id)
+            await _storage_call(storage.mark_probe_runner_relay_auth_failed, runner_id)
             await _record_auth_failure(auth_key)
             await _close_websocket_best_effort(websocket, code=4403, reason="relay token invalid")
             return
@@ -354,7 +394,7 @@ async def relay_connect(websocket: WebSocket) -> None:
         if session is None:
             return
         session_holder["session"] = session
-        storage.mark_probe_runner_relay_connected(runner_id, token_version=token_version)
+        await _storage_call(storage.mark_probe_runner_relay_connected, runner_id, token_version=token_version)
         logger.info("relay_connected runner_id=%r session_id=%s", runner_id, session.session_id)
         await session.send_json({"type": "ready"})
         while True:
@@ -370,12 +410,12 @@ async def relay_connect(websocket: WebSocket) -> None:
                 return
             message_type = str(message.get("type") or "")
             if message_type == "heartbeat":
-                if not _relay_session_credentials_valid(session):
+                if not await _storage_call(_relay_session_credentials_valid, session):
                     disconnect_reason = "relay token rotated"
                     await _close_websocket_best_effort(websocket, code=4403, reason="relay token rotated")
                     return
                 session.last_seen_monotonic = time.monotonic()
-                storage.mark_probe_runner_relay_seen(runner_id)
+                await _storage_call(storage.mark_probe_runner_relay_seen, runner_id)
                 await session.send_json({"type": "heartbeat_ack"})
             elif message_type == "data":
                 try:
@@ -411,24 +451,30 @@ async def relay_connect(websocket: WebSocket) -> None:
         disconnect_reason = str(exc)[:500]
         if runner_id:
             if session is None:
-                storage.mark_probe_runner_relay_disconnected(runner_id, disconnect_reason)
+                await _storage_call(storage.mark_probe_runner_relay_disconnected, runner_id, disconnect_reason)
         raise
     finally:
-        if session:
-            reason = session.disconnect_reason or disconnect_reason
-            # Unexpected exception text is retained in the existing node field;
-            # journal entries use a bounded classification instead of raw payloads.
-            known_reason = reason if reason in {"relay heartbeat timeout", "invalid relay message", "relay token rotated", "client disconnected"} or reason.startswith("websocket disconnected (code=") else "session_error"
-            logger.info("relay_disconnected runner_id=%r session_id=%s reason=%s active_streams=%s", runner_id, session.session_id, known_reason, len(session.streams))
-            active_session = False
-            async with SESSION_LOCK:
-                if ACTIVE_SESSIONS.get(runner_id) is session:
-                    ACTIVE_SESSIONS.pop(runner_id, None)
-                    active_session = True
-            if active_session:
-                storage.mark_probe_runner_relay_disconnected(runner_id, session.disconnect_reason or disconnect_reason)
-            await session.close()
-        await _release_public_connection()
+        # Resource cleanup must outlive failed status writes. Release the public
+        # connection slot even if session cleanup itself raises or is cancelled.
+        try:
+            if session:
+                try:
+                    reason = session.disconnect_reason or disconnect_reason
+                    # Unexpected exception text is retained in the existing node field;
+                    # journal entries use a bounded classification instead of raw payloads.
+                    known_reason = reason if reason in {"relay heartbeat timeout", "invalid relay message", "relay token rotated", "client disconnected"} or reason.startswith("websocket disconnected (code=") else "session_error"
+                    logger.info("relay_disconnected runner_id=%r session_id=%s reason=%s active_streams=%s", runner_id, session.session_id, known_reason, len(session.streams))
+                    active_session = False
+                    async with SESSION_LOCK:
+                        if ACTIVE_SESSIONS.get(runner_id) is session:
+                            ACTIVE_SESSIONS.pop(runner_id, None)
+                            active_session = True
+                    if active_session:
+                        await _storage_call(storage.mark_probe_runner_relay_disconnected, runner_id, session.disconnect_reason or disconnect_reason)
+                finally:
+                    await session.close()
+        finally:
+            await _release_public_connection()
 
 
 def main() -> None:
@@ -440,7 +486,9 @@ def main() -> None:
 
 def _prepare_runtime() -> None:
     ensure_runtime_dirs()
-    storage.init_db()
+    # Relay shares the main database but does not own its executing probes or
+    # library validations. Restarting transport must not settle their state.
+    storage.init_db(recover_interrupted=False)
     ensure_relay_certificate()
     relay_control_token()
     storage.mark_relay_runners_restarted()

@@ -130,18 +130,20 @@ class DynamicUiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_target_timeout_after_successful_setup_remains_target_failure(self):
         ctx = self.context()
+        # Windows' event-loop clock can have 15.625 ms resolution. Use a target
+        # budget well above that tick while still requiring most of it to elapse.
         ctx.check.update({
-            "entry_url": "https://example.com", "assertions_json": "[]", "timeout_ms": 20,
+            "entry_url": "https://example.com", "assertions_json": "[]", "timeout_ms": 200,
             "setup_script": "async def setup(ctx, page):\n    pass",
             "script": "async def check(ctx):\n    await ctx.pause(1)",
         })
-        ctx.timeout_ms = 20
+        ctx.timeout_ms = 200
         ctx.entry_url = ctx.check["entry_url"]
         with patch("backend.app.runner.RunContext", return_value=ctx):
             result = await CheckRunner()._execute_core(ctx.check, "manual", 0, {"ui_retry_attempts": 0})
         self.assertEqual(result["status"], "timeout")
         self.assertEqual(result["failure_kind"], "target")
-        self.assertGreaterEqual(result["duration_ms"], 15)
+        self.assertGreaterEqual(result["duration_ms"], 175)
 
     def context(self):
         check = {"type": "ui", "entry_url": "https://example.com/detail?sku=${skuId}&image=${image}",

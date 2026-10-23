@@ -11,6 +11,20 @@ from typing import Any
 
 
 JsonSender = Callable[[dict[str, Any]], Awaitable[None]]
+STREAM_CLOSE_TIMEOUT_SECONDS = 5
+
+
+async def close_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=STREAM_CLOSE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        # A peer that stopped reading can keep buffered data from draining.
+        # Abort the transport so accepted sockets cannot pin server shutdown.
+        transport = getattr(writer, "transport", None)
+        if transport is not None:
+            transport.abort()
+        raise
 
 
 @dataclass
@@ -30,8 +44,7 @@ class TunnelStream:
         for task in wait_tasks:
             task.cancel()
         try:
-            self.writer.close()
-            await self.writer.wait_closed()
+            await close_writer(self.writer)
         finally:
             if wait_tasks:
                 await asyncio.gather(*wait_tasks, return_exceptions=True)
@@ -65,7 +78,14 @@ async def pump_reader_to_sender(
             if max_bytes is not None and sent_bytes > max_bytes:
                 close_reason = "byte_limit"
                 break
-            await send_json({"type": "data", "stream_id": stream_id, "data": base64.b64encode(chunk).decode("ascii")})
+            try:
+                await asyncio.wait_for(
+                    send_json({"type": "data", "stream_id": stream_id, "data": base64.b64encode(chunk).decode("ascii")}),
+                    timeout=idle_timeout_seconds,
+                )
+            except TimeoutError:
+                close_reason = "idle_timeout"
+                break
     except asyncio.CancelledError:
         close_reason = "cancelled"
         raise
@@ -73,7 +93,10 @@ async def pump_reader_to_sender(
         close_reason = "io_error"
         raise
     finally:
-        await send_json({"type": "close", "stream_id": stream_id, "reason": close_reason})
+        await asyncio.wait_for(
+            send_json({"type": "close", "stream_id": stream_id, "reason": close_reason}),
+            timeout=STREAM_CLOSE_TIMEOUT_SECONDS,
+        )
 
 
 def decode_data_message(message: dict[str, Any]) -> bytes:

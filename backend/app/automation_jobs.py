@@ -14,6 +14,7 @@ from collections import Counter
 from typing import Any
 
 from . import storage
+from .async_storage import call as storage_call
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,8 @@ class BatchExecutor:
                 await asyncio.sleep(0.5)
                 continue
             try:
-                item = claim()
+                item = (await storage_call(claim, _on_cancelled_result=lambda claimed:
+                    finish(claimed, 'unknown', message='领取等待中断；请核对关联运行') if claimed else None))
             except Exception:
                 logger.exception("Unable to claim a queued execution item")
                 await asyncio.sleep(1)
@@ -177,12 +179,12 @@ class BatchExecutor:
             try:
                 result = await self.runner.run_check(item["check_id"], project_id=item["project_id"],
                     trigger=f"mcp-batch:{item['batch_id']}:{item['check_id']}", expected_definition_hash=item["definition_hash"])
-                finish(item, "completed", result)
+                (await storage_call(finish, item, "completed", result))
             except DispatchRejected:
-                finish(item, "rejected", message="任务定义或启停状态已变化；未执行，请重新确认任务范围")
+                (await storage_call(finish, item, "rejected", message="任务定义或启停状态已变化；未执行，请重新确认任务范围"))
             except asyncio.CancelledError:
-                finish(item, "unknown", message="执行等待中断；不要重试，请核对关联运行")
+                (await storage_call(finish, item, "unknown", message="执行等待中断；不要重试，请核对关联运行"))
                 raise
             except Exception:
                 # Even a runner error may follow an external side effect. Never requeue.
-                finish(item, "unknown", message="执行结果未知；请核对关联运行和目标状态")
+                (await storage_call(finish, item, "unknown", message="执行结果未知；请核对关联运行和目标状态"))

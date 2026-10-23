@@ -34,8 +34,62 @@ class DeploymentBackupTests(unittest.TestCase):
     def create(self, **kwargs) -> Path:
         return backups.create(self.root, uuid.uuid4().hex, self.app, **kwargs)
 
+    def test_large_snapshot_is_not_scanned_separately_for_hashing(self) -> None:
+        with closing(sqlite3.connect(self.app / 'data' / 'pulseguard.db')) as conn:
+            conn.execute('CREATE TABLE blobs (data BLOB)')
+            conn.execute('INSERT INTO blobs VALUES (?)', (b'x' * (2 * 1024 * 1024),))
+            conn.commit()
+        with patch.object(backups, '_digest', wraps=backups._digest) as digest:
+            path = self.create()
+        self.assertNotIn('database.db', [call.args[0].name for call in digest.call_args_list])
+        restored = self.directory / 'large-restored.db'
+        with gzip.open(path / 'database.db.gz', 'rb') as source:
+            restored.write_bytes(source.read())
+        with closing(sqlite3.connect(restored)) as conn:
+            self.assertEqual(conn.execute('SELECT length(data) FROM blobs').fetchone()[0], 2 * 1024 * 1024)
+
     def complete(self, path: Path, retention: int = 2, **kwargs) -> list[str]:
         return backups.complete(self.root, path.name.removeprefix("managed-"), retention, **kwargs)
+
+    def test_snapshot_callback_resumes_writes_without_changing_frozen_recovery_point(self) -> None:
+        observed = []
+
+        def resume(snapshot):
+            observed.append(snapshot)
+            self.assertTrue(snapshot.is_file())
+            self.assertTrue((snapshot.parent.parent / 'source.tar.gz').is_file())
+            self.assertTrue((snapshot.parent.parent / 'runtime.tar.gz').is_file())
+            self.assertFalse((snapshot.parent.parent / 'manifest.json').exists())
+            (self.app / 'backend/main.py').write_text('resumed source')
+            (self.app / 'data/runner-token.key').write_text('resumed key')
+            with closing(sqlite3.connect(self.app / 'data/pulseguard.db')) as conn:
+                conn.execute("INSERT INTO settings VALUES ('after_snapshot', 'new')")
+                conn.commit()
+
+        path = self.create(on_snapshot=resume)
+        self.assertEqual(len(observed), 1)
+        with tarfile.open(path / 'source.tar.gz') as archive:
+            self.assertEqual(archive.extractfile('backend/main.py').read(), b'old source')
+        with tarfile.open(path / 'runtime.tar.gz') as archive:
+            self.assertEqual(archive.extractfile('data/runner-token.key').read(), b'test-key')
+        restored = self.directory / 'callback-restored.db'
+        with gzip.open(path / 'database.db.gz', 'rb') as source:
+            restored.write_bytes(source.read())
+        with closing(sqlite3.connect(restored)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM settings').fetchone()[0], 1)
+        self.complete(path)
+
+    def test_snapshot_callback_failure_cannot_create_accepted_backup_or_prune_history(self) -> None:
+        previous = self.create()
+        self.complete(previous)
+
+        def fail(_snapshot):
+            raise RuntimeError('resume failed')
+
+        with self.assertRaisesRegex(RuntimeError, 'resume failed'):
+            self.create(on_snapshot=fail)
+        self.assertTrue(previous.is_dir())
+        self.assertEqual(len(list(self.root.glob('managed-*/manifest.json'))), 1)
 
     def test_database_and_runtime_round_trip_without_recursive_backups(self) -> None:
         (self.app / ".venv").mkdir()

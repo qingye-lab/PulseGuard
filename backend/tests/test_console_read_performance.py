@@ -60,6 +60,66 @@ class ConsoleReadPerformanceTests(unittest.TestCase):
         self.assertIn("USING COVERING INDEX", count_plan)
         self.assertIn("project_id=? AND observation_kind=?", count_plan)
 
+    def test_tab_filters_count_and_page_from_a_covering_index(self) -> None:
+        # Rule: every console tab dimension must reach an exact count through a
+        # covering index. A plan that reads the runs table means one wide-row
+        # lookup per row of the whole project scope, which costs minutes cold.
+        cases = (
+            ({"check_type": "api"}, 2),
+            ({"status": "failed"}, 3),
+            ({"check_type": "ui", "status": "failed"}, 2),
+            ({"check_type": "api", "status": "failed"}, 1),
+        )
+        for extra, expected_total in cases:
+            filters = {"project_id": self.project_id, "observation_kind": "observation", **extra}
+            clauses, params = storage._run_filter_clauses(filters)
+            where = " WHERE " + " AND ".join(clauses)
+            with storage._connect(read_only=True) as conn:
+                count_plan = " ".join(str(row[3]) for row in conn.execute(
+                    f"EXPLAIN QUERY PLAN SELECT COUNT(*) FROM runs{where}", params,
+                ))
+                page_plan = " ".join(str(row[3]) for row in conn.execute(
+                    "EXPLAIN QUERY PLAN " + storage._run_page_select(filters, where),
+                    [*params, 2, 0],
+                ))
+                self.assertIn("USING COVERING INDEX idx_runs_project_page_filter_started", count_plan)
+                self.assertNotIn("SCAN runs", count_plan)
+                self.assertIn("MATERIALIZE page", page_plan)
+                self.assertIn("USING COVERING INDEX idx_runs_project_page_filter_started", page_plan)
+                self.assertIn("SEARCH r USING INTEGER PRIMARY KEY", page_plan)
+            self.assertEqual(storage.list_runs_page(filters, page=1, page_size=2)["total"], expected_total)
+
+    def test_sparse_tabs_page_ids_before_reading_wide_rows_with_or_without_kind(self) -> None:
+        with storage._connect() as conn:
+            conn.executemany(
+                """INSERT INTO runs(project_id, check_id, check_name, check_type, status,
+                    started_at, created_at, observation_kind, logs)
+                    VALUES (?, 1, 'Recent success', 'api', 'ok', ?, ?, 'observation', ?)""",
+                [(self.project_id, (self.started + timedelta(seconds=i + 1)).isoformat(),
+                  self.started.isoformat(), 'x' * 8192) for i in range(1000)],
+            )
+        for kind in ('observation', ''):
+            for extra in ({'status': 'failed'}, {'check_type': 'ui'}, {'check_type': 'ui', 'status': 'failed'}):
+                filters = {'project_id': self.project_id, 'observation_kind': kind, **extra}
+                with self.subTest(filters=filters):
+                    clauses, params = storage._run_filter_clauses(filters)
+                    sql = storage._run_page_select(filters, ' WHERE ' + ' AND '.join(clauses))
+                    with storage._connect(read_only=True) as conn:
+                        plan = ' '.join(row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + sql, [*params, 2, 0]))
+                    self.assertIn('MATERIALIZE page', plan)
+                    self.assertIn('USING COVERING INDEX idx_runs_project_page_filter_started', plan)
+                    self.assertIn('SEARCH r USING INTEGER PRIMARY KEY', plan)
+                    expected = storage.list_runs(filters, limit=100, summary_only=True)
+                    first = storage.list_runs_page(filters, page=1, page_size=2)
+                    second = storage.list_runs_page(filters, page=2, page_size=2)
+                    self.assertEqual(first['total'], len(expected))
+                    self.assertEqual(first['items'] + second['items'], expected)
+
+    def test_noncovered_filters_keep_their_full_semantics(self) -> None:
+        filters = {'project_id': self.project_id, 'status': 'failed', 'runner_id': 'runner-1'}
+        expected = storage.list_runs(filters, limit=100, summary_only=True)
+        self.assertEqual(storage.list_runs_page(filters)['items'], expected)
+
     def test_pagination_and_filters_keep_exact_results_and_order_without_sorting(self) -> None:
         filters = {"project_id": self.project_id, "observation_kind": "observation"}
         expected = storage.list_runs(filters, limit=100, summary_only=True)

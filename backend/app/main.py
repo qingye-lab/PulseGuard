@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from .api_assertions import ApiInspectionFailure, inspect_api_response
 from .ui_diagnostics import UiInspectionFailure
 from . import config_transfer, failure_summary, notifier, request_timing, run_comparison, storage
+from .async_storage import call as storage_call
 from .defaults import DEFAULT_SETTINGS
 from .frontend_assets import FrontendAssets
 from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TEAM_NAME, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_PRINT_TOKEN, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs, relay_control_token
@@ -138,7 +139,7 @@ async def _cancel_background_tasks(tasks: set[asyncio.Task[Any]]) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    storage.init_db()
+    (await storage_call(storage.init_db))
     runner = CheckRunner()
     app.state.runner = runner
     await runner.start()
@@ -147,7 +148,7 @@ async def lifespan(app: FastAPI):
     scheduler = None
     batch_executor = None
     try:
-        _track_background_task(app, _sync_enabled_browser_type_installation(storage.get_settings()))
+        _track_background_task(app, _sync_enabled_browser_type_installation((await storage_call(storage.get_settings))))
         if NODE_ROLE != "worker":
             scheduler = PulseScheduler(runner)
             app.state.scheduler = scheduler
@@ -167,7 +168,7 @@ async def lifespan(app: FastAPI):
         await shutdown_browser_installation()
         if scheduler is not None:
             scheduler.shutdown()
-        await runner.shutdown(record_cancelled=not storage.is_deployment_window_active())
+        await runner.shutdown(record_cancelled=not (await storage_call(storage.is_deployment_window_active)))
 
 
 ensure_runtime_dirs()
@@ -421,28 +422,32 @@ async def validate_library(
     project_id: int = Depends(_active_library_project_context),
 ) -> dict[str, Any]:
     try:
-        validation = storage.create_project_library_validation(
+        validation = (await storage_call(storage.create_project_library_validation,
             project_id,
             payload.candidate_revision,
             include_disabled=payload.include_disabled,
-        )
+            _on_cancelled_result=lambda row: storage.finish_project_library_validation(
+                project_id, row['id'], 'cancelled', checks=[], diagnostics=[]),
+        ))
     except storage.LibraryRevisionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except storage.ModuleLibraryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    storage.record_audit_event(
-        "created",
-        "script_library_validation",
-        validation["id"],
-        summary="创建公共方法验证",
-        payload={
-            "candidate_revision": validation["candidate_revision"],
-            "include_disabled": bool(validation.get("include_disabled")),
-        },
-        project_id=project_id,
-    )
+    try:
+        await storage_call(storage.record_audit_event,
+            "created", "script_library_validation", validation["id"],
+            summary="创建公共方法验证",
+            payload={"candidate_revision": validation["candidate_revision"],
+                     "include_disabled": bool(validation.get("include_disabled"))},
+            project_id=project_id,
+        )
+    except BaseException as exc:
+        await storage_call(storage.finish_project_library_validation,
+            project_id, validation['id'], 'cancelled' if isinstance(exc, asyncio.CancelledError) else 'failed',
+            checks=[], diagnostics=[])
+        raise
     _track_background_task(
         request.app,
         script_library_service.run_project_library_validation(
@@ -623,7 +628,7 @@ async def worker_update_status(authorization: str = Header(default="")) -> dict[
 @app.post("/api/heartbeats/{key}")
 async def record_heartbeat(key: str, request: Request) -> dict[str, Any]:
     heartbeat_key = _normalize_heartbeat_key(key)
-    settings = storage.get_settings()
+    settings = (await storage_call(storage.get_settings))
     try:
         raw = await request.json()
     except Exception:
@@ -637,7 +642,7 @@ async def record_heartbeat(key: str, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="心跳状态必须是 ok 或 failed")
     message = mask_text(str(raw.get("message") or "").strip(), settings)[:500]
     payload = mask_data(raw.get("payload") if isinstance(raw.get("payload"), dict) else {}, settings)
-    heartbeat = storage.record_heartbeat(heartbeat_key, status=status, message=message, payload=payload)
+    heartbeat = (await storage_call(storage.record_heartbeat, heartbeat_key, status=status, message=message, payload=payload))
     return {"ok": True, "heartbeat": mask_data(heartbeat, settings)}
 
 
@@ -674,7 +679,7 @@ async def prepare_deployment(
     wait_seconds: int = Query(default=60, ge=0, le=300),
     reason: str = Query(default="docker-deploy", min_length=1, max_length=80),
 ) -> dict[str, Any]:
-    state = storage.start_deployment_window(reason)
+    state = (await storage_call(storage.start_deployment_window, reason))
     scheduler = request.app.state.scheduler
     if hasattr(scheduler, "pause"):
         scheduler.pause()
@@ -684,16 +689,16 @@ async def prepare_deployment(
         if hasattr(runner, "wait_for_idle")
         else runner.runtime_status()
     )
-    storage.record_audit_event(
+    (await storage_call(storage.record_audit_event,
         "started",
         "deployment",
         entity_name=state["reason"],
         summary="进入部署维护窗口",
         payload={"wait_seconds": wait_seconds, "runner": runner_status},
-    )
+    ))
     return {
         "ok": True,
-        "deployment": storage.get_deployment_state(),
+        "deployment": (await storage_call(storage.get_deployment_state)),
         "runner": runner_status,
         "scheduler": _scheduler_runtime_status(scheduler),
     }
@@ -712,13 +717,13 @@ async def complete_deployment(
         if hasattr(runner, "wait_for_idle")
         else runner.runtime_status()
     )
-    discarded_incomplete_runs = storage.discard_incomplete_runs()
-    state = storage.finish_deployment_window()
+    discarded_incomplete_runs = (await storage_call(storage.discard_incomplete_runs))
+    state = (await storage_call(storage.finish_deployment_window))
     if hasattr(scheduler, "resume"):
         scheduler.resume()
     elif hasattr(scheduler, "refresh_all"):
         scheduler.refresh_all()
-    storage.record_audit_event(
+    (await storage_call(storage.record_audit_event,
         "completed",
         "deployment",
         entity_name=state.get("reason") or "docker-deploy",
@@ -729,10 +734,10 @@ async def complete_deployment(
             "discarded_incomplete_runs": discarded_incomplete_runs,
             "runner": runner_status,
         },
-    )
+    ))
     return {
         "ok": True,
-        "deployment": storage.get_deployment_state(),
+        "deployment": (await storage_call(storage.get_deployment_state)),
         "runs": runs,
         "discarded_incomplete_runs": discarded_incomplete_runs,
         "runner": runner_status,
@@ -853,25 +858,25 @@ def rotate_runner_token(runner_id: str) -> dict[str, Any]:
 
 @app.post("/api/runners/{runner_id}/update")
 async def update_runner_node(runner_id: str, payload: WorkerUpdateRequest) -> dict[str, Any]:
-    runner = storage.get_probe_runner(runner_id)
+    runner = (await storage_call(storage.get_probe_runner, runner_id))
     if not runner:
         raise HTTPException(status_code=404, detail="Runner 不存在")
     if str(runner.get("role") or "") == "local":
         raise HTTPException(status_code=400, detail="本机 Runner 不支持远程更新")
     previous_status = str(runner.get("status") or "")
-    storage.mark_probe_runner_updating(runner_id)
+    (await storage_call(storage.mark_probe_runner_updating, runner_id))
     try:
         result = await _worker_request(runner, "POST", "/api/worker/update", payload.model_dump(exclude_none=True), timeout=10)
     except Exception:
-        storage.restore_probe_runner_status(runner_id, previous_status)
+        (await storage_call(storage.restore_probe_runner_status, runner_id, previous_status))
         raise
-    storage.record_audit_event("updated", "runner", runner_id, runner.get("name", ""), "推送执行节点更新", {"target_image": payload.target_image or ""})
+    (await storage_call(storage.record_audit_event, "updated", "runner", runner_id, runner.get("name", ""), "推送执行节点更新", {"target_image": payload.target_image or ""}))
     return {"ok": True, "message": "节点更新任务已下发", "worker": result}
 
 
 @app.get("/api/runners/{runner_id}/update-status")
 async def runner_update_status(runner_id: str) -> dict[str, Any]:
-    runner = storage.get_probe_runner(runner_id)
+    runner = (await storage_call(storage.get_probe_runner, runner_id))
     if not runner:
         raise HTTPException(status_code=404, detail="Runner 不存在")
     if str(runner.get("role") or "") == "local":
@@ -882,16 +887,16 @@ async def runner_update_status(runner_id: str) -> dict[str, Any]:
 
 @app.post("/api/runners/{runner_id}/test")
 async def test_runner_connection(runner_id: str) -> dict[str, Any]:
-    runner = storage.get_probe_runner(runner_id)
+    runner = (await storage_call(storage.get_probe_runner, runner_id))
     if not runner:
         raise HTTPException(status_code=404, detail="Runner 不存在")
     if str(runner.get("role")) == "local":
         return {"ok": True, "message": "local Runner 可用", "runner": runner}
     try:
         health = await _fetch_runner_health(runner)
-        storage.mark_probe_runner_available(runner_id, health)
+        (await storage_call(storage.mark_probe_runner_available, runner_id, health))
     except Exception as exc:
-        storage.mark_probe_runner_unavailable(runner_id)
+        (await storage_call(storage.mark_probe_runner_unavailable, runner_id))
         raise HTTPException(status_code=400, detail=f"Runner 连接失败：{exc}") from exc
     return {"ok": True, "message": "Runner 连接正常", "worker": health}
 
@@ -1062,7 +1067,7 @@ async def restore_database_backup(filename: str, request: Request) -> dict[str, 
                     except asyncio.CancelledError:
                         cancelled = True
                 result = restore_task.result()
-                storage.record_audit_event("restored", "database_backup", entity_name=filename, summary="恢复数据库备份")
+                (await storage_call(storage.record_audit_event, "restored", "database_backup", entity_name=filename, summary="恢复数据库备份"))
                 if cancelled:
                     raise asyncio.CancelledError
                 return result
@@ -1072,7 +1077,7 @@ async def restore_database_backup(filename: str, request: Request) -> dict[str, 
             finally:
                 if recovery_failed:
                     scheduler.pause()
-                elif was_paused or storage.is_deployment_window_active():
+                elif was_paused or (await storage_call(storage.is_deployment_window_active)):
                     scheduler.refresh_all()
                 else:
                     scheduler.resume()
@@ -1112,10 +1117,10 @@ async def run_all_checks(
 async def batch_checks(
     payload: CheckBatchRequest, request: Request, project_id: int = Depends(_active_project_context)
 ) -> dict[str, Any]:
-    storage.refresh_stale_statuses(project_id=project_id)
+    (await storage_call(storage.refresh_stale_statuses, project_id=project_id))
     checks_by_id: dict[int, dict[str, Any]] = {}
     for check_id in payload.ids:
-        check = storage.get_check(check_id, refresh_stale=False, project_id=project_id)
+        check = (await storage_call(storage.get_check, check_id, refresh_stale=False, project_id=project_id))
         if check and check.get("type") == payload.type:
             checks_by_id[int(check["id"])] = check
 
@@ -1136,20 +1141,20 @@ async def batch_checks(
         return {"matched": len(runnable_ids), "changed": 0, "ids": runnable_ids, "runs": runs}
 
     if payload.action == "enable":
-        changed = storage.batch_set_check_enabled(ids, True, project_id=project_id)
+        changed = (await storage_call(storage.batch_set_check_enabled, ids, True, project_id=project_id))
     else:
-        changed = storage.batch_set_check_enabled(ids, False, project_id=project_id)
+        changed = (await storage_call(storage.batch_set_check_enabled, ids, False, project_id=project_id))
 
     for check_id in ids:
         request.app.state.scheduler.sync_check(check_id)
-    storage.record_audit_event(
+    (await storage_call(storage.record_audit_event,
         payload.action,
         "check_batch",
         entity_name=payload.type,
         summary="批量操作任务",
         payload={"type": payload.type, "matched": len(ids), "changed": changed, "ids": ids},
         project_id=project_id,
-    )
+    ))
     return {"matched": len(ids), "changed": changed, "ids": ids, "runs": []}
 
 
@@ -1157,7 +1162,7 @@ async def batch_checks(
 async def debug_check(
     payload: CheckCreate, request: Request, project_id: int = Depends(_active_project_context)
 ) -> dict[str, Any]:
-    data = {**_validated_check_payload(payload), "project_id": project_id}
+    data = {**(await storage_call(_validated_check_payload, payload)), "project_id": project_id}
     return await request.app.state.runner.run_draft(data, trigger="draft-debug")
 
 
@@ -1165,14 +1170,14 @@ async def debug_check(
 async def inspect_api_check(
     payload: ApiInspectRequest, request: Request, project_id: int = Depends(_active_project_context)
 ) -> dict[str, Any]:
-    settings = storage.settings_for_project(storage.get_settings(), project_id)
+    settings = (await storage_call(storage.settings_for_project, (await storage_call(storage.get_settings)), project_id))
     runner = getattr(request.app.state, "runner", None)
     resources = getattr(runner, "resources", None)
     try:
         script_loader = getattr(runner, "_load_check_function", None)
         config = {**payload.model_dump(), "project_id": project_id}
         if str(config.get("script") or "").strip():
-            config["_module_bundle"] = storage.get_published_library(project_id)
+            config["_module_bundle"] = (await storage_call(storage.get_published_library, project_id))
         return await inspect_api_response(
             config, settings, resources=resources, script_loader=script_loader
         )
@@ -1192,7 +1197,7 @@ async def inspect_api_check(
 async def inspect_ui_check(
     payload: UiInspectRequest, request: Request, project_id: int = Depends(_active_project_context)
 ) -> dict[str, Any]:
-    settings = storage.get_settings()
+    settings = (await storage_call(storage.get_settings))
     try:
         return await request.app.state.runner.inspect_ui({**payload.model_dump(), "project_id": project_id})
     except UiInspectionFailure as exc:
@@ -1208,7 +1213,7 @@ async def inspect_ui_check(
 async def inspect_ui_rules(
     payload: UiInspectRulesRequest, request: Request, project_id: int = Depends(_active_project_context)
 ) -> dict[str, Any]:
-    settings = storage.get_settings()
+    settings = (await storage_call(storage.get_settings))
     try:
         return await request.app.state.runner.inspect_ui_rules({**payload.model_dump(), "project_id": project_id})
     except UiInspectionFailure as exc:
@@ -1557,7 +1562,7 @@ def run_success_comparison(run_id: int, project_id: int = Depends(_project_conte
 async def rerun(
     run_id: int, request: Request, project_id: int = Depends(_active_project_context)
 ) -> dict[str, Any]:
-    run = storage.get_run(run_id, project_id=project_id)
+    run = (await storage_call(storage.get_run, run_id, project_id=project_id))
     if not run:
         raise HTTPException(status_code=404, detail="运行记录不存在")
     if int(run["check_id"]) <= 0:
@@ -1578,15 +1583,15 @@ def get_settings() -> dict[str, Any]:
 @app.put("/api/settings")
 async def update_settings(payload: SettingsUpdate, request: Request) -> dict[str, Any]:
     try:
-        settings = storage.update_settings(payload.values)
+        settings = (await storage_call(storage.update_settings, payload.values))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await request.app.state.runner.reload_settings()
     if "enabled_browser_types" in payload.values:
         _track_background_task(request.app, _sync_enabled_browser_type_installation(settings))
     request.app.state.scheduler.refresh_all()
-    storage.record_audit_event("updated", "settings", summary="更新系统设置", payload={"fields": sorted(payload.values)})
-    return storage.get_public_settings()
+    (await storage_call(storage.record_audit_event, "updated", "settings", summary="更新系统设置", payload={"fields": sorted(payload.values)}))
+    return (await storage_call(storage.get_public_settings))
 
 
 @app.post("/api/read-only-tokens")
@@ -1625,7 +1630,7 @@ def delete_read_only_token(token_id: str) -> dict[str, Any]:
 async def test_alert(
     payload: SettingsUpdate, project_id: int = Depends(_active_project_context)
 ) -> dict[str, Any]:
-    settings = _project_alert_settings_with_overrides(payload, project_id)
+    settings = (await storage_call(_project_alert_settings_with_overrides, payload, project_id))
     try:
         await notifier.send_test_alert(settings)
     except notifier.AlertDeliveryError as exc:
@@ -1642,7 +1647,7 @@ def alert_preview(
 
 @app.post("/api/settings/test-system-alert")
 async def test_system_alert(payload: SettingsUpdate) -> dict[str, Any]:
-    settings = _settings_with_overrides(payload)
+    settings = (await storage_call(_settings_with_overrides, payload))
     effective = {
         **settings,
         "notification_channels": settings.get("system_notification_channels") or [],
@@ -1725,7 +1730,7 @@ async def import_config(payload: ConfigImportRequest, request: Request) -> dict[
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await request.app.state.runner.reload_settings()
-    storage.record_audit_event("imported", "config", summary="导入配置", payload=result)
+    (await storage_call(storage.record_audit_event, "imported", "config", summary="导入配置", payload=result))
     return result
 
 
@@ -1883,12 +1888,12 @@ async def _run_enabled_checks(
     concurrent: bool = True,
     project_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    checks_to_run = storage.list_checks(
+    checks_to_run = (await storage_call(storage.list_checks,
         check_type,
         enabled_only=True,
         project_id=project_id,
         active_projects_only=project_id is None,
-    )
+    ))
     if not concurrent:
         results: list[dict[str, Any]] = []
         for check in checks_to_run:
@@ -2017,7 +2022,7 @@ async def _sync_enabled_browser_type_installation(settings: dict[str, Any]) -> N
         pass
     runners = [
         runner
-        for runner in storage.list_enabled_probe_runners()
+        for runner in (await storage_call(storage.list_enabled_probe_runners))
         if str(runner.get("role") or "") == "child" and runner.get("available")
     ]
     for runner in runners:
@@ -2034,7 +2039,7 @@ def _missing_enabled_browser_types(source: dict[str, Any], settings: dict[str, A
 
 
 async def _install_missing_enabled_browser_types_on_runner(runner: dict[str, Any], health: dict[str, Any]) -> None:
-    missing = _missing_enabled_browser_types(health, storage.get_settings())
+    missing = _missing_enabled_browser_types(health, (await storage_call(storage.get_settings)))
     if not missing:
         return
     await _worker_request(runner, "POST", "/api/worker/browser-types/install", {"browser_types": missing}, timeout=10)
@@ -2095,19 +2100,25 @@ async def _poll_runner_health(
     try:
         async with health_semaphore:
             health = await _fetch_runner_health(runner)
-            storage.mark_probe_runner_available(runner_id, health)
     except asyncio.CancelledError:
         raise
-    except Exception:
-        latest = storage.mark_probe_runner_unavailable(runner_id)
+    except Exception as exc:
+        # The poll decides a node is offline right here, so the reason must be
+        # recorded or the outage stays undiagnosable.
+        logger.warning("runner_health_probe_failed runner_id=%r error_type=%s error=%s", runner_id, type(exc).__name__, str(exc)[:200])
+        latest = (await storage_call(storage.mark_probe_runner_unavailable, runner_id))
         # The poll is often the first thing to notice a node is gone.  Dispatch
         # will now skip that node entirely, so if the alert is not raised here
         # it is never raised at all.
         _schedule_runner_unavailable_notification(latest or runner_id, notification_tasks)
         return
 
+    # Persistence failures are not evidence that the remote node is offline.
+    await storage_call(storage.mark_probe_runner_available, runner_id, health)
+
     try:
-        _schedule_runner_browser_install(runner, health, install_semaphore, install_tasks)
+        settings = await storage_call(storage.get_settings)
+        _schedule_runner_browser_install(runner, health, install_semaphore, install_tasks, settings=settings)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -2162,8 +2173,9 @@ def _schedule_runner_browser_install(
     health: dict[str, Any],
     semaphore: asyncio.Semaphore,
     install_tasks: dict[str, asyncio.Task[Any]],
+    *, settings: dict[str, Any] | None = None,
 ) -> None:
-    missing = _missing_enabled_browser_types(health, storage.get_settings())
+    missing = _missing_enabled_browser_types(health, settings if settings is not None else storage.get_settings())
     if not missing:
         return
     runner_id = str(runner.get("runner_id") or "")
@@ -2222,7 +2234,7 @@ async def _runner_health_poll_loop() -> None:
             try:
                 runners = [
                     runner
-                    for runner in storage.list_enabled_probe_runners()
+                    for runner in (await storage_call(storage.list_enabled_probe_runners))
                     if str(runner.get("role") or "") == "child"
                 ]
                 await _poll_runner_health_round(runners, health_semaphore, install_semaphore, install_tasks, notification_tasks)

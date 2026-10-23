@@ -1133,6 +1133,31 @@ class RunnerHealthPollingTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_a_failed_health_probe_records_why_the_node_is_offline(self) -> None:
+        async def scenario() -> None:
+            detail = "[WinError 10061] No connection could be made because the target machine actively refused it"
+
+            async def fetch(_runner: dict[str, object]) -> dict[str, object]:
+                raise ConnectionRefusedError(detail)
+
+            with patch.object(main_module, "_fetch_runner_health", side_effect=fetch), patch.object(
+                main_module.storage, "mark_probe_runner_unavailable", return_value=None
+            ) as mark_unavailable, patch.object(
+                main_module, "_schedule_runner_unavailable_notification"
+            ) as notify, self.assertLogs(main_module.logger, level="WARNING") as logs:
+                await main_module._poll_runner_health(
+                    self._runner("edge-1"), asyncio.Semaphore(1), asyncio.Semaphore(1), {}, {}
+                )
+
+            text = "\n".join(logs.output)
+            self.assertIn("runner_health_probe_failed", text)
+            self.assertIn("ConnectionRefusedError", text)
+            self.assertIn("actively refused it", text)
+            mark_unavailable.assert_called_once_with("edge-1")
+            notify.assert_called_once_with("edge-1", {})
+
+        asyncio.run(scenario())
+
     @staticmethod
     def _runner(runner_id: str) -> dict[str, object]:
         return {"runner_id": runner_id, "role": "child", "address": f"http://{runner_id}:8788"}
@@ -1221,7 +1246,9 @@ class RunnerHealthPollingTests(unittest.TestCase):
             release_install = asyncio.Event()
             install_failed = asyncio.Event()
             second_health_poll = asyncio.Event()
+            second_health_persisted = asyncio.Event()
             hold_later_polls = asyncio.Event()
+            loop = asyncio.get_running_loop()
             fetch_count = 0
             install_calls = 0
 
@@ -1253,11 +1280,16 @@ class RunnerHealthPollingTests(unittest.TestCase):
             ), patch.object(main_module, "logger") as logger, patch.object(
                 main_module, "RUNNER_HEALTH_POLL_SECONDS", 0.01
             ):
+                def persisted(*args):
+                    if mark_available.call_count >= 2:
+                        loop.call_soon_threadsafe(second_health_persisted.set)
+                mark_available.side_effect = persisted
                 logger.exception.side_effect = lambda *args: install_failed.set()
                 poll_task = asyncio.create_task(main_module._runner_health_poll_loop())
                 try:
                     await asyncio.wait_for(install_started.wait(), 1)
                     await asyncio.wait_for(second_health_poll.wait(), 1)
+                    await asyncio.wait_for(second_health_persisted.wait(), 1)
                     self.assertEqual(install_calls, 1)
                     self.assertGreaterEqual(fetch_count, 2)
                     self.assertGreaterEqual(mark_available.call_count, 2)

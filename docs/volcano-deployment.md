@@ -1,5 +1,7 @@
 # PulseGuard 火山部署说明
 
+唯一本地源码目录为 `D:\project\PulseGuard`。构建、测试、MCP 和发布均从该目录执行；旧 Documents 路径仅作迁移兼容入口，不再维护独立源码树。
+
 当前推荐拓扑：
 
 - 火山服务器是公网主节点，默认地址 `http://115.190.188.243:8787`。
@@ -9,7 +11,13 @@
 
 通用的国内网络部署坑和 systemd 部署脚本见 [china-deployment.md](./china-deployment.md)。火山只是这套方法的一个实例，默认使用火山 PyPI 镜像和 `9443` relay 端口。
 
+主机预览回收、压力准入、日志上限和维护资源限制见 [资源保护运维](./volcano-resource-guard.md)。
+
 ## 远端服务
+
+不涉及依赖、环境或数据库结构变化的定向发布使用 `scripts/systemd_release.py`，在远端上传目录依次执行 `preflight`、`snapshot`、`apply`。上传目录包含 `manifest.json`、`stage/`、执行脚本和配套的 `deployment_backups.py`。manifest 的 `id` 为 32 位十六进制恢复点 ID，`files` 为相对源码路径到 `baseline`（原文件 SHA256，新增文件为 null）和 `sha256`（候选 SHA256）的映射。
+
+预演使用真实数据库的隔离副本。快照冻结后恢复原实例，完整性检查和压缩继续处理不可变副本。切流只替换 manifest 指定的源码，任何部分替换失败都按事先保存的逐文件原件恢复；不替换在线数据库。验收按真实项目头及 `observation_kind=observation` 检查各个历史分页筛选；HTTP/结构/范围错误必须失败，延迟另行记录。验收成功后正式完成恢复点并执行现有保留规则；保留收尾失败单独处理，不回滚已验收代码。
 
 火山当前使用 systemd 部署，根目录是 `/opt/pulseguard`：
 

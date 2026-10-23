@@ -25,6 +25,8 @@ from .browser_types import (
 )
 from .ui_assertions import has_enabled_ui_assertions, run_structured_ui_check
 from . import notifier, storage
+from .async_storage import call as storage_call
+from .async_storage import create_run as create_run_async
 from .artifacts import ArtifactStore
 from .context import RunContext, RunFailure, RunnerEnvironmentFailure, PreparationFailure, compile_check_function
 from .monitoring import run_metadata
@@ -147,13 +149,13 @@ class CheckRunner:
 
     async def start(self) -> None:
         self._closing = False
-        settings = storage.get_settings()
+        settings = (await storage_call(storage.get_settings))
         await self.resources.start(
             settings,
-            api_pool_size=self._api_pool_size(settings),
-            browser_pool_sizes_value=self._browser_pool_sizes(settings),
+            api_pool_size=(await storage_call(self._api_pool_size, settings)),
+            browser_pool_sizes_value=(await storage_call(self._browser_pool_sizes, settings)),
         )
-        self._refresh_local_runner_browser_capabilities(settings)
+        (await storage_call(self._refresh_local_runner_browser_capabilities, settings))
 
     async def shutdown(self, record_cancelled: bool = True) -> None:
         previous_suppression = self._suppress_shutdown_records
@@ -176,33 +178,33 @@ class CheckRunner:
             self._suppress_shutdown_records = previous_suppression
 
     async def reload_settings(self) -> None:
-        settings = storage.get_settings()
-        self._queue_limit = self._max_queue_size(settings)
-        await self._global_limiter.resize(self._max_concurrency(settings))
-        await self._ui_limiter.resize(self._max_ui_concurrency(settings))
+        settings = (await storage_call(storage.get_settings))
+        self._queue_limit = (await storage_call(self._max_queue_size, settings))
+        await self._global_limiter.resize((await storage_call(self._max_concurrency, settings)))
+        await self._ui_limiter.resize((await storage_call(self._max_ui_concurrency, settings)))
         await self.resources.reload(
             settings,
-            api_pool_size=self._api_pool_size(settings),
-            browser_pool_sizes_value=self._browser_pool_sizes(settings),
+            api_pool_size=(await storage_call(self._api_pool_size, settings)),
+            browser_pool_sizes_value=(await storage_call(self._browser_pool_sizes, settings)),
         )
-        self._refresh_local_runner_browser_capabilities(settings)
+        (await storage_call(self._refresh_local_runner_browser_capabilities, settings))
 
     async def run_check(
         self, check_id: int, trigger: str = "scheduled", project_id: int | None = None,
         *, expected_definition_hash: str | None = None,
     ) -> dict[str, Any]:
-        check = storage.get_check(check_id, project_id=project_id)
+        check = (await storage_call(storage.get_check, check_id, project_id=project_id))
         if not check:
             raise ValueError("任务不存在")
         if expected_definition_hash is not None:
             from .automation_jobs import definition_hash, DispatchRejected
             if not check.get("enabled") or definition_hash(check) != expected_definition_hash:
                 raise DispatchRejected("任务配置或启停状态已变化，批次未执行此任务")
-        project = storage.get_project(int(check["project_id"]))
+        project = (await storage_call(storage.get_project, int(check["project_id"])))
         if not project or project.get("status") != "active":
             raise ValueError("归档项目不能执行任务")
         try:
-            check = self._attach_frozen_module_bundle(check, require_published=True)
+            check = (await storage_call(self._attach_frozen_module_bundle, check, require_published=True))
         except ValueError as exc:
             # Module resolution is a run precondition.  Keep the attempt
             # observable through the normal failure path so scheduled runs do
@@ -212,10 +214,10 @@ class CheckRunner:
             if isinstance(bundle, dict):
                 check = {**check, "_module_bundle": bundle}
             return await self._run_module_preflight_failure(check, trigger, exc)
-        if storage.is_deployment_window_active() and trigger != "post-deploy":
+        if (await storage_call(storage.is_deployment_window_active)) and trigger != "post-deploy":
             return self._deployment_paused_result(check, trigger)
-        runners = self._resolve_check_runners(check)
-        targets = self._resolve_browser_targets(check, runners)
+        runners = (await storage_call(self._resolve_check_runners, check))
+        targets = (await storage_call(self._resolve_browser_targets, check, runners))
         if self._uses_browser(check):
             if len(targets) == 1 and targets[0].runner.get("runner_id") == storage.LOCAL_RUNNER_ID and not targets[0].skip_reason:
                 target = targets[0]
@@ -246,15 +248,15 @@ class CheckRunner:
         if not draft.get("project_id"):
             raise ValueError("草稿调试缺少项目归属")
         try:
-            draft = self._attach_frozen_module_bundle(draft, require_published=False)
+            draft = (await storage_call(self._attach_frozen_module_bundle, draft, require_published=False))
         except ValueError as exc:
             bundle = getattr(exc, "bundle", None)
             if isinstance(bundle, dict):
                 draft = {**draft, "_module_bundle": bundle}
             draft = self._with_module_preflight_failure(draft, exc)
-        settings = storage.get_settings()
-        local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(settings)
-        browser_type = self._first_runnable_browser_type(draft, local, settings) if self._uses_browser(draft) else ""
+        settings = (await storage_call(storage.get_settings))
+        local = (await storage_call(storage.get_probe_runner, storage.LOCAL_RUNNER_ID)) or self._local_runner_from_settings(settings)
+        browser_type = (await storage_call(self._first_runnable_browser_type, draft, local, settings)) if self._uses_browser(draft) else ""
         if browser_type:
             draft = self._with_browser_type(draft, browser_type)
         return await self._submit(
@@ -356,8 +358,8 @@ class CheckRunner:
             validation_check["id"] = original_check_id
         self._validate_module_references(validation_check, normalized_bundle)
 
-        runners = self._resolve_check_runners(validation_check)
-        targets = self._resolve_browser_targets(validation_check, runners)
+        runners = (await storage_call(self._resolve_check_runners, validation_check))
+        targets = (await storage_call(self._resolve_browser_targets, validation_check, runners))
         if self._uses_browser(validation_check):
             if (
                 len(targets) == 1
@@ -494,8 +496,8 @@ class CheckRunner:
     ) -> dict[str, Any]:
         await self.resources.reload(
             settings,
-            api_pool_size=self._api_pool_size(settings),
-            browser_pool_sizes_value=self._browser_pool_sizes(settings),
+            api_pool_size=(await storage_call(self._api_pool_size, settings)),
+            browser_pool_sizes_value=(await storage_call(self._browser_pool_sizes, settings)),
         )
         if self._uses_browser(check):
             async with self._ui_limiter.slot():
@@ -517,8 +519,8 @@ class CheckRunner:
     async def _inspect_ui(self, payload: dict[str, Any], inspect_func: Any, name: str) -> dict[str, Any]:
         from .ui_diagnostics import UiInspectionFailure, inspection_diagnostics
 
-        payload = self._attach_frozen_module_bundle(payload, require_published=True)
-        settings = storage.settings_for_project(storage.get_settings(), payload.get("project_id"))
+        payload = (await storage_call(self._attach_frozen_module_bundle, payload, require_published=True))
+        settings = (await storage_call(storage.settings_for_project, (await storage_call(storage.get_settings)), payload.get("project_id")))
         ctx = RunContext(
             {
                 "id": 0,
@@ -673,20 +675,20 @@ class CheckRunner:
             if self._maintenance_active and manage_capacity:
                 return self._deployment_paused_result(check, trigger)
             if self._closing:
-                return self._create_skipped_run(check, "执行器正在关闭，本次已跳过", trigger)
+                return (await storage_call(self._create_skipped_run, check, "执行器正在关闭，本次已跳过", trigger))
             if manage_active and check_id > 0 and check_id in self._active_checks:
-                return self._create_skipped_run(check, "同一任务上一次执行尚未结束或仍在排队，本次已跳过", trigger)
+                return (await storage_call(self._create_skipped_run, check, "同一任务上一次执行尚未结束或仍在排队，本次已跳过", trigger))
             if manage_capacity and self._queued_jobs >= self._queue_limit:
-                return self._create_skipped_run(check, "执行队列已满，本次已跳过", trigger)
+                return (await storage_call(self._create_skipped_run, check, "执行队列已满，本次已跳过", trigger))
 
-            settings = storage.get_settings()
+            settings = (await storage_call(storage.get_settings))
             metadata = run_metadata(trigger)
             if check.get("_library_validation"):
                 metadata.update({"trigger": trigger, "observation_kind": "library_validation", "affects_health": False})
             run_group_id = str(check.get("_run_group_id") or metadata.get("run_group_id") or "")
             run_metadata_payload = {**metadata, **({"run_group_id": run_group_id} if run_group_id else {})}
             runner_payload = runner_metadata or self._runner_metadata(settings, failure_kind="none")
-            run = storage.create_run(
+            run = (await create_run_async(
                 self._with_runner_metadata(
                     check,
                     settings,
@@ -695,7 +697,7 @@ class CheckRunner:
                     run_metadata_payload=run_metadata_payload,
                 ),
                 "pending",
-            )
+            ))
             job = RunJob(
                 check=check,
                 trigger=trigger,
@@ -723,7 +725,7 @@ class CheckRunner:
             result = await self._run_job_body(job)
         except asyncio.TimeoutError:
             try:
-                result = self._finish_watchdog_timeout(job)
+                result = (await storage_call(self._finish_watchdog_timeout, job))
             except Exception as finish_exc:
                 result = self._ephemeral_job_error(
                     job,
@@ -737,28 +739,37 @@ class CheckRunner:
                     job.trigger,
                     job.run_id,
                     result,
-                    self._settings_for_system_alert(),
+                    (await storage_call(self._settings_for_system_alert)),
                     source="watchdog",
                 )
         except asyncio.CancelledError:
-            result = self._finish_cancelled_job(job)
+            result = (await storage_call(self._finish_cancelled_job, job))
         except Exception as exc:
-            result = self._finish_internal_error(job, exc)
+            result = (await storage_call(self._finish_internal_error, job, exc))
             if not job.check.get("_library_validation"):
                 result = await self._notify_system_result(
                     job.check,
                     job.trigger,
                     job.run_id,
                     result,
-                    self._settings_for_system_alert(),
+                    (await storage_call(self._settings_for_system_alert)),
                     source="runner",
                 )
         finally:
-            await self._complete_job(job, result)
+            completion = asyncio.create_task(self._complete_job(job, result))
+            cancelled = False
+            while not completion.done():
+                try:
+                    await asyncio.shield(completion)
+                except asyncio.CancelledError:
+                    cancelled = True
+            completion.result()
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _run_job_body(self, job: RunJob) -> dict[str, Any]:
         if not job.manage_capacity:
-            storage.start_run(job.run_id)
+            (await storage_call(storage.start_run, job.run_id))
             return await self._execute_started_job(job)
         if self._uses_browser(job.check):
             async with self._ui_limiter.slot():
@@ -772,10 +783,11 @@ class CheckRunner:
             job.started = True
             self._queued_jobs = max(0, self._queued_jobs - 1)
             self._running_jobs += 1
-        storage.start_run(job.run_id)
+        (await storage_call(storage.start_run, job.run_id))
         return await self._execute_started_job(job)
 
     async def _execute_started_job(self, job: RunJob) -> dict[str, Any]:
+        settings = await storage_call(storage.get_settings)
         return await asyncio.wait_for(
             self._execute(
                 job.check,
@@ -785,7 +797,7 @@ class CheckRunner:
                 job.notify,
                 job.runner_metadata,
             ),
-            timeout=self._job_timeout_seconds(job.check, storage.get_settings()),
+            timeout=self._job_timeout_seconds(job.check, settings),
         )
 
     async def _complete_job(self, job: RunJob, result: dict[str, Any] | None) -> None:
@@ -800,7 +812,7 @@ class CheckRunner:
                 self._active_checks.discard(check_id)
         if result is None:
             try:
-                result = storage.get_run(job.run_id) or {}
+                result = (await storage_call(storage.get_run, job.run_id)) or {}
             except Exception as exc:
                 result = self._ephemeral_job_error(job, "执行器完成状态读取失败", exc)
         if not job.future.done():
@@ -815,9 +827,37 @@ class CheckRunner:
         notify: bool = True,
         runner_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        settings = storage.settings_for_project(storage.get_settings(), check.get("project_id"))
-        library_validation = bool(check.get("_library_validation"))
+        settings = (await storage_call(storage.settings_for_project, (await storage_call(storage.get_settings)), check.get("project_id")))
         result_data = await self._execute_core(check, trigger, run_id, settings)
+        return await self._complete_outcome(self._finish_execution(
+            check, trigger, run_id, settings, result_data, record_status, notify, runner_metadata,
+        ))
+
+    @staticmethod
+    async def _complete_outcome(awaitable: Any) -> Any:
+        # Once execution has produced an outcome, cancellation must not split
+        # result persistence from health/notification settlement. Return the
+        # completed outcome so a watchdog cannot manufacture a second failure.
+        task = asyncio.create_task(awaitable)
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        return task.result()
+
+    async def _finish_execution(
+        self,
+        check: dict[str, Any],
+        trigger: str,
+        run_id: int,
+        settings: dict[str, Any],
+        result_data: dict[str, Any],
+        record_status: bool,
+        notify: bool,
+        runner_metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        library_validation = bool(check.get("_library_validation"))
         if runner_metadata:
             result_data.update(
                 {
@@ -830,26 +870,26 @@ class CheckRunner:
                 }
             )
         if self._is_runner_system_result(result_data):
-            result = self._finish_runner_result(check, trigger, run_id, result_data)
+            result = (await storage_call(self._finish_runner_result, check, trigger, run_id, result_data))
             if notify and not library_validation:
                 result = await self._notify_system_result(check, trigger, run_id, result, settings, source="runner")
             return result
         if library_validation:
             result_data = {**result_data, "affects_health": False}
-        finished_run = storage.finish_run(run_id, result_data)
+        finished_run = (await storage_call(storage.finish_run, run_id, result_data))
 
         if finished_run is None:
             raise RuntimeError("运行记录更新失败")
 
         if library_validation or not record_status or not finished_run.get("affects_health", True):
-            storage.update_run_notification(run_id, "not_required", channel=None, error=None, sent_at=None)
-            return storage.get_run(run_id) or finished_run
+            (await storage_call(storage.update_run_notification, run_id, "not_required", channel=None, error=None, sent_at=None))
+            return (await storage_call(storage.get_run, run_id)) or finished_run
 
-        transition = storage.update_check_status(int(check["id"]), finished_run)
+        transition = (await storage_call(storage.update_check_status, int(check["id"]), finished_run))
         transition["trigger"] = trigger
         if notify and not library_validation:
             await notifier.maybe_notify(check, finished_run, transition)
-        return storage.get_run(run_id) or finished_run
+        return (await storage_call(storage.get_run, run_id)) or finished_run
 
     async def _execute_core(
         self,
@@ -1168,7 +1208,8 @@ class CheckRunner:
 
     def _finish_internal_error(self, job: RunJob, exc: Exception) -> dict[str, Any]:
         message = str(exc) or exc.__class__.__name__
-        return self._finish_without_context(job, "failed", f"执行器内部错误：{message}", traceback.format_exc())
+        return self._finish_without_context(job, "failed", f"执行器内部错误：{message}",
+                                            ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
 
     def _ephemeral_job_error(self, job: RunJob, message: str, exc: Exception, status: str = "failed") -> dict[str, Any]:
         detail = str(exc).strip() or exc.__class__.__name__
@@ -1300,11 +1341,11 @@ class CheckRunner:
         if str(result.get("failure_kind") or "") == "runner" and not bool(result.get("affects_health")):
             status, channel, error, sent_at = self._system_notification_record(outcome)
             try:
-                storage.update_run_notification(run_id, status, channel=channel, error=error, sent_at=sent_at)
+                (await storage_call(storage.update_run_notification, run_id, status, channel=channel, error=error, sent_at=sent_at))
             except Exception:
                 pass
             try:
-                return storage.get_run(run_id) or result
+                return (await storage_call(storage.get_run, run_id)) or result
             except Exception:
                 return result
         return result
@@ -1541,18 +1582,18 @@ class CheckRunner:
                 running = True
             jobs = [self._dispatch_runner(check, target, trigger, run_group_id, capacity_managed=True) for target in targets]
             runs = await asyncio.gather(*jobs)
-            return await self._finish_distributed_group(check, runs, trigger)
+            return await self._complete_outcome(self._finish_distributed_group(check, runs, trigger))
 
         async with self._lock:
             self._jobs = {job for job in self._jobs if not job.done()}
             if self._maintenance_active:
                 return self._deployment_paused_result(check, trigger)
             if self._closing:
-                return self._create_skipped_run(check, "执行器正在关闭，本次已跳过", trigger)
+                return (await storage_call(self._create_skipped_run, check, "执行器正在关闭，本次已跳过", trigger))
             if check_id > 0 and check_id in self._active_checks:
-                return self._create_skipped_run(check, "同一任务上一次执行尚未结束或仍在排队，本次已跳过", trigger)
+                return (await storage_call(self._create_skipped_run, check, "同一任务上一次执行尚未结束或仍在排队，本次已跳过", trigger))
             if self._queued_jobs >= self._queue_limit:
-                return self._create_skipped_run(check, "执行队列已满，本次已跳过", trigger)
+                return (await storage_call(self._create_skipped_run, check, "执行队列已满，本次已跳过", trigger))
             self._queued_jobs += 1
             queued = True
             if check_id > 0:
@@ -1587,7 +1628,7 @@ class CheckRunner:
             health_check = self._runner_health_checks.get(runner_id)
             if health_check is not None:
                 await asyncio.shield(health_check)
-            latest_runner = storage.get_probe_runner(runner_id)
+            latest_runner = (await storage_call(storage.get_probe_runner, runner_id))
             if latest_runner:
                 runner = latest_runner
         check_payload = self._with_browser_type({**check, "_run_group_id": run_group_id}, target.browser_type)
@@ -1597,11 +1638,11 @@ class CheckRunner:
             metadata.update({"trigger": trigger, "observation_kind": "library_validation", "affects_health": False})
         runner_system_metadata = {**metadata, "affects_health": False}
         if target.skip_reason:
-            run = storage.create_run(
-                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
+            run = (await create_run_async(
+                self._with_runner_metadata(check_payload, (await storage_call(storage.get_settings)), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
-            )
-            unavailable = self._finish_runner_unavailable(int(run["id"]), check_payload, trigger, runner, target.skip_reason)
+            ))
+            unavailable = (await storage_call(self._finish_runner_unavailable, int(run["id"]), check_payload, trigger, runner, target.skip_reason))
             if check.get("_library_validation"):
                 return unavailable
             return await self._notify_system_result(
@@ -1609,38 +1650,38 @@ class CheckRunner:
                 trigger,
                 int(run["id"]),
                 unavailable,
-                self._settings_for_system_alert(),
+                (await storage_call(self._settings_for_system_alert)),
                 source="runner",
             )
-        if not storage.can_schedule_runner(runner):
-            run = storage.create_run(
-                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
+        if not (await storage_call(storage.can_schedule_runner, runner)):
+            run = (await create_run_async(
+                self._with_runner_metadata(check_payload, (await storage_call(storage.get_settings)), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
-            )
-            unavailable = self._finish_runner_unavailable(int(run["id"]), check, trigger, runner, "执行节点不可用")
+            ))
+            unavailable = (await storage_call(self._finish_runner_unavailable, int(run["id"]), check, trigger, runner, "执行节点不可用"))
             if not check.get("_library_validation"):
                 unavailable = await self._notify_system_result(
                     check_payload,
                     trigger,
                     int(run["id"]),
                     unavailable,
-                    self._settings_for_system_alert(),
+                    (await storage_call(self._settings_for_system_alert)),
                     source="runner",
                 )
             await self._notify_runner_unavailable_if_needed(runner, check)
             return unavailable
         if runner_id != storage.LOCAL_RUNNER_ID and self._uses_mixed_api_flow(check) and not self._runner_supports_mixed_api_flow(runner):
-            run = storage.create_run(
-                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
+            run = (await create_run_async(
+                self._with_runner_metadata(check_payload, (await storage_call(storage.get_settings)), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
-            )
-            unavailable = self._finish_runner_unavailable(
+            ))
+            unavailable = (await storage_call(self._finish_runner_unavailable,
                 int(run["id"]),
                 check_payload,
                 trigger,
                 runner,
                 "执行节点不支持脚本后接口校验，请先更新执行节点",
-            )
+            ))
             if check.get("_library_validation"):
                 return unavailable
             return await self._notify_system_result(
@@ -1648,21 +1689,21 @@ class CheckRunner:
                 trigger,
                 int(run["id"]),
                 unavailable,
-                self._settings_for_system_alert(),
+                (await storage_call(self._settings_for_system_alert)),
                 source="runner",
             )
         if runner_id != storage.LOCAL_RUNNER_ID and self._uses_script_modules(check) and not self._runner_supports_script_modules(runner):
-            run = storage.create_run(
-                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
+            run = (await create_run_async(
+                self._with_runner_metadata(check_payload, (await storage_call(storage.get_settings)), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
-            )
-            unavailable = self._finish_runner_unavailable(
+            ))
+            unavailable = (await storage_call(self._finish_runner_unavailable,
                 int(run["id"]),
                 check_payload,
                 trigger,
                 runner,
                 "执行节点不支持公共方法模块，请先更新执行节点",
-            )
+            ))
             if check.get("_library_validation"):
                 return unavailable
             return await self._notify_system_result(
@@ -1670,7 +1711,7 @@ class CheckRunner:
                 trigger,
                 int(run["id"]),
                 unavailable,
-                self._settings_for_system_alert(),
+                (await storage_call(self._settings_for_system_alert)),
                 source="runner",
             )
         if runner_id == storage.LOCAL_RUNNER_ID:
@@ -1683,55 +1724,60 @@ class CheckRunner:
                 manage_active=False,
                 manage_capacity=not capacity_managed,
             )
-        run = storage.create_run(
-            self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=metadata),
+        run = (await create_run_async(
+            self._with_runner_metadata(check_payload, (await storage_call(storage.get_settings)), runner_payload, trigger=trigger, run_metadata_payload=metadata),
             "pending",
-        )
+        ))
         run_id = int(run["id"])
-        storage.start_run(run_id)
         try:
-            result = await self._call_remote_runner(runner, check_payload, trigger, run_id)
-        except Exception as exc:
-            logger.warning("worker_request_failed runner_id=%r run_id=%s error_type=%s", runner_id, run_id, type(exc.__cause__ or exc).__name__)
-            if not check.get("_library_validation"):
-                await self._recheck_runner_after_failure(runner)
-            unavailable = self._finish_runner_unavailable(run_id, check, trigger, runner, f"执行节点调用失败：{exc}")
-            if not check.get("_library_validation"):
-                unavailable = await self._notify_system_result(
-                    check_payload,
-                    trigger,
-                    run_id,
-                    unavailable,
-                    self._settings_for_system_alert(),
-                    source="runner",
-                )
-            latest_runner = storage.get_probe_runner(runner_id) or runner
-            await self._notify_runner_unavailable_if_needed(latest_runner, check)
-            return unavailable
-        data = self._remote_result_to_finish_payload(result, run_id, runner)
-        if self._is_runner_system_result(data):
+            (await storage_call(storage.start_run, run_id))
+            try:
+                result = await self._call_remote_runner(runner, check_payload, trigger, run_id)
+            except Exception as exc:
+                logger.warning("worker_request_failed runner_id=%r run_id=%s error_type=%s", runner_id, run_id, type(exc.__cause__ or exc).__name__)
+                if not check.get("_library_validation"):
+                    await self._recheck_runner_after_failure(runner)
+                unavailable = (await storage_call(self._finish_runner_unavailable, run_id, check, trigger, runner, f"执行节点调用失败：{exc}"))
+                if not check.get("_library_validation"):
+                    unavailable = await self._notify_system_result(
+                        check_payload,
+                        trigger,
+                        run_id,
+                        unavailable,
+                        (await storage_call(self._settings_for_system_alert)),
+                        source="runner",
+                    )
+                latest_runner = (await storage_call(storage.get_probe_runner, runner_id)) or runner
+                await self._notify_runner_unavailable_if_needed(latest_runner, check)
+                return unavailable
+            data = self._remote_result_to_finish_payload(result, run_id, runner)
+            if self._is_runner_system_result(data):
+                if check.get("_library_validation"):
+                    latest_runner = runner
+                else:
+                    latest_runner = (await storage_call(storage.mark_probe_runner_unavailable, runner_id, status="unhealthy")) or (await storage_call(storage.get_probe_runner, runner_id)) or runner
+                system_result = (await storage_call(self._finish_runner_result, check_payload, trigger, run_id, data))
+                if not check.get("_library_validation"):
+                    system_result = await self._notify_system_result(
+                        check_payload,
+                        trigger,
+                        run_id,
+                        system_result,
+                        (await storage_call(self._settings_for_system_alert)),
+                        source="runner",
+                    )
+                await self._notify_runner_unavailable_if_needed(latest_runner, check)
+                return system_result
             if check.get("_library_validation"):
-                latest_runner = runner
-            else:
-                latest_runner = storage.mark_probe_runner_unavailable(runner_id, status="unhealthy") or storage.get_probe_runner(runner_id) or runner
-            system_result = self._finish_runner_result(check_payload, trigger, run_id, data)
-            if not check.get("_library_validation"):
-                system_result = await self._notify_system_result(
-                    check_payload,
-                    trigger,
-                    run_id,
-                    system_result,
-                    self._settings_for_system_alert(),
-                    source="runner",
-                )
-            await self._notify_runner_unavailable_if_needed(latest_runner, check)
-            return system_result
-        if check.get("_library_validation"):
-            data = {**data, "affects_health": False}
-        finished = storage.finish_run(run_id, data)
-        if check.get("_library_validation"):
-            storage.update_run_notification(run_id, "not_required", channel=None, error=None, sent_at=None)
-        return storage.get_run(run_id) or finished or run
+                data = {**data, "affects_health": False}
+            finished = (await storage_call(storage.finish_run, run_id, data))
+            if check.get("_library_validation"):
+                (await storage_call(storage.update_run_notification, run_id, "not_required", channel=None, error=None, sent_at=None))
+            return (await storage_call(storage.get_run, run_id)) or finished or run
+        except asyncio.CancelledError:
+            await storage_call(self._finish_runner_unavailable, run_id, check_payload, trigger, runner,
+                "执行等待被取消；远端是否完成未知，请核对后再操作")
+            raise
 
     async def _recheck_runner_after_failure(self, runner: dict[str, Any]) -> None:
         """Check connectivity once; never replay a possibly executed worker POST."""
@@ -1756,7 +1802,7 @@ class CheckRunner:
                 # it offline, and another poll/admin action may have changed it.
                 logger.info("worker_health_recheck_ok runner_id=%r", runner_id)
                 return
-            current = storage.get_probe_runner(runner_id)
+            current = (await storage_call(storage.get_probe_runner, runner_id))
             # A failed check of stale configuration must not overwrite a later
             # health poll, disable, update, rotation or relay transition.
             if not current or not current.get("enabled"):
@@ -1765,13 +1811,13 @@ class CheckRunner:
                 return
             if any(current.get(key) != runner.get(key) for key in ("address", "token_hash", "relay_token_version", "last_disconnect_reason", "updated_at")):
                 return
-            storage.mark_probe_runner_unavailable(runner_id)
+            (await storage_call(storage.mark_probe_runner_unavailable, runner_id))
         finally:
             self._runner_health_checks.pop(runner_id, None)
 
     async def _call_remote_runner(self, runner: dict[str, Any], check: dict[str, Any], trigger: str, run_id: int) -> dict[str, Any]:
         try:
-            storage.ensure_probe_runner_transport_allowed(runner)
+            (await storage_call(storage.ensure_probe_runner_transport_allowed, runner))
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         address = str(runner.get("address") or "").strip().rstrip("/")
@@ -1779,8 +1825,8 @@ class CheckRunner:
         if not address:
             raise RuntimeError("Runner address is empty")
         if not token:
-            token = self._runner_token_from_row(runner)
-        settings = storage.settings_for_project(storage.get_settings(), check.get("project_id"))
+            token = (await storage_call(self._runner_token_from_row, runner))
+        settings = (await storage_call(storage.settings_for_project, (await storage_call(storage.get_settings)), check.get("project_id")))
         payload = {
             "check": self._worker_check_payload(check),
             "trigger": trigger,
@@ -1897,7 +1943,7 @@ class CheckRunner:
 
     async def _finish_distributed_group(self, check: dict[str, Any], runs: list[dict[str, Any]], trigger: str) -> dict[str, Any]:
         if not runs:
-            skipped = self._create_skipped_run(check, "没有可执行节点，本次已跳过", trigger)
+            skipped = (await storage_call(self._create_skipped_run, check, "没有可执行节点，本次已跳过", trigger))
             if check.get("_library_validation"):
                 return {**skipped, "runs": [skipped]}
             return skipped
@@ -1915,7 +1961,7 @@ class CheckRunner:
                 "observation_kind": "library_validation",
             }
         if status_run.get("affects_health") and status_run.get("failure_kind") != "runner":
-            transition = storage.update_check_status(int(check["id"]), status_run)
+            transition = (await storage_call(storage.update_check_status, int(check["id"]), status_run))
             transition["trigger"] = trigger
             # Pass the full node matrix, not just the representative run, so the
             # alert can say which nodes disagreed.
@@ -2231,5 +2277,5 @@ class CheckRunner:
         )
 
     async def ensure_enabled_browser_types_installed(self, settings: dict[str, Any] | None = None) -> dict[str, Any]:
-        resolved_settings = settings or storage.get_settings()
+        resolved_settings = settings or (await storage_call(storage.get_settings))
         return await ensure_browser_types_installed(enabled_browser_types(resolved_settings))

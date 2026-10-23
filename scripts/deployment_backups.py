@@ -18,6 +18,7 @@ import sqlite3
 import tarfile
 import tempfile
 import time
+from typing import Callable
 
 
 FORMAT = "pulseguard-deployment-backup-v1"
@@ -58,13 +59,49 @@ def _write_manifest(target: Path, manifest: dict) -> None:
     temporary.replace(target / "manifest.json")
 
 
-def create(root: Path, backup_id: str, app_root: Path, *, include_reports: bool = False) -> Path:
+def _archive_frozen_state(target: Path, app_root: Path, include_reports: bool) -> None:
+    def source_filter(info: tarfile.TarInfo):
+        parts = Path(info.name).parts
+        if parts[0] in {"data", "reports", ".venv", ".git", ".tmp"}:
+            return None
+        if any(part in {"node_modules", "__pycache__", ".pytest_cache"} for part in parts):
+            return None
+        return info
+
+    with tarfile.open(target / "source.tar.gz", "w:gz") as archive:
+        for path in sorted(app_root.iterdir()):
+            archive.add(path, arcname=path.name, filter=source_filter)
+
+    def runtime_filter(info: tarfile.TarInfo):
+        parts = Path(info.name).parts
+        if len(parts) > 1 and parts[0] == "data" and parts[1] in {
+            "backups", "pulseguard.db", "pulseguard.db-wal", "pulseguard.db-shm",
+        }:
+            return None
+        return info
+
+    with tarfile.open(target / "runtime.tar.gz", "w:gz") as archive:
+        for name in (["data", "reports"] if include_reports else ["data"]):
+            path = app_root / name
+            if path.exists():
+                archive.add(path, arcname=name, filter=runtime_filter)
+
+
+def create(root: Path, backup_id: str, app_root: Path, *, include_reports: bool = False,
+           on_snapshot: Callable[[Path | None], None] | None = None) -> Path:
+    """Capture under a writer fence, then verify immutable files.
+
+    on_snapshot may release the fence/resume the unchanged instance once source,
+    runtime and SQLite are captured. It must not modify the snapshot before this
+    function returns. The callback is not backup acceptance: validation can fail.
+    """
     target = _target(root, backup_id)
     app_root = app_root.resolve(strict=True)
     if root.is_relative_to(app_root) or app_root.is_relative_to(root):
         raise ValueError("deployment backups must be outside the application tree")
     with _locked(root):
         target.mkdir(mode=0o700)
+        _archive_frozen_state(target, app_root, include_reports)
         database = app_root / "data" / "pulseguard.db"
         if database.exists():
             with tempfile.TemporaryDirectory(prefix="snapshot-", dir=target) as temporary:
@@ -72,42 +109,29 @@ def create(root: Path, backup_id: str, app_root: Path, *, include_reports: bool 
                 with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=30)) as source:
                     with closing(sqlite3.connect(snapshot)) as destination:
                         source.backup(destination)
-                        if destination.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                            raise ValueError("deployment database backup failed integrity check")
-                expected = _digest(snapshot)
+                if on_snapshot is not None:
+                    on_snapshot(snapshot)
+                with closing(sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=30)) as verify:
+                    # Bound verification memory while retaining frequently reused
+                    # index pages; the default 2 MiB cache amplifies large checks.
+                    verify.execute("PRAGMA cache_size=-65536")
+                    if verify.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                        raise ValueError("deployment database backup failed integrity check")
                 compressed = target / "database.db.gz"
+                digest = hashlib.sha256()
                 with snapshot.open("rb") as source, gzip.open(compressed, "wb", compresslevel=1) as output:
-                    shutil.copyfileobj(source, output, 1024 * 1024)
+                    # Hash the immutable snapshot while compressing it. A separate
+                    # digest pass evicts a large DB from cache and reads it twice.
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        output.write(chunk)
+                expected = digest.hexdigest()
                 with gzip.open(compressed, "rb") as stream:
                     if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
                         raise ValueError("compressed database backup failed verification")
 
-        def source_filter(info: tarfile.TarInfo):
-            parts = Path(info.name).parts
-            if parts[0] in {"data", "reports", ".venv", ".git", ".tmp"}:
-                return None
-            if any(part in {"node_modules", "__pycache__", ".pytest_cache"} for part in parts):
-                return None
-            return info
-
-        with tarfile.open(target / "source.tar.gz", "w:gz") as archive:
-            for path in sorted(app_root.iterdir()):
-                archive.add(path, arcname=path.name, filter=source_filter)
-
-        def runtime_filter(info: tarfile.TarInfo):
-            parts = Path(info.name).parts
-            if len(parts) > 1 and parts[0] == "data" and parts[1] in {
-                "backups", "pulseguard.db", "pulseguard.db-wal", "pulseguard.db-shm",
-            }:
-                return None
-            return info
-
-        # Preserve runner keys and Relay state with the matching database.
-        with tarfile.open(target / "runtime.tar.gz", "w:gz") as archive:
-            for name in (["data", "reports"] if include_reports else ["data"]):
-                path = app_root / name
-                if path.exists():
-                    archive.add(path, arcname=name, filter=runtime_filter)
+        elif on_snapshot is not None:
+            on_snapshot(None)
         files = {p.name: {"sha256": _digest(p), "bytes": p.stat().st_size} for p in target.iterdir()}
         # Wall clocks can repeat (notably on Windows) or move backwards. Creation
         # is serialized by the root lock, so preserve a strict order in manifests.
