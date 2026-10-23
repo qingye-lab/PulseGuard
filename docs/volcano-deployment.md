@@ -26,6 +26,8 @@ systemctl status pulseguard.service pulseguard-relay.service
 journalctl -u pulseguard.service -u pulseguard-relay.service --since "10 minutes ago" --no-pager
 ```
 
+2026-10-23 已撤销这两个 unit 人工设置的 `/dev/vda` 读 20 MB/s、500 IOPS 限额；其他服务和预览资源保护保持原配置。检查实际限额应读取 `/sys/fs/cgroup/system.slice/<unit>/io.max`，空文件表示没有设备级上限。以后调整配额需先记录原值并通过主机压力准入，随后验证 API、节点可用性和实际 cgroup；验收失败恢复原配置。此次变更与验收依据见 [运行结果与发布完整性决策](decisions/2026-10-23-outcome-and-release-integrity.md)。
+
 主节点关键环境：
 
 ```env
