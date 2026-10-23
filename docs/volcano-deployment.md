@@ -19,6 +19,8 @@
 
 预演使用真实数据库的隔离副本。快照冻结后恢复原实例，完整性检查和压缩继续处理不可变副本。切流只替换 manifest 指定的源码，任何部分替换失败都按事先保存的逐文件原件恢复；不替换在线数据库。验收按真实项目头及 `observation_kind=observation` 检查各个历史分页筛选；HTTP/结构/范围错误必须失败，延迟另行记录。验收成功后正式完成恢复点并执行现有保留规则；保留收尾失败单独处理，不回滚已验收代码。
 
+兼容性数据库迁移须显式设置 manifest 的 `migrate_database: true`，并通过与确切 manifest 摘要绑定的生产数据库副本预演。切流在停止两个写入服务并替换候选源码后，先运行 `storage.init_db(recover_interrupted=False)`，完成后才启动 API 和 Relay。`retain_preflight_copy: true` 可暂留独立副本作冷读验证，验证后必须清理副本及 sidecar；不要驱逐在线数据库或全局缓存。历史分页验收覆盖全部筛选字段、通知/运行状态、来源、字段组合和分页边界，方案见 [统一筛选索引决策](decisions/2026-10-23-universal-run-page-index.md)。
+
 火山当前使用 systemd 部署，根目录是 `/opt/pulseguard`：
 
 ```sh

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import closing
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import unittest
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import Mock, patch
 
 
@@ -17,6 +20,32 @@ SPEC.loader.exec_module(release)
 
 
 class SystemdReleaseTests(unittest.TestCase):
+    def test_copy_preflight_binds_candidate_and_retains_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'app'
+            (root / 'data').mkdir(parents=True)
+            (root / 'backend/app').mkdir(parents=True)
+            (root / 'backend/app/storage.py').write_text(
+                "import os,sqlite3\ndef init_db(**kwargs):\n"
+                " with sqlite3.connect(os.environ['PULSEGUARD_DB_PATH']) as conn:\n"
+                "  conn.execute('CREATE INDEX IF NOT EXISTS migration_copy ON checks(id)')\n")
+            db = root / 'data/pulseguard.db'
+            with closing(sqlite3.connect(db)) as conn, conn:
+                for table in ('checks', 'projects', 'settings'):
+                    conn.execute('CREATE TABLE ' + table + '(id INTEGER, value TEXT)')
+                    conn.execute('INSERT INTO ' + table + ' VALUES (1, ?)', ('preserve',))
+            before = release.digest(db)
+            for retained in (False, True):
+                work = Path(temporary) / str(retained)
+                work.mkdir()
+                (work / 'manifest.json').write_text(json.dumps({'retain_preflight_copy': retained}))
+                result = release.preflight(root, work)
+                self.assertTrue(result['configuration_intact'])
+                self.assertEqual(result['manifest_sha256'], release.digest(work / 'manifest.json'))
+                self.assertEqual(result['copy_retained'], retained)
+                self.assertEqual((work / 'preflight.db').exists(), retained)
+                self.assertEqual(release.digest(db), before)
+
     def test_start_submits_both_units_before_waiting_for_api_readiness(self):
         events = []
         with patch.object(release, 'service', side_effect=lambda action: events.append(action)), \
@@ -110,14 +139,53 @@ class SystemdReleaseTests(unittest.TestCase):
             calls.append((path, kwargs))
             if path == '/api/health':
                 return {'status': 'ok'}
-            return {'total': 0, 'items': [], 'page': 1, 'page_size': 12}
+            query = parse_qs(urlsplit(path).query)
+            return {'total': 0, 'items': [], 'page': int(query.get('page', ['1'])[0]),
+                    'page_size': int(query.get('page_size', ['12'])[0])}
 
         with patch.object(release, 'api', side_effect=api):
             result = release.verify_console([1, 2])
-        self.assertEqual(len(result), 10)
+        self.assertGreater(len(result), 50)
+        self.assertEqual({next(iter(r['filters'])) for r in result if len(r['filters']) == 1},
+                         {'type', 'status', 'notification_status', 'observation_kind', 'check_id',
+                          'runner_id', 'run_group_id', 'trigger', 'q', 'page_size'})
         for path, kwargs in calls[1:]:
-            self.assertIn('observation_kind=observation', path)
+            self.assertIn(parse_qs(urlsplit(path).query)['observation_kind'][0], ('observation', 'verification', 'draft'))
             self.assertIn(kwargs['project_id'], (1, 2))
+
+    def test_compatible_migration_runs_under_writer_fence_before_start(self):
+        events = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = {'id': 'a' * 32, 'files': {}, 'migrate_database': True}
+            (root / 'manifest.json').write_text(json.dumps(manifest))
+            (root / 'preflight-result.json').write_text(json.dumps({'state': 'ready', 'configuration_intact': True,
+                                                                  'manifest_sha256': release.digest(root / 'manifest.json')}))
+            with patch.object(release, 'api', side_effect=lambda p, **k:
+                    {'database_backup_retention': 2} if p == '/api/settings' else [{'id': 1, 'status': 'active'}]), \
+                 patch.object(release.deployment_backups, '_manifest'), patch.object(release.deployment_backups, 'complete'), \
+                 patch.object(release, 'fingerprint', return_value={}), patch.object(release, 'capture_originals', return_value={}), \
+                 patch.object(release, 'drain'), patch.object(release, 'settle'), patch.object(release, 'verify_console', return_value=[]), \
+                 patch.object(release, 'service', side_effect=lambda action: events.append(action)), \
+                 patch.object(release, 'replace_files', side_effect=lambda *a: events.append('replace')), \
+                 patch.object(release, 'migrate_database', side_effect=lambda *a: events.append('migrate')), \
+                 patch.object(release, 'start_services', side_effect=lambda: events.append('start')):
+                release.apply(root, root, manifest)
+        self.assertEqual(events, ['stop', 'replace', 'migrate', 'start'])
+
+    def test_missing_or_stale_migration_preflight_rejects_before_stopping_services(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = {'id': 'a' * 32, 'files': {}, 'migrate_database': True}
+            (root / 'manifest.json').write_text(json.dumps(manifest))
+            with patch.object(release, 'drain') as drain, patch.object(release, 'service') as service:
+                for result in (None, {'state': 'ready', 'configuration_intact': True, 'manifest_sha256': 'stale'}):
+                    if result is not None:
+                        (root / 'preflight-result.json').write_text(json.dumps(result))
+                    with self.assertRaisesRegex(RuntimeError, 'exact manifest'):
+                        release.apply(root, root, manifest)
+                drain.assert_not_called()
+                service.assert_not_called()
 
     def test_http_failure_and_wrong_project_are_fatal_acceptance_errors(self):
         for response in (RuntimeError('HTTP 400'), {'total': 1, 'page': 1, 'page_size': 12,

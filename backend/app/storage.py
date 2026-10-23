@@ -243,6 +243,15 @@ TREND_SUMMARY_CHECK_IDS = {"ui": -1, "api": -2}
 PROJECT_SCHEMA_VERSION = 2
 SCRIPT_LIBRARY_SCHEMA_VERSION = 3
 RUN_COUNT_SCHEMA_VERSION = 4
+RUN_PAGE_SCHEMA_VERSION = 5
+# The list index owns every predicate exposed by runs-page. Keep time/id before
+# the remaining metadata so a scoped page can stream in its requested order.
+# Large logs, snapshots, response bodies and error text stay in the table.
+RUN_PAGE_INDEX_COLUMNS = (
+    "project_id", "observation_kind", "started_at", "id", "check_type", "status",
+    "notification_status", "runner_id", "run_group_id", "trigger", "check_id", "check_name",
+)
+RUN_PAGE_INDEX = "idx_runs_project_page_filter_started"
 DEFAULT_PROJECT_NAME = "默认项目"
 PROJECT_SCOPED_TABLES = (
     "checks",
@@ -1066,13 +1075,7 @@ def _init_db(*, recover_interrupted: bool = True) -> None:
             "CREATE INDEX IF NOT EXISTS idx_runs_project_kind_started "
             "ON runs(project_id, observation_kind, started_at DESC, id DESC)"
         )
-        # Tab filters (type/status) must also count and page from the index alone.
-        # Without the check_type/status terms SQLite falls back to one wide-row lookup
-        # per row in the whole project scope, which costs minutes on cold cache.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_runs_project_page_filter_started "
-            "ON runs(project_id, observation_kind, check_type, status, started_at DESC, id DESC)"
-        )
+        _ensure_run_page_index(conn)
         _ensure_run_count_totals(conn)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_project_health_cover "
@@ -4435,6 +4438,33 @@ def _ensure_run_count_totals(conn: sqlite3.Connection) -> None:
                  (RUN_COUNT_SCHEMA_VERSION, now_iso()))
 
 
+def _ensure_run_page_index(conn: sqlite3.Connection) -> None:
+    # Replacing the previous type/status-only index is transactional. A failed
+    # build restores the old index and migration marker with the transaction.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    existing = tuple((row[2], bool(row[3])) for row in conn.execute(f"PRAGMA index_xinfo({RUN_PAGE_INDEX})") if row[5])
+    expected = tuple((column, column in {"started_at", "id"}) for column in RUN_PAGE_INDEX_COLUMNS)
+    if existing != expected:
+        started = time_module.monotonic()
+        logger.info('run_page_index_rebuild_started old_columns=%s new_columns=%s', existing, RUN_PAGE_INDEX_COLUMNS)
+        conn.execute(f"DROP INDEX IF EXISTS {RUN_PAGE_INDEX}")
+        columns = ", ".join(column + (" DESC" if column in {"started_at", "id"} else "")
+                            for column in RUN_PAGE_INDEX_COLUMNS)
+        conn.execute(f"CREATE INDEX {RUN_PAGE_INDEX} ON runs({columns})")
+        logger.info('run_page_index_rebuild_finished elapsed_seconds=%.3f', time_module.monotonic() - started)
+    conn.execute("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (?, ?)",
+                 (RUN_PAGE_SCHEMA_VERSION, now_iso()))
+
+
+def _run_count_select(where: str, *, scope_only: bool = False) -> str:
+    if scope_only:
+        return f"SELECT COALESCE(SUM(run_count), 0) AS count FROM run_count_totals{where}"
+    # The explicit index prevents the planner from choosing a smaller index
+    # that requires a wide table lookup for an uncovered predicate.
+    return f"SELECT COUNT(*) AS count FROM runs INDEXED BY {RUN_PAGE_INDEX}{where}"
+
+
 def list_runs_page(
     filters: dict[str, Any] | None = None,
     page: int = 1,
@@ -4445,18 +4475,12 @@ def list_runs_page(
     page_size = max(1, min(100, int(page_size)))
     clauses, params = _run_filter_clauses(filters)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    scope_only = all(clause in {"project_id = ?", "observation_kind = ?"} for clause in clauses)
     with _connect(read_only=True) as conn:
         with request_timing.phase("runs_count"):
-            if all(clause in {"project_id = ?", "observation_kind = ?"} for clause in clauses):
-                # Exact totals and page rows share this read snapshot. Complex
-                # filters keep their original precise SQL count and semantics.
-                total = int(conn.execute(
-                    f"SELECT COALESCE(SUM(run_count), 0) AS count FROM run_count_totals{where}", params,
-                ).fetchone()["count"])
-            else:
-                total = int(conn.execute(f"SELECT COUNT(*) AS count FROM runs{where}", params).fetchone()["count"])
+            total = int(conn.execute(_run_count_select(where, scope_only=scope_only), params).fetchone()["count"])
         with request_timing.phase("runs_fetch"):
-            rows = conn.execute(
+            rows = [] if total == 0 else conn.execute(
                 _run_page_select(filters, where),
                 [*params, page_size, (page - 1) * page_size],
             ).fetchall()
@@ -4471,21 +4495,18 @@ def list_runs_page(
 
 
 def _run_page_select(filters: dict[str, Any], where: str) -> str:
-    active_filters = {key for key, value in filters.items() if value is not None and value != ""}
-    covered_filters = {"project_id", "observation_kind", "check_type", "status", "start", "end"}
-    if (filters.get("check_type") or filters.get("status")) and active_filters <= covered_filters:
-        # A time-ordered index can look cheap while reading thousands of wide
-        # rows to find a sparse status. Materialize only the selected IDs from
-        # the existing covering index, then fetch at most page_size wide rows.
-        # CROSS JOIN fixes page as the outer loop; the final sort is bounded.
-        return (
-            "WITH page AS MATERIALIZED ("
-            "SELECT id, started_at FROM runs INDEXED BY idx_runs_project_page_filter_started"
-            f"{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?) "
-            f"SELECT {_run_summary_select('r')} FROM page CROSS JOIN runs AS r "
-            "WHERE r.id = page.id ORDER BY page.started_at DESC, page.id DESC"
-        )
-    return f"SELECT {_run_summary_select()} FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
+    # All filter combinations use the same two-stage read. Scope-only pages
+    # let SQLite use its small time indexes for optional project/kind scopes.
+    clauses, _ = _run_filter_clauses(filters)
+    scope_only = all(clause in {"project_id = ?", "observation_kind = ?"} for clause in clauses)
+    source = "runs" if scope_only else f"runs INDEXED BY {RUN_PAGE_INDEX}"
+    return (
+        "WITH page AS MATERIALIZED ("
+        f"SELECT id, started_at FROM {source}{where} "
+        "ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?) "
+        f"SELECT {_run_summary_select('r')} FROM page CROSS JOIN runs AS r "
+        "WHERE r.id = page.id ORDER BY page.started_at DESC, page.id DESC"
+    )
 
 
 def _run_filter_clauses(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
@@ -4572,9 +4593,18 @@ def create_database_backup(preserve_filename: str | None = None) -> dict[str, An
 def _create_database_backup(preserve_filename: str | None = None) -> dict[str, Any]:
     ensure_runtime_dirs()
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-    # Wall clocks can repeat within one platform clock tick. A safety backup
-    # must never overwrite the restore source created earlier in that tick.
-    filename = f"pulseguard-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex}.db"
+    # Coarse filesystem/clock ticks can tie. Persist creation order in the
+    # timestamp as well as keeping names unique, so retention never uses a
+    # random UUID to choose which of two equally timed backups is newer.
+    stamp = datetime.now().astimezone().replace(tzinfo=None)
+    for previous in BACKUPS_DIR.glob("pulseguard-*.db"):
+        try:
+            previous_stamp = datetime.strptime(previous.name[11:33], '%Y%m%d-%H%M%S-%f')
+        except ValueError:
+            continue
+        if previous_stamp >= stamp:
+            stamp = previous_stamp + timedelta(microseconds=1)
+    filename = f"pulseguard-{stamp.strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex}.db"
     target = BACKUPS_DIR / filename
     _copy_database(Path(DB_PATH), target)
     preserve_filenames = {target.name}

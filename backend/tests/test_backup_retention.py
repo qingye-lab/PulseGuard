@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +22,25 @@ class BackupRetentionTests(unittest.TestCase):
         storage.update_settings({"database_backup_retention": 2})
         created = [storage.create_database_backup()["filename"] for _ in range(5)]
         self.assertEqual({b["filename"] for b in storage.list_database_backups()}, set(created[-2:]))
+
+    def test_repeated_clock_ticks_keep_backups_in_creation_order(self) -> None:
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 23, 12, 0, 0, tzinfo=tz)
+
+        self_copy = storage._copy_database
+
+        def copy_with_coarse_mtime(source, destination):
+            self_copy(source, destination)
+            os.utime(destination, ns=(1_700_000_000_000_000_000,) * 2)
+
+        storage.update_settings({"database_backup_retention": 2})
+        with patch.object(storage, 'datetime', FrozenDatetime), \
+             patch.object(storage, '_copy_database', side_effect=copy_with_coarse_mtime), \
+             patch.object(storage.uuid, 'uuid4', side_effect=[SimpleNamespace(hex=f'{i:032x}') for i in range(5, 0, -1)]):
+            created = [storage.create_database_backup()["filename"] for _ in range(5)]
+        self.assertEqual([b["filename"] for b in storage.list_database_backups()], created[-2:][::-1])
 
     def test_one_keeps_only_new_backup_even_with_manual_names(self) -> None:
         storage.update_settings({"database_backup_retention": 1})
