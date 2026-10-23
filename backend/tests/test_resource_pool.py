@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from backend.app.resource_pool import BrowserPool, ProbeResourcePool
+from backend.app.resource_pool import BrowserPool, ProbeResourcePool, ResourcePoolError
 
 
 class BrowserPoolTests(unittest.TestCase):
@@ -25,8 +25,9 @@ class BrowserPoolTests(unittest.TestCase):
             self.assertFalse(waiter.done())
             try:
                 with patch("backend.app.resource_pool.RESOURCE_CLEANUP_TIMEOUT_SECONDS", 0.02):
-                    with self.assertRaises(TimeoutError):
-                        await pool.release_context(lease)
+                    await pool.release_context(lease)
+                self.assertTrue(pool.snapshot()["retiring"])
+                self.assertFalse(original_browser.closed)
                 next_lease = await asyncio.wait_for(waiter, 1)
                 self.assertTrue(original_browser.closed)
                 self.assertIsNot(next_lease.browser, original_browser)
@@ -77,16 +78,22 @@ class BrowserPoolTests(unittest.TestCase):
             self.assertEqual(pool.snapshot()["ready"], 4)
             self.assertEqual(pool.snapshot()["in_use"], 1)
 
-            await lease.context.close()
             await pool.release_context(lease)
 
             self.assertFalse(browser.closed)
             self.assertEqual(len(fake.chromium.launches), 1)
-            self.assertEqual(pool.snapshot()["ready"], 5)
+            self.assertEqual(pool.snapshot()["ready"], 4)
             self.assertEqual(pool.snapshot()["in_use"], 0)
-            self.assertEqual(pool.snapshot()["total"], 5)
-            self.assertEqual(len(browser.contexts), 6)
+            self.assertEqual(pool.snapshot()["total"], 4)
             self.assertEqual(sum(1 for context in browser.contexts if context.closed), 1)
+
+            next_lease = await pool.acquire_context(settings(), context_options)
+            self.assertEqual(pool.snapshot()["ready"], 4)
+            self.assertEqual(pool.snapshot()["total"], 5)
+            self.assertEqual(sum(1 for context in browser.contexts if context.closed), 1)
+            await pool.release_context(next_lease)
+            self.assertEqual(pool.snapshot()["ready"], 4)
+            self.assertEqual(pool.snapshot()["in_use"], 0)
 
             await pool.shutdown()
 
@@ -111,10 +118,17 @@ class BrowserPoolTests(unittest.TestCase):
             second_lease = await pool.acquire_context(pool_settings, context_options)
             await pool.release_context(second_lease)
 
+            self.assertFalse(first_browser.closed)
+            self.assertTrue(pool.snapshot()["retiring"])
+            self.assertEqual(pool.snapshot()["completed_contexts"], 2)
+
+            third_lease = await pool.acquire_context(pool_settings, context_options)
             self.assertTrue(first_browser.closed)
             self.assertEqual(len(fake.chromium.launches), 2)
+            self.assertIsNot(third_lease.browser, first_browser)
             self.assertEqual(pool.snapshot()["completed_contexts"], 0)
             self.assertEqual(pool.snapshot()["recycle_after_runs"], 2)
+            await pool.release_context(third_lease)
 
             await pool.shutdown()
 
@@ -142,8 +156,53 @@ class BrowserPoolTests(unittest.TestCase):
 
             await lease.context.close()
             await pool.release_context(lease)
-            self.assertEqual(pool.snapshot()["ready"], 5)
+            self.assertEqual(pool.snapshot()["ready"], 4)
             self.assertEqual(len(fake.chromium.launches), 1)
+
+            await pool.shutdown()
+
+    def test_recycle_does_not_block_release_when_browser_launch_is_slow(self) -> None:
+        async def scenario() -> None:
+            fake = FakePlaywright()
+            pool = browser_pool(fake, size=1)
+            pool_settings = {**settings(), "browser_recycle_after_runs": 1}
+
+            await pool.start(pool_settings)
+            first_browser = fake.chromium.launches[0]
+            fake.chromium.launch_delay = 0.05
+
+            lease = await pool.acquire_context(pool_settings, {})
+            with patch("backend.app.resource_pool.RESOURCE_CLEANUP_TIMEOUT_SECONDS", 0.01):
+                await pool.release_context(lease)
+
+            self.assertTrue(pool.snapshot()["retiring"])
+            self.assertFalse(first_browser.closed)
+            self.assertEqual(len(fake.chromium.launches), 1)
+
+            next_lease = await pool.acquire_context(pool_settings, {})
+            self.assertTrue(first_browser.closed)
+            self.assertEqual(len(fake.chromium.launches), 2)
+            self.assertIsNot(next_lease.browser, first_browser)
+            self.assertEqual(pool.snapshot()["completed_contexts"], 0)
+            await pool.release_context(next_lease)
+
+            await pool.shutdown()
+
+        asyncio.run(scenario())
+
+    def test_browser_launch_timeout_reports_clear_error(self) -> None:
+        async def scenario() -> None:
+            fake = FakePlaywright()
+            fake.chromium.launch_delay = 1.0
+            pool = browser_pool(fake, size=1)
+
+            with patch("backend.app.resource_pool.BROWSER_LAUNCH_TIMEOUT_SECONDS", 0.02):
+                with self.assertRaises(ResourcePoolError) as raised:
+                    await pool.start(settings())
+
+            self.assertIn("浏览器启动超时", str(raised.exception))
+            self.assertIn("浏览器启动超时", pool.snapshot()["error"])
+            self.assertEqual(pool.snapshot()["browser_processes"], 0)
 
             await pool.shutdown()
 
@@ -221,8 +280,11 @@ class FakeBrowserType:
     def __init__(self) -> None:
         self.launches: list[FakeBrowser] = []
         self.launch_options: list[dict[str, object]] = []
+        self.launch_delay = 0.0
 
     async def launch(self, **options: object) -> "FakeBrowser":
+        if self.launch_delay:
+            await asyncio.sleep(self.launch_delay)
         browser = FakeBrowser()
         self.launch_options.append(options)
         self.launches.append(browser)

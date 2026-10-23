@@ -1024,14 +1024,15 @@ class CheckRunner:
                     try:
                         await ctx.close(failed and not retrying and failure_kind == "target")
                     except Exception as exc:
+                        cleanup_error = str(exc) or exc.__class__.__name__
                         if status == "ok":
                             status = "failed"
-                            error_message = f"运行清理失败：{exc}"
+                            error_message = f"运行清理失败：{cleanup_error}"
                             error_stack = traceback.format_exc()
                             failure_kind = "runner"
                             retrying = False
                         else:
-                            ctx.log(f"运行清理失败：{exc}")
+                            ctx.log(f"运行清理失败：{cleanup_error}")
                     log_lines.extend(mask_text(line, ctx.settings) for line in ctx.logs)
                     if error_message is not None:
                         error_message = mask_text(error_message, ctx.settings)

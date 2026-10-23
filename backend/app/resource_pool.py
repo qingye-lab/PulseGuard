@@ -12,6 +12,7 @@ from .variables import resolve_text
 from .viewport import browser_context_options, browser_viewport
 
 RESOURCE_CLEANUP_TIMEOUT_SECONDS = 5.0
+BROWSER_LAUNCH_TIMEOUT_SECONDS = 60.0
 
 
 class ResourcePoolError(Exception):
@@ -204,43 +205,35 @@ class BrowserPool:
 
     async def release(self, lease: BrowserLease, *, healthy: bool = True) -> None:
         async with self._condition:
-            if lease is self._browser_lease and (not healthy or not self._browser_connected(lease.browser)):
-                self._retire_browser_when_idle = True
             try:
-                async with asyncio.timeout(RESOURCE_CLEANUP_TIMEOUT_SECONDS):
+                if lease is self._browser_lease and (not healthy or not self._browser_connected(lease.browser)):
+                    self._retire_browser_when_idle = True
+                # Recycle on the next acquire: closing a browser or launching its
+                # replacement can outlast the run's cleanup budget on a loaded host.
+                if self._closing:
                     await self._reconcile_locked()
-            except ResourcePoolError:
-                pass
-            except (TimeoutError, asyncio.CancelledError):
-                self._retire_browser_when_idle = True
-                raise
             finally:
                 self._condition.notify_all()
         await self._stop_playwright_if_idle()
 
     async def release_context(self, lease: BrowserContextLease, *, healthy: bool = True) -> None:
         async with self._condition:
-            self._active_contexts.discard(lease)
-            released_current_browser = self._browser_lease is not None and lease.browser is self._browser_lease.browser
-            if not healthy:
-                self._retire_browser_when_idle = True
             try:
-                async with asyncio.timeout(RESOURCE_CLEANUP_TIMEOUT_SECONDS):
-                    await self._close_context(lease)
-                    if healthy and released_current_browser:
-                        self._completed_contexts_since_launch += 1
-                        if self._completed_contexts_since_launch >= self._recycle_after_runs:
-                            self._retire_browser_when_idle = True
-                    if healthy and not self._closing and not self._retire_browser_when_idle and self._browser_lease is not None:
-                        await self._fill_contexts_locked(lease.context_options)
+                self._active_contexts.discard(lease)
+                released_current_browser = self._browser_lease is not None and lease.browser is self._browser_lease.browser
+                context_closed = await self._close_context(lease)
+                if not healthy or not context_closed:
+                    self._retire_browser_when_idle = True
+                elif released_current_browser:
+                    self._completed_contexts_since_launch += 1
+                    if self._completed_contexts_since_launch >= self._recycle_after_runs:
+                        self._retire_browser_when_idle = True
+                # Refill and browser recycling run on the next acquire so cleanup
+                # cannot fail the run that just finished. A closing pool instead
+                # finishes its shutdown as soon as the last lease is gone.
+                if self._closing:
                     await self._reconcile_locked()
-            except ResourcePoolError:
-                pass
-            except (TimeoutError, asyncio.CancelledError):
-                self._retire_browser_when_idle = True
-                raise
             finally:
-                # A failed close or refill must still wake capacity waiters.
                 self._condition.notify_all()
         await self._stop_playwright_if_idle()
 
@@ -316,14 +309,15 @@ class BrowserPool:
 
     async def _launch_locked(self, config: BrowserLaunchConfig) -> BrowserLease:
         try:
-            playwright = await self._ensure_playwright_locked()
-            browser_type = getattr(playwright, config.browser_type, None)
-            if browser_type is None:
-                raise ResourcePoolError(f"不支持的浏览器类型：{config.browser_type}")
-            launch_options: dict[str, Any] = {"headless": config.headless}
-            if config.proxy_url:
-                launch_options["proxy"] = {"server": config.proxy_url}
-            browser = await browser_type.launch(**launch_options)
+            async with asyncio.timeout(BROWSER_LAUNCH_TIMEOUT_SECONDS):
+                playwright = await self._ensure_playwright_locked()
+                browser_type = getattr(playwright, config.browser_type, None)
+                if browser_type is None:
+                    raise ResourcePoolError(f"不支持的浏览器类型：{config.browser_type}")
+                launch_options: dict[str, Any] = {"headless": config.headless}
+                if config.proxy_url:
+                    launch_options["proxy"] = {"server": config.proxy_url}
+                browser = await browser_type.launch(**launch_options)
             raw_version = getattr(browser, "version", "")
             if callable(raw_version):
                 raw_version = raw_version()
@@ -332,6 +326,9 @@ class BrowserPool:
         except ResourcePoolError as exc:
             self._last_error = str(exc)
             raise
+        except TimeoutError as exc:
+            self._last_error = f"浏览器启动超时（{BROWSER_LAUNCH_TIMEOUT_SECONDS:g} 秒）"
+            raise ResourcePoolError(self._last_error) from exc
         except ImportError as exc:
             self._last_error = "Playwright 未安装，请先安装后再执行 UI 探活"
             raise ResourcePoolError(self._last_error) from exc
@@ -375,11 +372,12 @@ class BrowserPool:
                 self._browser_lease = None
                 self._completed_contexts_since_launch = 0
 
-    async def _close_context(self, lease: BrowserContextLease) -> None:
+    async def _close_context(self, lease: BrowserContextLease) -> bool:
         try:
             await asyncio.wait_for(lease.context.close(), RESOURCE_CLEANUP_TIMEOUT_SECONDS)
         except Exception:
-            pass
+            return False
+        return True
 
     async def _stop_playwright_if_idle(self) -> None:
         playwright = None
