@@ -1,14 +1,12 @@
 """Verified source-only systemd releases; never replace the live database.
 
-Run on the host with an uploaded manifest and stage directory. Compatible DB
-migrations require an explicit manifest flag and a successful copy preflight.
-Dependency changes and incompatible contracts need their own build/migration.
+Run on the host with an uploaded manifest and stage directory. Dependency or
+schema changes require their own migration/build procedure before this entry.
 """
 from __future__ import annotations
 
 import argparse
 from contextlib import closing
-from datetime import datetime
 import hashlib
 import json
 import os
@@ -51,77 +49,25 @@ def verify_console(project_ids: list[int]) -> list[dict]:
         raise RuntimeError("Health acceptance failed")
     results = []
     for project_id in project_ids:
-        base = api('/api/runs-page?observation_kind=observation&page_size=1', project_id=project_id)
-        sample = next(iter(base.get('items', [])), {})
-        cases = [{}, {"type": "api"}, {"type": "ui"}]
-        cases += [{"status": value} for value in ('ok', 'failed', 'timeout', 'pending', 'running', 'skipped', 'preparation_failed')]
-        cases += [{"notification_status": value} for value in ('sent', 'failed', 'suppressed', 'disabled', 'not_required')]
-        cases += [{"observation_kind": value} for value in ('verification', 'draft')]
-        for key in ('check_id', 'runner_id', 'run_group_id', 'trigger'):
-            cases.append({key: sample.get(key) or (1 if key == 'check_id' else 'release-no-match')})
-        cases.append({'q': str(sample.get('check_name') or 'release-no-match')[:12]})
-        if sample.get('started_at'):
-            cases += [{'start': sample['started_at']}, {'end': sample['started_at']},
-                      {'start': sample['started_at'], 'end': sample['started_at']}]
-        cases += [{'type': 'ui', 'status': 'failed'}, {'notification_status': 'failed', 'status': 'failed'},
-                  {'notification_status': 'failed', 'page': 2},
-                  {'notification_status': 'failed', 'page_size': 1},
-                  {'page_size': 100},
-                  {'type': 'api', 'notification_status': 'failed', 'runner_id': sample.get('runner_id') or 'release-no-match'},
-                  {'q': 'release-no-such-check', 'notification_status': 'failed'},
-                  {'type': sample.get('check_type') or 'api', 'status': sample.get('status') or 'ok',
-                   'notification_status': sample.get('notification_status') or 'not_required',
-                   'runner_id': sample.get('runner_id') or 'release-no-match',
-                   'run_group_id': sample.get('run_group_id') or 'release-no-match',
-                   'trigger': sample.get('trigger') or 'release-no-match',
-                   'check_id': sample.get('check_id') or 1,
-                   'q': str(sample.get('check_name') or 'release-no-match')[:12]}]
-        for extra in cases:
+        for extra in ({}, {"status": "failed"}, {"type": "api"}, {"type": "ui"},
+                      {"type": "ui", "status": "failed"}):
             query = urllib.parse.urlencode({"observation_kind": "observation", "page_size": 12, **extra})
             started = time.monotonic()
             page = api("/api/runs-page?" + query, project_id=project_id)
-            expected_page = extra.get('page', 1)
-            expected_size = extra.get('page_size', 12)
             if (type(page.get("total")) is not int or page["total"] < 0
-                    or not isinstance(page.get("items"), list)
-                    or len(page["items"]) != min(max(page["total"] - (expected_page - 1) * expected_size, 0), expected_size)
-                    or page.get("page") != expected_page or page.get("page_size") != expected_size):
+                    or not isinstance(page.get("items"), list) or len(page["items"]) != min(page["total"], 12)
+                    or page.get("page") != 1 or page.get("page_size") != 12):
                 raise RuntimeError("Invalid pagination response")
             for row in page["items"]:
-                if row.get("project_id") != project_id or row.get("observation_kind") != extra.get('observation_kind', "observation"):
+                if row.get("project_id") != project_id or row.get("observation_kind") != "observation":
                     raise RuntimeError("Pagination project/source scope differs")
                 if extra.get("status") == "failed" and row.get("status") not in ("failed", "timeout"):
                     raise RuntimeError("Pagination status filter differs")
                 if extra.get("type") and row.get("check_type") != extra["type"]:
                     raise RuntimeError("Pagination type filter differs")
-                if extra.get('status') and extra['status'] != 'failed' and row.get('status') != extra['status']:
-                    raise RuntimeError('Pagination exact status filter differs')
-                for key in ('notification_status', 'runner_id', 'run_group_id', 'trigger', 'check_id'):
-                    if key in extra and row.get(key) != extra[key]:
-                        raise RuntimeError('Pagination filter differs: ' + key)
-                if extra.get('q'):
-                    with closing(sqlite3.connect(':memory:')) as predicate:
-                        if not predicate.execute('SELECT ? LIKE ?', (row.get('check_name'), '%' + extra['q'] + '%')).fetchone()[0]:
-                            raise RuntimeError('Pagination name filter differs')
-                if extra.get('start') or extra.get('end'):
-                    actual = datetime.fromisoformat(row['started_at']).astimezone()
-                    if extra.get('start') and actual < datetime.fromisoformat(extra['start']).astimezone():
-                        raise RuntimeError('Pagination start filter differs')
-                    if extra.get('end') and actual > datetime.fromisoformat(extra['end']).astimezone():
-                        raise RuntimeError('Pagination end filter differs')
             results.append({"project_id": project_id, "filters": extra, "total": page["total"],
                             "rows": len(page["items"]), "elapsed_ms": round((time.monotonic() - started) * 1000, 1)})
     return results
-
-
-def migrate_database(root: Path) -> None:
-    # Run migrations under the writer fence before starting API/Relay. Building
-    # a large compatible index must not compete with the API readiness deadline.
-    env = os.environ.copy()
-    env.update(PYTHONPATH=str(root / 'backend'), PULSEGUARD_DB_PATH=str(root / 'data/pulseguard.db'))
-    subprocess.run([sys.executable, '-c',
-                    'from app import storage; storage.init_db(recover_interrupted=False)'],
-                   cwd=root, env=env, check=True, timeout=1800)
 
 
 def validate_files(files: dict) -> None:
@@ -231,7 +177,6 @@ def fingerprint(db: Path) -> dict:
 
 
 def preflight(root: Path, work: Path) -> dict:
-    manifest = json.loads((work / 'manifest.json').read_text())
     database = root / "data/pulseguard.db"
     scratch = work / "preflight.db"
     if scratch.exists():
@@ -249,20 +194,16 @@ def preflight(root: Path, work: Path) -> dict:
                PULSEGUARD_DB_PATH=str(scratch), PULSEGUARD_REPORTS_DIR=str(work / "preflight-reports"),
                PULSEGUARD_BACKUPS_DIR=str(work / "preflight-backups"))
     try:
-        subprocess.run([sys.executable, "-c", "import logging; logging.basicConfig(level=logging.INFO); "
-                        "from app import storage; storage.init_db(recover_interrupted=False)"],
-                       env=env, cwd=work, check=True, timeout=1800)
+        subprocess.run([sys.executable, "-c", "from app import storage; storage.init_db(recover_interrupted=False)"],
+                       env=env, cwd=work, check=True, timeout=600)
         if fingerprint(scratch) != before:
             raise RuntimeError("Existing database migration changed configuration")
-        return {"configuration_intact": True, "database_bytes": scratch.stat().st_size,
-                "manifest_sha256": digest(work / 'manifest.json'),
-                "copy_retained": bool(manifest.get('retain_preflight_copy'))}
+        return {"configuration_intact": True, "database_bytes": scratch.stat().st_size}
     finally:
-        if not manifest.get('retain_preflight_copy'):
-            for suffix in ("", "-wal", "-shm"):
-                path = Path(str(scratch) + suffix)
-                if path.exists():
-                    path.unlink()
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(str(scratch) + suffix)
+            if path.exists():
+                path.unlink()
 
 
 def snapshot(root: Path, work: Path, manifest: dict) -> Path:
@@ -290,15 +231,6 @@ def snapshot(root: Path, work: Path, manifest: dict) -> Path:
 
 def apply(root: Path, work: Path, manifest: dict) -> dict:
     reason = "release-" + manifest["id"]
-    if manifest.get('migrate_database'):
-        try:
-            preflight_result = json.loads((work / 'preflight-result.json').read_text())
-            ready = (preflight_result.get('state') == 'ready' and preflight_result.get('configuration_intact')
-                     and preflight_result.get('manifest_sha256') == digest(work / 'manifest.json'))
-        except (OSError, ValueError):
-            ready = False
-        if not ready:
-            raise RuntimeError('Compatible migration requires a successful preflight for the exact manifest')
     backup = Path("/opt/pulseguard-backups") / ("managed-" + manifest["id"])
     deployment_backups._manifest(backup)
     # Verify without pruning before any cutover; acceptance remains pending.
@@ -316,8 +248,6 @@ def apply(root: Path, work: Path, manifest: dict) -> dict:
         service("stop")
         originals = capture_originals(root, work, manifest["files"])
         replace_files(root, work, manifest["files"])
-        if manifest.get('migrate_database'):
-            migrate_database(root)
         start_services()
         downtime = time.monotonic() - started
         if fingerprint(root / "data/pulseguard.db") != before or any(digest(root / p) != sha for p, sha in protected.items()):

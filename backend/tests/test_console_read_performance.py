@@ -76,7 +76,7 @@ class ConsoleReadPerformanceTests(unittest.TestCase):
             where = " WHERE " + " AND ".join(clauses)
             with storage._connect(read_only=True) as conn:
                 count_plan = " ".join(str(row[3]) for row in conn.execute(
-                    "EXPLAIN QUERY PLAN " + storage._run_count_select(where), params,
+                    f"EXPLAIN QUERY PLAN SELECT COUNT(*) FROM runs{where}", params,
                 ))
                 page_plan = " ".join(str(row[3]) for row in conn.execute(
                     "EXPLAIN QUERY PLAN " + storage._run_page_select(filters, where),
@@ -115,7 +115,7 @@ class ConsoleReadPerformanceTests(unittest.TestCase):
                     self.assertEqual(first['total'], len(expected))
                     self.assertEqual(first['items'] + second['items'], expected)
 
-    def test_combined_filters_keep_their_full_semantics(self) -> None:
+    def test_noncovered_filters_keep_their_full_semantics(self) -> None:
         filters = {'project_id': self.project_id, 'status': 'failed', 'runner_id': 'runner-1'}
         expected = storage.list_runs(filters, limit=100, summary_only=True)
         self.assertEqual(storage.list_runs_page(filters)['items'], expected)
@@ -145,12 +145,7 @@ class ConsoleReadPerformanceTests(unittest.TestCase):
             storage.list_runs_page(filters, page=2, page_size=2)
         select = next(sql for sql in statements if "ORDER BY started_at DESC, id DESC LIMIT" in sql)
         with storage._connect(read_only=True) as conn:
-            # Only the bounded final page may need a sort. The inner scope scan
-            # must retain index order without sorting the entire run history.
-            plan = " ".join(str(row[3]) for row in conn.execute(
-                "EXPLAIN QUERY PLAN SELECT id, started_at FROM runs WHERE project_id=? "
-                "AND observation_kind=? ORDER BY started_at DESC, id DESC LIMIT 2 OFFSET 2",
-                (self.project_id, "observation")))
+            plan = " ".join(str(row[3]) for row in conn.execute("EXPLAIN QUERY PLAN " + select))
         self.assertIn("project_id=? AND observation_kind=?", plan)
         self.assertNotIn("TEMP B-TREE", plan)
 
