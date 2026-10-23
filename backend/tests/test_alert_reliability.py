@@ -274,6 +274,55 @@ class RunnerUnavailableNotificationTests(unittest.IsolatedAsyncioTestCase):
 
         notify.assert_not_awaited()
 
+    async def test_active_deployment_suppresses_the_node_offline_alert(self) -> None:
+        with patch.object(notifier.storage, "get_probe_runner", return_value=self.runner), patch.object(
+            notifier.storage,
+            "get_deployment_state",
+            return_value={"active": True, "finished_at": None},
+        ), patch.object(notifier, "notify_runner_unavailable", new=AsyncMock()) as notify:
+            result = await notifier.notify_runner_unavailable_if_needed(self.runner)
+
+        self.assertEqual(result, {"status": "skipped", "reason": "deployment"})
+        notify.assert_not_awaited()
+
+    async def test_recently_finished_deployment_suppresses_the_node_offline_alert(self) -> None:
+        finished_at = (datetime.now().astimezone() - timedelta(seconds=30)).isoformat(timespec="seconds")
+        with patch.object(notifier.storage, "get_probe_runner", return_value=self.runner), patch.object(
+            notifier.storage,
+            "get_deployment_state",
+            return_value={"active": False, "finished_at": finished_at},
+        ), patch.object(notifier, "notify_runner_unavailable", new=AsyncMock()) as notify:
+            result = await notifier.notify_runner_unavailable_if_needed(self.runner)
+
+        self.assertEqual(result, {"status": "skipped", "reason": "deployment"})
+        notify.assert_not_awaited()
+
+    async def test_deployment_state_read_failure_does_not_hide_the_alert(self) -> None:
+        with patch.object(notifier.storage, "get_probe_runner", return_value=self.runner), patch.object(
+            notifier.storage, "get_deployment_state", side_effect=RuntimeError("database unavailable")
+        ), patch.object(
+            notifier, "notify_runner_unavailable", new=AsyncMock(return_value={"status": "sent"})
+        ) as notify:
+            result = await notifier.notify_runner_unavailable_if_needed(self.runner)
+
+        self.assertEqual(result["status"], "sent")
+        notify.assert_awaited_once()
+
+    async def test_node_offline_alert_resumes_after_the_deployment_grace(self) -> None:
+        grace = storage.DEPLOYMENT_UNAVAILABLE_ALERT_GRACE_SECONDS
+        finished_at = (datetime.now().astimezone() - timedelta(seconds=grace + 60)).isoformat(timespec="seconds")
+        with patch.object(notifier.storage, "get_probe_runner", return_value=self.runner), patch.object(
+            notifier.storage,
+            "get_deployment_state",
+            return_value={"active": False, "finished_at": finished_at},
+        ), patch.object(
+            notifier, "notify_runner_unavailable", new=AsyncMock(return_value={"status": "sent"})
+        ) as notify:
+            result = await notifier.notify_runner_unavailable_if_needed(self.runner)
+
+        self.assertEqual(result["status"], "sent")
+        notify.assert_awaited_once()
+
     async def test_concurrent_notification_is_deduplicated_and_cancellation_allows_retry(self) -> None:
         entered, release = asyncio.Event(), asyncio.Event()
 
@@ -283,6 +332,10 @@ class RunnerUnavailableNotificationTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "sent"}
 
         with patch.object(notifier.storage, "get_probe_runner", return_value=self.runner), patch.object(
+            notifier.storage,
+            "get_deployment_state",
+            return_value={"active": False, "finished_at": None},
+        ), patch.object(
             notifier, "notify_runner_unavailable", side_effect=deliver
         ) as send:
             first = asyncio.create_task(notifier.notify_runner_unavailable_if_needed(self.runner))

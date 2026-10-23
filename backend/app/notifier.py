@@ -143,6 +143,13 @@ async def notify_runner_unavailable_if_needed(
             return {"status": "skipped", "reason": "unknown_runner"}
         if not (await storage_call(storage.should_notify_probe_runner_unavailable, latest)):
             return {"status": "skipped", "reason": "not_required"}
+        try:
+            deployment = (await storage_call(storage.get_deployment_state))
+        except Exception:
+            # A missing state read must not hide a real node outage.
+            deployment = {}
+        if storage.deployment_suppresses_runner_unavailable_alerts(deployment):
+            return {"status": "skipped", "reason": "deployment"}
         return await notify_runner_unavailable(latest, checks or [])
     finally:
         _RUNNER_UNAVAILABLE_IN_FLIGHT.discard(runner_id)

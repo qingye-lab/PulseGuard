@@ -174,6 +174,10 @@ RELAY_HEARTBEAT_TIMEOUT_SECONDS = 60
 # `unavailable_since`, so relay nodes only become alertable once the outage has
 # outlasted that reconnect window.
 RELAY_UNAVAILABLE_ALERT_GRACE_SECONDS = 180
+# A planned deployment stops the API and relay transport together. The first
+# health poll after restart can race the reconnect, so node-offline alerts stay
+# suppressed while the window is active and until its services have settled.
+DEPLOYMENT_UNAVAILABLE_ALERT_GRACE_SECONDS = 180
 ENCRYPTED_RUNNER_TOKEN_PREFIX = "fernet:"
 RUN_SUMMARY_COLUMNS = (
     "id",
@@ -4000,6 +4004,12 @@ def mark_probe_runner_unavailable_notified(runner_id: str) -> dict[str, Any] | N
         if cursor.rowcount == 0:
             return None
     return get_probe_runner(runner_id)
+
+
+def deployment_suppresses_runner_unavailable_alerts(deployment: dict[str, Any]) -> bool:
+    return bool(deployment.get("active")) or _timestamp_is_fresh(
+        deployment.get("finished_at"), DEPLOYMENT_UNAVAILABLE_ALERT_GRACE_SECONDS
+    )
 
 
 def should_notify_probe_runner_unavailable(runner: dict[str, Any]) -> bool:
