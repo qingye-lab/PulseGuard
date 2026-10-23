@@ -4582,9 +4582,18 @@ def create_database_backup(preserve_filename: str | None = None) -> dict[str, An
 def _create_database_backup(preserve_filename: str | None = None) -> dict[str, Any]:
     ensure_runtime_dirs()
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-    # Wall clocks can repeat within one platform clock tick. A safety backup
-    # must never overwrite the restore source created earlier in that tick.
-    filename = f"pulseguard-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex}.db"
+    # Coarse filesystem/clock ticks can tie. Persist creation order in the
+    # timestamp as well as keeping names unique, so retention never uses a
+    # random UUID to choose which of two equally timed backups is newer.
+    stamp = datetime.now().astimezone().replace(tzinfo=None)
+    for previous in BACKUPS_DIR.glob("pulseguard-*.db"):
+        try:
+            previous_stamp = datetime.strptime(previous.name[11:33], '%Y%m%d-%H%M%S-%f')
+        except ValueError:
+            continue
+        if previous_stamp >= stamp:
+            stamp = previous_stamp + timedelta(microseconds=1)
+    filename = f"pulseguard-{stamp.strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex}.db"
     target = BACKUPS_DIR / filename
     _copy_database(Path(DB_PATH), target)
     preserve_filenames = {target.name}
