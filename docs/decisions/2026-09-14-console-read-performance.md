@@ -1,5 +1,7 @@
 # 控制台分页、状态摘要与慢请求计时
 
+> 2026-10-24 后续：运行列表已改为轻量投影 `run_records`，并在稀疏失败页和关键词计数上使用索引提示，取代本文“不引入 planner 提示”的旧边界。当前设计见[运行列表轻量投影与按 ID 读取](2026-10-24-run-record-projection.md)。
+
 - Status: accepted; deployed to Volcano on 2026-09-14 as perf-0f4712fc512c
 - Date: 2026-09-14
 - Owners: PulseGuard maintainers

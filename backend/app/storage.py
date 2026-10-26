@@ -247,6 +247,8 @@ TREND_SUMMARY_CHECK_IDS = {"ui": -1, "api": -2}
 PROJECT_SCHEMA_VERSION = 2
 SCRIPT_LIBRARY_SCHEMA_VERSION = 3
 RUN_COUNT_SCHEMA_VERSION = 4
+RUN_RECORDS_SCHEMA_VERSION = 5
+_RUN_RECORD_BACKFILL_BATCH_SIZE = 5000
 DEFAULT_PROJECT_NAME = "默认项目"
 PROJECT_SCOPED_TABLES = (
     "checks",
@@ -1078,6 +1080,7 @@ def _init_db(*, recover_interrupted: bool = True) -> None:
             "ON runs(project_id, observation_kind, check_type, status, started_at DESC, id DESC)"
         )
         _ensure_run_count_totals(conn)
+        _ensure_run_records(conn)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_project_health_cover "
             "ON runs(project_id, affects_health, started_at DESC, id DESC, "
@@ -4336,59 +4339,19 @@ def list_recent_business_incidents(limit: int = 20, project_id: int | None = Non
 
 def list_runs(filters: dict[str, Any] | None = None, limit: int = 100, summary_only: bool = False) -> list[dict[str, Any]]:
     filters = filters or {}
-    clauses: list[str] = []
-    params: list[Any] = []
-
-    if filters.get("project_id") is not None:
-        clauses.append("project_id = ?")
-        params.append(int(filters["project_id"]))
-
-    if filters.get("check_type"):
-        clauses.append("check_type = ?")
-        params.append(filters["check_type"])
-    if filters.get("status"):
-        if filters["status"] == "failed":
-            clauses.append("status IN ('failed', 'timeout')")
-        else:
-            clauses.append("status = ?")
-            params.append(filters["status"])
-    if filters.get("notification_status"):
-        clauses.append("notification_status = ?")
-        params.append(filters["notification_status"])
-    if filters.get("runner_id"):
-        clauses.append("runner_id = ?")
-        params.append(filters["runner_id"])
-    if filters.get("run_group_id"):
-        clauses.append("run_group_id = ?")
-        params.append(filters["run_group_id"])
-    if filters.get("trigger"):
-        clauses.append("trigger = ?")
-        params.append(filters["trigger"])
-    if filters.get("observation_kind"):
-        clauses.append("observation_kind = ?")
-        params.append(filters["observation_kind"])
-    if filters.get("q"):
-        clauses.append("check_name LIKE ?")
-        params.append(f"%{filters['q']}%")
-    if filters.get("check_id"):
-        clauses.append("check_id = ?")
-        params.append(int(filters["check_id"]))
-    if filters.get("start"):
-        clauses.append("started_at >= ?")
-        params.append(filters["start"])
-    if filters.get("end"):
-        clauses.append("started_at <= ?")
-        params.append(filters["end"])
-
-    select_columns = _run_summary_select() if summary_only else "*"
-    sql = f"SELECT {select_columns} FROM runs"
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY started_at DESC, id DESC LIMIT ?"
-    params.append(limit)
-
+    clauses, params = _run_filter_clauses(filters)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    source = _run_record_page_source(filters)
     with _connect(read_only=True) as conn:
-        return [_normalize_run(row) for row in conn.execute(sql, params).fetchall()]
+        ids = [
+            int(row["id"])
+            for row in conn.execute(
+                f"SELECT id FROM {source}{where} ORDER BY started_at DESC, id DESC LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+        ]
+        rows = _load_runs_by_ids(conn, ids, summary_only=summary_only)
+    return [_normalize_run(row) for row in rows]
 
 
 def _ensure_run_count_totals(conn: sqlite3.Connection) -> None:
@@ -4445,6 +4408,215 @@ def _ensure_run_count_totals(conn: sqlite3.Connection) -> None:
                  (RUN_COUNT_SCHEMA_VERSION, now_iso()))
 
 
+_RUN_RECORD_COLUMNS = (
+    "id",
+    "project_id",
+    "check_id",
+    "check_name",
+    "check_type",
+    "status",
+    "started_at",
+    "notification_status",
+    "runner_id",
+    "run_group_id",
+    "trigger",
+    "observation_kind",
+    "deduplicated_count",
+)
+
+
+def _run_record_sync_trigger(name: str, event: str) -> str:
+    columns = ", ".join(_RUN_RECORD_COLUMNS)
+    values = ", ".join(f"NEW.{column}" for column in _RUN_RECORD_COLUMNS)
+    assignments = ", ".join(
+        f"{column} = excluded.{column}" for column in _RUN_RECORD_COLUMNS if column != "id"
+    )
+    return f"""
+        CREATE TRIGGER IF NOT EXISTS {name} AFTER {event} ON runs BEGIN
+            INSERT INTO run_records ({columns}) VALUES ({values})
+            ON CONFLICT(id) DO UPDATE SET {assignments};
+        END
+    """
+
+
+_RUN_RECORD_TRIGGERS = {
+    "trg_runs_record_insert": _run_record_sync_trigger("trg_runs_record_insert", "INSERT"),
+    "trg_runs_record_update": _run_record_sync_trigger(
+        "trg_runs_record_update",
+        "UPDATE OF project_id, check_id, check_name, check_type, status, started_at, "
+        "notification_status, runner_id, run_group_id, trigger, observation_kind, deduplicated_count",
+    ),
+    "trg_runs_record_delete": """
+        CREATE TRIGGER IF NOT EXISTS trg_runs_record_delete AFTER DELETE ON runs BEGIN
+            DELETE FROM run_records WHERE id = OLD.id;
+        END
+    """,
+}
+
+_RUN_RECORD_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_started "
+    "ON run_records(project_id, started_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_kind_started "
+    "ON run_records(project_id, observation_kind, started_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_kind_status_started "
+    "ON run_records(project_id, observation_kind, status, started_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_kind_notification_started "
+    "ON run_records(project_id, observation_kind, notification_status, started_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_kind_type_started "
+    "ON run_records(project_id, observation_kind, check_type, started_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_kind_runner_started "
+    "ON run_records(project_id, observation_kind, runner_id, started_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_kind_check_started "
+    "ON run_records(project_id, observation_kind, check_id, started_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_group_started "
+    "ON run_records(project_id, run_group_id, started_at DESC, id DESC) "
+    "WHERE run_group_id IS NOT NULL",
+    # The failed tab expands to failed+timeout. Keeping start time ahead of id
+    # in these partial indexes lets page selection stop after 12 rows and keeps
+    # counts on the sparse failures instead of scanning the project timeline.
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_failures_started "
+    "ON run_records(project_id, started_at DESC, id DESC) "
+    "WHERE status IN ('failed', 'timeout')",
+    "CREATE INDEX IF NOT EXISTS idx_run_records_project_kind_failures_started "
+    "ON run_records(project_id, observation_kind, started_at DESC, id DESC) "
+    "WHERE status IN ('failed', 'timeout')",
+)
+
+
+def _run_record_page_source(filters: dict[str, Any]) -> str:
+    # With an ORDER BY ... LIMIT the planner can otherwise walk the time index
+    # for years looking for a sparse old status. Pin the index that matches the
+    # active dimension. Counts do not carry a LIMIT and keep planner choice.
+    if filters.get("project_id") is None:
+        return "run_records"
+    if filters.get("run_group_id"):
+        return "run_records INDEXED BY idx_run_records_project_group_started"
+    if not filters.get("observation_kind"):
+        if filters.get("status") == "failed":
+            return "run_records INDEXED BY idx_run_records_project_failures_started"
+        return "run_records INDEXED BY idx_run_records_project_started"
+    if filters.get("status") == "failed":
+        return "run_records INDEXED BY idx_run_records_project_kind_failures_started"
+    if filters.get("status") == "timeout":
+        return "run_records INDEXED BY idx_run_records_project_kind_status_started"
+    if filters.get("notification_status"):
+        return "run_records INDEXED BY idx_run_records_project_kind_notification_started"
+    if filters.get("check_id"):
+        return "run_records INDEXED BY idx_run_records_project_kind_check_started"
+    if filters.get("runner_id"):
+        return "run_records INDEXED BY idx_run_records_project_kind_runner_started"
+    if filters.get("check_type"):
+        return "run_records INDEXED BY idx_run_records_project_kind_type_started"
+    if filters.get("status"):
+        return "run_records INDEXED BY idx_run_records_project_kind_status_started"
+    return "run_records INDEXED BY idx_run_records_project_kind_started"
+
+
+_RUN_RECORD_COUNT_DIMENSIONS = (
+    "check_type",
+    "notification_status",
+    "runner_id",
+    "run_group_id",
+    "status",
+    "check_id",
+)
+
+
+def _run_record_count_source(filters: dict[str, Any]) -> str:
+    if filters.get("project_id") is not None and filters.get("status") == "failed":
+        # This filter expands to failed+timeout, so the partial indexes apply.
+        if filters.get("observation_kind"):
+            return "run_records INDEXED BY idx_run_records_project_kind_failures_started"
+        return "run_records INDEXED BY idx_run_records_project_failures_started"
+    # A LIKE '%term%' predicate cannot seek. Without a hint SQLite can pick a
+    # project/kind index for COUNT(*), then fetch one table row per match. Scan
+    # the narrow table sequentially when the keyword is the only predicate.
+    unindexed_filter = filters.get("q") or filters.get("trigger")
+    if unindexed_filter and not any(filters.get(key) for key in _RUN_RECORD_COUNT_DIMENSIONS):
+        if not filters.get("start") and not filters.get("end"):
+            return "run_records NOT INDEXED"
+        if filters.get("project_id") is None:
+            return "run_records"
+        if not filters.get("observation_kind"):
+            return "run_records INDEXED BY idx_run_records_project_started"
+        return "run_records INDEXED BY idx_run_records_project_kind_started"
+    return "run_records"
+
+
+def _ensure_run_records(conn: sqlite3.Connection) -> None:
+    # The wide runs table stays the single write source. Both the count rollup
+    # and this narrow read model are maintained by triggers in the same
+    # transaction, so direct SQL writers and rollbacks cannot drift them.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS run_records (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL,
+            check_id INTEGER NOT NULL,
+            check_name TEXT NOT NULL,
+            check_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            notification_status TEXT,
+            runner_id TEXT,
+            run_group_id TEXT,
+            trigger TEXT NOT NULL,
+            observation_kind TEXT NOT NULL,
+            deduplicated_count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    expected_objects = {"run_records", *_RUN_RECORD_TRIGGERS}
+    existing_objects = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') AND name IN ("
+            + ", ".join("?" for _ in expected_objects)
+            + ")",
+            tuple(expected_objects),
+        )
+    }
+    applied = conn.execute(
+        "SELECT 1 FROM schema_versions WHERE version = ?", (RUN_RECORDS_SCHEMA_VERSION,)
+    ).fetchone()
+    rebuild = not applied or existing_objects != expected_objects
+    if rebuild:
+        # A missing marker or trigger means the projection may have missed
+        # writes. Rebuild it from the source table under the same write lock.
+        for name in _RUN_RECORD_TRIGGERS:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        for name, definition in _RUN_RECORD_TRIGGERS.items():
+            conn.execute(definition)
+        conn.execute("DELETE FROM run_records")
+        last_id = 0
+        while True:
+            cursor = conn.execute(
+                f"""
+                INSERT INTO run_records ({", ".join(_RUN_RECORD_COLUMNS)})
+                SELECT {", ".join(_RUN_RECORD_COLUMNS)}
+                FROM runs
+                WHERE id > ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (last_id, _RUN_RECORD_BACKFILL_BATCH_SIZE),
+            )
+            if cursor.rowcount == 0:
+                break
+            last_id = int(conn.execute("SELECT MAX(id) FROM run_records").fetchone()[0])
+    else:
+        for definition in _RUN_RECORD_TRIGGERS.values():
+            conn.execute(definition)
+    for statement in _RUN_RECORD_INDEXES:
+        conn.execute(statement)
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (?, ?)",
+        (RUN_RECORDS_SCHEMA_VERSION, now_iso()),
+    )
+
+
 def list_runs_page(
     filters: dict[str, Any] | None = None,
     page: int = 1,
@@ -4455,21 +4627,30 @@ def list_runs_page(
     page_size = max(1, min(100, int(page_size)))
     clauses, params = _run_filter_clauses(filters)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    count_source = _run_record_count_source(filters)
+    page_source = _run_record_page_source(filters)
     with _connect(read_only=True) as conn:
         with request_timing.phase("runs_count"):
             if all(clause in {"project_id = ?", "observation_kind = ?"} for clause in clauses):
                 # Exact totals and page rows share this read snapshot. Complex
-                # filters keep their original precise SQL count and semantics.
+                # filters are counted in the narrow projection with the same
+                # semantics, never by joining detail rows into the filter.
                 total = int(conn.execute(
                     f"SELECT COALESCE(SUM(run_count), 0) AS count FROM run_count_totals{where}", params,
                 ).fetchone()["count"])
             else:
-                total = int(conn.execute(f"SELECT COUNT(*) AS count FROM runs{where}", params).fetchone()["count"])
+                total = int(conn.execute(
+                    f"SELECT COUNT(*) AS count FROM {count_source}{where}", params,
+                ).fetchone()["count"])
         with request_timing.phase("runs_fetch"):
-            rows = conn.execute(
-                _run_page_select(filters, where),
-                [*params, page_size, (page - 1) * page_size],
-            ).fetchall()
+            ids = [
+                int(row["id"])
+                for row in conn.execute(
+                    f"SELECT id FROM {page_source}{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
+                    [*params, page_size, (page - 1) * page_size],
+                ).fetchall()
+            ]
+            rows = _load_runs_by_ids(conn, ids)
     request_timing.record_count("runs_matches", total)
     request_timing.record_count("runs_rows", len(rows))
     return {
@@ -4480,22 +4661,16 @@ def list_runs_page(
     }
 
 
-def _run_page_select(filters: dict[str, Any], where: str) -> str:
-    active_filters = {key for key, value in filters.items() if value is not None and value != ""}
-    covered_filters = {"project_id", "observation_kind", "check_type", "status", "start", "end"}
-    if (filters.get("check_type") or filters.get("status")) and active_filters <= covered_filters:
-        # A time-ordered index can look cheap while reading thousands of wide
-        # rows to find a sparse status. Materialize only the selected IDs from
-        # the existing covering index, then fetch at most page_size wide rows.
-        # CROSS JOIN fixes page as the outer loop; the final sort is bounded.
-        return (
-            "WITH page AS MATERIALIZED ("
-            "SELECT id, started_at FROM runs INDEXED BY idx_runs_project_page_filter_started"
-            f"{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?) "
-            f"SELECT {_run_summary_select('r')} FROM page CROSS JOIN runs AS r "
-            "WHERE r.id = page.id ORDER BY page.started_at DESC, page.id DESC"
-        )
-    return f"SELECT {_run_summary_select()} FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
+def _load_runs_by_ids(conn: sqlite3.Connection, ids: list[int], *, summary_only: bool = True) -> list[sqlite3.Row]:
+    if not ids:
+        return []
+    placeholders = ", ".join("?" for _ in ids)
+    select_columns = _run_summary_select() if summary_only else "*"
+    rows = conn.execute(
+        f"SELECT {select_columns} FROM runs WHERE id IN ({placeholders})", ids,
+    ).fetchall()
+    by_id = {int(row["id"]): row for row in rows}
+    return [by_id[run_id] for run_id in ids if run_id in by_id]
 
 
 def _run_filter_clauses(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:

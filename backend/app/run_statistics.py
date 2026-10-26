@@ -41,7 +41,7 @@ def get_run_statistics(project_id: int, start: str, end: str, *, check_type: str
         retained = [dict(row) for row in conn.execute(
             f"""SELECT substr(started_at, 1, 10) AS date, check_type, status, COUNT(*) AS count,
                        SUM(COALESCE(deduplicated_count, 0)) AS legacy_merged_count
-                FROM runs WHERE {' AND '.join(clauses)} GROUP BY date, check_type, status""", params)]
+                FROM run_records WHERE {' AND '.join(clauses)} GROUP BY date, check_type, status""", params)]
         archive_clauses = ["project_id = ?", "archive_date >= ?", "archive_date <= ?"]
         archive_params: list[Any] = [project_id, first.date().isoformat(), last.date().isoformat()]
         if check_type:
@@ -51,7 +51,7 @@ def get_run_statistics(project_id: int, start: str, end: str, *, check_type: str
             f"SELECT archive_date AS date, check_type, status, run_count AS count FROM run_archives WHERE {' AND '.join(archive_clauses)}",
             archive_params)]
         installed = conn.execute("SELECT installed_at FROM run_history_policy WHERE id = 1").fetchone()
-        oldest = conn.execute("SELECT MIN(started_at) FROM runs WHERE project_id = ?", (project_id,)).fetchone()[0]
+        oldest = conn.execute("SELECT MIN(started_at) FROM run_records WHERE project_id = ?", (project_id,)).fetchone()[0]
     archives = []
     unsupported = bool(observation_kind or check_id or runner_id)
     excluded_archive_count = 0

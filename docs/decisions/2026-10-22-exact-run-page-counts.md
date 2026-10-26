@@ -4,6 +4,8 @@
 - Date: 2026-10-22
 - Scope: SQLite 运行记录分页及发布快照冻结边界
 
+> 2026-10-24 后续：其他筛选、排序和页面 ID 选择已改读轻量投影 `run_records`，见[运行列表轻量投影与按 ID 读取](2026-10-24-run-record-projection.md)。本文的 `run_count_totals` 继续提供项目/来源精确总数。
+
 ## Context
 
 用户观察到 `runs-page?observation_kind=observation&page=1&page_size=12` 耗时 23.57 秒。服务健康端点正常不代表历史分页正常；此前资源治理验收未覆盖大历史量的冷缓存计数。
