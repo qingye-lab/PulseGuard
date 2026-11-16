@@ -7,9 +7,6 @@ FROM ${UV_IMAGE} AS uv-bin
 
 FROM ${PLAYWRIGHT_IMAGE}
 
-ARG PULSEGUARD_VERSION=0.1.0
-ARG PULSEGUARD_BUILD_SHA=unknown
-
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/backend
@@ -22,8 +19,6 @@ ENV PULSEGUARD_PORT=8788
 ENV PULSEGUARD_DATA_DIR=/app/data
 ENV PULSEGUARD_REPORTS_DIR=/app/reports
 ENV PULSEGUARD_WORKER_TOKEN_FILE=/app/data/worker-token
-ENV PULSEGUARD_VERSION=${PULSEGUARD_VERSION}
-ENV PULSEGUARD_BUILD_SHA=${PULSEGUARD_BUILD_SHA}
 
 COPY --from=uv-bin /uv /uvx /bin/
 COPY pyproject.toml uv.lock /app/
@@ -32,6 +27,12 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY backend /app/backend
 
 RUN mkdir -p /app/data /app/reports/screenshots /app/reports/traces /app/reports/responses
+
+# Declared last so the per-commit build SHA does not invalidate the dependency layers above.
+ARG PULSEGUARD_VERSION=0.1.0
+ARG PULSEGUARD_BUILD_SHA=unknown
+ENV PULSEGUARD_VERSION=${PULSEGUARD_VERSION}
+ENV PULSEGUARD_BUILD_SHA=${PULSEGUARD_BUILD_SHA}
 
 EXPOSE 8788
 CMD ["sh", "-c", "python -m app.worker --host ${PULSEGUARD_HOST:-0.0.0.0} --port ${PULSEGUARD_PORT:-8788}"]
